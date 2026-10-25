@@ -72,3 +72,43 @@ def test_segments_without_those_attributes_still_work(monkeypatch, tmp_path):
     result = Transcriber().execute(_input(tmp_path))
     assert result.success, result.error
     assert "no_speech_prob" not in result.data["segments"][0]
+
+
+def _install_device_fake(monkeypatch, devices, cuda_count=1):
+    class FakeWhisperModel:
+        def __init__(self, model_size, *, device, compute_type):
+            devices.append((device, compute_type))
+
+        def transcribe(self, *args, **kwargs):
+            return iter(()), _Info()
+
+    monkeypatch.setitem(sys.modules, "faster_whisper", SimpleNamespace(WhisperModel=FakeWhisperModel))
+    monkeypatch.setitem(
+        sys.modules,
+        "ctranslate2",
+        SimpleNamespace(get_cuda_device_count=lambda: cuda_count, get_supported_compute_types=lambda d: {"float16"}),
+    )
+
+
+def test_device_cpu_forces_cpu_even_with_a_gpu(monkeypatch, tmp_path):
+    devices = []
+    _install_device_fake(monkeypatch, devices, cuda_count=1)
+    result = Transcriber().execute(_input(tmp_path, device="cpu"))
+    assert result.success, result.error
+    assert devices == [("cpu", "int8")]
+
+
+def test_device_cuda_without_gpu_falls_back_to_cpu_with_reason(monkeypatch, tmp_path):
+    devices = []
+    _install_device_fake(monkeypatch, devices, cuda_count=0)
+    result = Transcriber().execute(_input(tmp_path, device="cuda"))
+    assert result.success, result.error
+    assert devices == [("cpu", "int8")]
+    assert "no CUDA device" in result.data["gpu_fallback_reason"]
+
+
+def test_device_auto_keeps_previous_behaviour(monkeypatch, tmp_path):
+    devices = []
+    _install_device_fake(monkeypatch, devices, cuda_count=1)
+    assert Transcriber().execute(_input(tmp_path, device="auto")).success
+    assert devices == [("cuda", "float16")]

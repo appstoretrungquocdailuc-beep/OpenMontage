@@ -25,6 +25,26 @@ Branch `claude/charming-meitner-s9tzcb`. Plans: `docs/superpowers/plans/2026-10-
 - `tools/analysis/transcriber.py`: additive `initial_prompt` / `beam_size` inputs and per-segment
   `avg_logprob` / `no_speech_prob`; default call unchanged.
 
+## Windows real-footage trial kit (`lib/anime_trial.py`, `scripts/anime_trial/*.bat`)
+- Guide: `docs/anime-recap/HUONG_DAN_CHAY_THU_WINDOWS.md`. `.bat` files only find Python 3.11/3.12,
+  create `.venv-anime`, offer `winget install Gyan.FFmpeg`, then call `python -m lib.anime_trial`
+  `setup|run|score` — all logic is Python and unit-tested on Linux. The `.bat` files have never run on Windows.
+- GPU: pip `nvidia-cublas-cu12` + `nvidia-cudnn-cu12==9.*`; `register_windows_cuda_dlls()` adds
+  `site-packages/nvidia/*/bin` via `os.add_dll_directory`. Transcriber gained `device: auto|cuda|cpu`
+  (cuda without a GPU → CPU + `gpu_fallback_reason`); setup smoke-tests Whisper on 1 s of silence.
+- Clip trial: re-encoded at `-ss` (frame-accurate, starts at 0, nominal `-r`); default start 60 s
+  when the video is ≥ 3 min; report states the offset to add.
+- Paths with non-ASCII/quotes are copied to `work/input.mp4` (ffmpeg lavfi `movie=` breaks on quotes).
+- Automatic checks: schema, contiguity, frame grid, keyframes, lines in scenes, ids, dialogue heuristics,
+  suspected false cuts = RGB SSIM ≥ 0.92 across a cut. YUV SSIM was luma-dominated (green→red = 0.93,
+  59 false alarms on the 8-min test); `format=gbrp` gives 0.008.
+- Manual sheets are UTF-8-BOM CSV (Excel). `score` → accuracy, CER (Levenshtein), false-cut rate;
+  half-filled = PARTIAL. AI visual review / manual checks stay PENDING; `overall` is FAIL or PENDING
+  until they are really done — never PASS by default.
+- 8-min 1080p synthetic, full mode, no ASR, cloud CPU: total 333 s; keyframes 223 s (720 ffmpeg
+  spawns in `frame_sampler`), proxy 51 s, checks 37 s, scene detect 19 s. Keyframe batching is the
+  obvious speed-up if it matters on the user's PC (tool left unchanged on purpose).
+
 ## Legacy AI_VIDEO_DIRECTOR_CN_JP (private; never commit its source to this public repo)
 | Legacy module | Decision | Why |
 |---|---|---|

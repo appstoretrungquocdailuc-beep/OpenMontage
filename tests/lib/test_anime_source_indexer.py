@@ -552,3 +552,31 @@ def test_provenance_records_rgb_scdet_when_ffmpeg_fallback_is_used(sample_video,
         pytest.skip("PySceneDetect installed — the ffmpeg fallback is not used")
     result = asi.build_source_index(sample_video, tmp_path / "prov", transcript_path=transcript_file, provenance_kind="mock")
     assert "ffmpeg scdet(rgb)" in result.index["provenance"]["tools"]
+
+
+# ── Windows trial hooks ─────────────────────────────────────────────────
+
+
+@needs_ffmpeg
+def test_build_records_stage_timings(sample_video, transcript_file, tmp_path):
+    timings: dict = {}
+    asi.build_source_index(sample_video, tmp_path / "t", transcript_path=transcript_file,
+                           provenance_kind="mock", timings=timings)
+    for stage in ("probe", "scene_detect", "keyframes", "transcript", "dialogue", "loudness", "write"):
+        assert stage in timings and timings[stage] >= 0.0, stage
+
+
+@needs_ffmpeg
+def test_build_passes_asr_device_to_transcriber(sample_video, tmp_path, monkeypatch):
+    seen = {}
+
+    class FakeTranscriber:
+        def execute(self, inputs):
+            from tools.base_tool import ToolResult
+            seen.update(inputs)
+            return ToolResult(success=True, data=_transcript())
+
+    monkeypatch.setattr("tools.analysis.transcriber.Transcriber", FakeTranscriber)
+    monkeypatch.setattr(asi, "_faster_whisper_available", lambda: True)
+    asi.build_source_index(sample_video, tmp_path / "dev", model_size="large-v3", provenance_kind="mock", asr_device="cpu")
+    assert seen["device"] == "cpu"

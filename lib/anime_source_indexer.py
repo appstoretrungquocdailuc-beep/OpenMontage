@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import contextlib
 import copy
 import importlib.util
 import json
@@ -36,6 +37,7 @@ import math
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
@@ -438,13 +440,13 @@ def _faster_whisper_available() -> bool:
     return importlib.util.find_spec("faster_whisper") is not None
 
 
-def transcribe_japanese(video: Path, work_dir: Path, model_size: str) -> dict:
+def transcribe_japanese(video: Path, work_dir: Path, model_size: str, *, device: str = "auto") -> dict:
     """Run the transcriber tool (faster-whisper) with language forced to ja."""
     from tools.analysis.transcriber import Transcriber
 
     result = Transcriber().execute({
         "input_path": str(video), "language": "ja", "model_size": model_size, "output_dir": str(work_dir),
-        "initial_prompt": JA_ANIME_PROMPT, "beam_size": JA_BEAM_SIZE,
+        "initial_prompt": JA_ANIME_PROMPT, "beam_size": JA_BEAM_SIZE, "device": device,
     })
     if not result.success:
         raise IndexBuildError(
@@ -540,6 +542,15 @@ def write_review_packet(index: dict, path: Path) -> Path:
 # ── build ────────────────────────────────────────────────────────────────
 
 
+@contextlib.contextmanager
+def _stage(timings: dict[str, float], name: str):
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        timings[name] = round(timings.get(name, 0.0) + time.perf_counter() - start, 3)
+
+
 def _slug(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "-", text).strip("-").lower() or "episode"
 
@@ -555,8 +566,15 @@ def build_source_index(
     scene_threshold: float | None = None,
     min_scene_seconds: float = DEFAULT_MIN_SCENE_SECONDS,
     low_confidence_threshold: float = DEFAULT_LOW_CONFIDENCE,
+    asr_device: str = "auto",
+    timings: dict[str, float] | None = None,
 ) -> BuildResult:
-    """Analyse ``video_path`` and write ``anime_source_index.json`` + review packet."""
+    """Analyse ``video_path`` and write ``anime_source_index.json`` + review packet.
+
+    ``asr_device`` (auto/cuda/cpu) goes to the transcriber. Pass a dict as
+    ``timings`` to receive wall-clock seconds per stage.
+    """
+    timings = {} if timings is None else timings
     video_path = Path(video_path)
     if not video_path.is_file():
         raise IndexBuildError(f"video not found: {video_path}")
@@ -575,7 +593,8 @@ def build_source_index(
     work_dir.mkdir(parents=True, exist_ok=True)
     keyframe_dir.mkdir(parents=True, exist_ok=True)
 
-    info = probe_video(video_path)
+    with _stage(timings, "probe"):
+        info = probe_video(video_path)
     fps, duration = info["fps"], info["duration_seconds"]
     warnings: list[Issue] = []
     tools_used: list[str] = ["ffprobe"]
@@ -587,26 +606,31 @@ def build_source_index(
         ))
 
     detect_on = video_path
-    if info["height"] > PROXY_MAX_HEIGHT:
-        detect_on = make_analysis_proxy(video_path, work_dir / "analysis_proxy.mp4")
-        tools_used.append("ffmpeg(proxy)")
-    scenes, scene_warnings = detect_scenes(
-        detect_on, work_dir, fps=fps, duration=duration, threshold=scene_threshold, min_scene_seconds=min_scene_seconds
-    )
+    with _stage(timings, "proxy"):
+        if info["height"] > PROXY_MAX_HEIGHT:
+            detect_on = make_analysis_proxy(video_path, work_dir / "analysis_proxy.mp4")
+            tools_used.append("ffmpeg(proxy)")
+    with _stage(timings, "scene_detect"):
+        scenes, scene_warnings = detect_scenes(
+            detect_on, work_dir, fps=fps, duration=duration, threshold=scene_threshold, min_scene_seconds=min_scene_seconds
+        )
     warnings += scene_warnings
     tools_used.append("scene_detect")
     if importlib.util.find_spec("scenedetect") is None:
         tools_used.append("ffmpeg scdet(rgb)")  # detect_scenes' supplement on the ffmpeg fallback
 
-    keyframes = extract_keyframes(video_path, scenes, keyframe_dir, fps)
+    with _stage(timings, "keyframes"):
+        keyframes = extract_keyframes(video_path, scenes, keyframe_dir, fps)
     tools_used.append("frame_sampler")
 
     if transcript_path is not None:
-        transcript = _load_transcript(Path(transcript_path))
+        with _stage(timings, "transcript"):
+            transcript = _load_transcript(Path(transcript_path))
         transcript_origin = "external_file"
         tools_used.append(f"transcript:{Path(transcript_path).name}")
     else:
-        transcript = transcribe_japanese(video_path, work_dir, model_size)
+        with _stage(timings, "transcript"):
+            transcript = transcribe_japanese(video_path, work_dir, model_size, device=asr_device)
         transcript_origin = "faster_whisper"
         tools_used.append(f"transcriber(faster-whisper {model_size}, ja)")
         if model_size in SMALL_ASR_MODELS:
@@ -618,12 +642,14 @@ def build_source_index(
     if language and language != "ja":
         warnings.append(Issue("transcript_not_japanese", "transcript.language", f"transcript language is '{language}', expected 'ja'"))
 
-    dialogue = assign_dialogue(transcript["segments"], scenes, low_confidence_threshold=low_confidence_threshold)
-    if not any(dialogue.values()):
-        warnings.append(Issue("no_dialogue", "scenes", "no dialogue lines were assigned — check the audio track and transcript"))
-    elif info["has_audio"]:
-        measure_line_loudness(video_path, dialogue)
-        tools_used.append("ffmpeg(line loudness)")
+    with _stage(timings, "dialogue"):
+        dialogue = assign_dialogue(transcript["segments"], scenes, low_confidence_threshold=low_confidence_threshold)
+    with _stage(timings, "loudness"):
+        if not any(dialogue.values()):
+            warnings.append(Issue("no_dialogue", "scenes", "no dialogue lines were assigned — check the audio track and transcript"))
+        elif info["has_audio"]:
+            measure_line_loudness(video_path, dialogue)
+            tools_used.append("ffmpeg(line loudness)")
 
     index = {
         "version": "1.0",
@@ -660,11 +686,12 @@ def build_source_index(
         ],
     }
 
-    index_path = output_dir / "anime_source_index.json"
-    index_path.write_text(json.dumps(index, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    packet_path = write_review_packet(index, output_dir / "review_packet.md")
-    template_path = output_dir / "visual_annotations.template.json"
-    template_path.write_text(json.dumps(annotations_template(index), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    with _stage(timings, "write"):
+        index_path = output_dir / "anime_source_index.json"
+        index_path.write_text(json.dumps(index, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        packet_path = write_review_packet(index, output_dir / "review_packet.md")
+        template_path = output_dir / "visual_annotations.template.json"
+        template_path.write_text(json.dumps(annotations_template(index), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return BuildResult(index, index_path, packet_path, template_path, warnings)
 
 

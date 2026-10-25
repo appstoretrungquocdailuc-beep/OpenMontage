@@ -69,6 +69,12 @@ class Transcriber(BaseTool):
                 "description": "Optional decoding context, e.g. 以下は日本語のアニメの会話です。 for Japanese anime dialogue",
             },
             "beam_size": {"type": "integer", "minimum": 1, "description": "Optional beam width (faster-whisper default if omitted)"},
+            "device": {
+                "type": "string",
+                "enum": ["auto", "cuda", "cpu"],
+                "default": "auto",
+                "description": "auto picks CUDA when ctranslate2 sees a GPU; cpu forces CPU; cuda falls back to CPU (with gpu_fallback_reason) when no GPU",
+            },
         },
     }
 
@@ -147,16 +153,22 @@ class Transcriber(BaseTool):
         # PyTorch—is authoritative for CUDA availability and compute types.
         device = "cpu"
         compute_type = "int8"
+        requested_device = inputs.get("device", "auto")
+        gpu_fallback_reason = None
         try:
             import ctranslate2
 
-            if ctranslate2.get_cuda_device_count() > 0:
+            if requested_device == "cpu":
+                pass
+            elif ctranslate2.get_cuda_device_count() > 0:
                 supported = ctranslate2.get_supported_compute_types("cuda")
                 for candidate in ("float16", "int8_float16", "float32"):
                     if candidate in supported:
                         device = "cuda"
                         compute_type = candidate
                         break
+            elif requested_device == "cuda":
+                gpu_fallback_reason = "device='cuda' requested but no CUDA device was found; using CPU"
         except Exception:
             # Probing is advisory. CPU remains a safe deterministic baseline.
             pass
@@ -209,7 +221,6 @@ class Transcriber(BaseTool):
 
             return parsed_segments, parsed_words, transcription_info
 
-        gpu_fallback_reason = None
         try:
             segments, word_timestamps, info = _transcribe_on(device, compute_type)
         except Exception as exc:

@@ -104,3 +104,7 @@ venv/
 
 # Local Wan / diffusers GPU environment
 .venv-wan/
+
+# Anime real-footage trial: user videos, results, venv (never commit anime footage)
+/anime_trial/
+/.venv-anime/
