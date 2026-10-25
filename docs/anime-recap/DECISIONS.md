@@ -72,6 +72,27 @@ Branch `claude/charming-meitner-s9tzcb`. Plans: `docs/superpowers/plans/2026-10-
 - Not run on a real GPU yet (container has no GPU, huggingface.co blocked). Tier 2 waits until the user's scored
   story map shows Tier 1 understands the episode. Guide: `docs/anime-recap/HUONG_DAN_TANG1_QWEN3_VL.md`.
 
+## Phase 3 fix — first real Qwen3-VL run failed (2026-10-25)
+- Real run (#253-1, RTX 3060, Qwen3-VL-4B-Thinking NF4): 1499.1 s, 4 calls, 16.87 tok/s, 3/4 calls hit
+  max_new_tokens=6144, w01 "unterminated JSON", 0 grounded claims, VRAM 4662 MB, GPU None — yet the synthesizer
+  invented a logline (man, watch, girl, wallet) with empty claim_ids, and the report said PENDING.
+  4 × 6144 / 16.87 ≈ 1457 s → generation length, not prefill, dominated. Thinking vs answer split was not logged;
+  the new per-call table measures it.
+- Causes fixed: (1) `parse_model_json` escape bug (`esc` computed before the quote check, so `"x \""` ended the
+  string early) → proper state machine, answer = text after the last `</think>`, truncation reported as "bị cắt";
+  (2) synthesizer ran with zero claims → gated on ≥1 grounded non-hypothesis claim, and every synthesis item must
+  cite valid claim ids or it is removed (count kept, text not shown); (3) GPU None: `info()` read before the lazy
+  model load → read after the calls, and `info()` asks torch for the device name; (4) unbounded thinking →
+  `budgeted_generate` forces `</think>` at the thinking budget (Qwen's own forced-close text), separate answer budget.
+- Pipeline split into short JSON steps: extract ≤4 observed events (frames) → grounder drops events without real
+  evidence → reason (text only) only over grounded event ids, unknown/empty refs dropped, never "observation" →
+  verify (inferences first) → synthesize (scope = analysed windows; pilot says THỬ NGHIỆM / "không phải toàn bộ tập").
+  Budgets (think/answer): extract 512/768, reason 768/1024, verify 256/256, synthesize 768/1536.
+- No retry on a parse failure with the same budget; raw answers saved in `reasoner/raw/` (debug only, never in
+  story_map). `--max-calls` hard cap; live progress (window, frames, step, call n, tokens every 5 s, valid claims).
+- `--extract-model Qwen/Qwen3-VL-4B-Instruct` optional (extra ~9 GB download, both models in VRAM) — not claimed
+  better; compare on scored runs. BAT 7 default = 1 window of 20 s, 8 frames, ≤4 calls; full episode only after it passes.
+
 ## Legacy AI_VIDEO_DIRECTOR_CN_JP (private; never commit its source to this public repo)
 | Legacy module | Decision | Why |
 |---|---|---|

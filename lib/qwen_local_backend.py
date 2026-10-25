@@ -67,6 +67,75 @@ def build_hf_messages(system: str, parts: list[dict]) -> list[dict]:
     return [{"role": "system", "content": [{"type": "text", "text": system}]}, {"role": "user", "content": content}]
 
 
+# Qwen3 documents ending a thinking budget by appending this sentence and </think>.
+FORCED_CLOSE_TEXT = "\n\nConsidering the limited time, I have to give the solution based on the thinking directly now.\n</think>\n\n"
+
+
+def is_thinking_model(model_id: str) -> bool:
+    return "thinking" in model_id.lower()
+
+
+def budgeted_generate(
+    generate_fn: Callable[[list[int], int], list[int]],
+    *,
+    think_end_id: int | None,
+    eos_ids: set[int],
+    forced_close_ids: list[int],
+    think_budget: int,
+    answer_budget: int,
+) -> dict:
+    """Generate with a hard thinking budget, then a separate answer budget.
+
+    ``generate_fn(prefix, max_new)`` continues the prompt + ``prefix`` and returns
+    only the new token ids. Thinking that has not closed with </think> within
+    ``think_budget`` tokens is closed by appending ``forced_close_ids``; the answer
+    then gets its own ``answer_budget`` (the real run spent all 6144 tokens
+    thinking and never reached the JSON).
+    """
+    if think_end_id is None:  # Instruct model: answer only
+        tokens = generate_fn([], answer_budget)
+        done = bool(tokens) and tokens[-1] in eos_ids
+        return {"tokens": tokens, "thinking_tokens": 0, "answer_tokens": len(tokens), "think_forced_close": False,
+                "hit_max_new_tokens": not done and len(tokens) >= answer_budget}
+    first = generate_fn([], think_budget)
+    forced = False
+    if think_end_id in first:
+        cut = first.index(think_end_id) + 1
+        thinking, answer = first[:cut], first[cut:]
+    elif first and first[-1] in eos_ids:  # answered without thinking
+        thinking, answer = [], first
+    else:
+        thinking, answer, forced = first + list(forced_close_ids), [], True
+    done = bool(answer) and answer[-1] in eos_ids
+    if not done and len(answer) < answer_budget:
+        answer = answer + generate_fn(thinking + answer, answer_budget - len(answer))
+        done = bool(answer) and answer[-1] in eos_ids
+    return {"tokens": thinking + answer, "thinking_tokens": len(thinking), "answer_tokens": len(answer),
+            "think_forced_close": forced, "hit_max_new_tokens": not done and len(answer) >= answer_budget}
+
+
+class _ProgressStreamer:
+    """Counts generated tokens and reports them every few seconds (live progress)."""
+
+    def __init__(self, on_progress: Callable[[str], None], label: str, every: float = 5.0):
+        self.on_progress, self.label, self.every = on_progress, label, every
+        self.count, self.started, self.last, self.skipped_prompt = 0, time.perf_counter(), 0.0, False
+
+    def put(self, value) -> None:
+        if not self.skipped_prompt:  # first call carries the prompt
+            self.skipped_prompt = True
+            return
+        self.count += int(value.numel()) if hasattr(value, "numel") else 1
+        now = time.perf_counter()
+        if now - self.last >= self.every:
+            self.last = now
+            rate = self.count / max(now - self.started, 1e-6)
+            self.on_progress(f"    … {self.label}: {self.count} token, {now - self.started:.0f}s, {rate:.1f} token/s")
+
+    def end(self) -> None:
+        self.skipped_prompt = False
+
+
 class TransformersQwenBackend:
     backend = "transformers"
 
@@ -78,6 +147,14 @@ class TransformersQwenBackend:
         self._device_name = None
 
     def info(self) -> dict:
+        if self._device_name is None:
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    self._device_name = torch.cuda.get_device_name(0)
+            except (ImportError, TypeError, AttributeError):
+                pass
         return {
             "backend": self.backend,
             "model_id": self.model_id,
@@ -112,29 +189,53 @@ class TransformersQwenBackend:
         self._processor = AutoProcessor.from_pretrained(self.model_id)
         self._device_name = torch.cuda.get_device_name(0)
 
-    def chat(self, system: str, parts: list[dict], *, max_new_tokens: int = 4096) -> tuple[str, dict]:
+    def chat(self, system: str, parts: list[dict], *, think_budget: int = 512, answer_budget: int = 1024,
+             on_progress: Callable[[str], None] | None = None, label: str = "") -> tuple[str, dict]:
         self._load()
         import torch
 
         torch.manual_seed(self.seed)
+        tok = self._processor.tokenizer
         inputs = self._processor.apply_chat_template(
             build_hf_messages(system, parts), tokenize=True, add_generation_prompt=True,
             return_dict=True, return_tensors="pt",
         ).to(self._model.device)
+        prompt_ids = inputs["input_ids"]
+        streamer = _ProgressStreamer(on_progress, label) if on_progress else None
+
+        def generate(prefix: list[int], max_new: int) -> list[int]:
+            call = dict(inputs)
+            if prefix:
+                extra = torch.tensor([prefix], device=prompt_ids.device, dtype=prompt_ids.dtype)
+                for key, value in inputs.items():
+                    if hasattr(value, "shape") and value.shape == prompt_ids.shape:
+                        pad = torch.ones_like(extra) if key == "attention_mask" else (extra if key == "input_ids" else torch.zeros_like(extra))
+                        call[key] = torch.cat([value, pad], dim=1)
+            with torch.inference_mode():
+                out = self._model.generate(**call, max_new_tokens=max_new, streamer=streamer, **SAMPLING)
+            return out[0, call["input_ids"].shape[1]:].tolist()
+
+        eos = self._model.generation_config.eos_token_id
+        eos_ids = set(eos if isinstance(eos, (list, tuple)) else [eos])
+        thinking = is_thinking_model(self.model_id)
         torch.cuda.reset_peak_memory_stats()
         start = time.perf_counter()
-        with torch.inference_mode():
-            out = self._model.generate(**inputs, max_new_tokens=max_new_tokens, **SAMPLING)
+        result = budgeted_generate(
+            generate,
+            think_end_id=tok.convert_tokens_to_ids("</think>") if thinking else None,
+            eos_ids=eos_ids,
+            forced_close_ids=tok.encode(FORCED_CLOSE_TEXT, add_special_tokens=False) if thinking else [],
+            think_budget=think_budget, answer_budget=answer_budget,
+        )
         seconds = time.perf_counter() - start
-        prompt_len = inputs["input_ids"].shape[1]
-        generated = out[:, prompt_len:]
-        text = self._processor.batch_decode(generated, skip_special_tokens=True)[0]
-        n = int(generated.shape[1])
+        text = tok.decode(result["tokens"], skip_special_tokens=True)
+        n = len(result["tokens"])
         return text, {
-            "prompt_tokens": int(prompt_len), "generated_tokens": n, "seconds": round(seconds, 2),
-            "tokens_per_second": round(n / seconds, 2) if seconds else None,
+            "prompt_tokens": int(prompt_ids.shape[1]), "generated_tokens": n,
+            "thinking_tokens": result["thinking_tokens"], "answer_tokens": result["answer_tokens"],
+            "think_forced_close": result["think_forced_close"], "hit_max_new_tokens": result["hit_max_new_tokens"],
+            "seconds": round(seconds, 2), "tokens_per_second": round(n / seconds, 2) if seconds else None,
             "peak_vram_mb": round(torch.cuda.max_memory_allocated() / 2**20),
-            "hit_max_new_tokens": n >= max_new_tokens,
         }
 
 
@@ -148,7 +249,9 @@ class OllamaQwenBackend:
     def info(self) -> dict:
         return {"backend": self.backend, "model_id": self.model, "quantization": "ollama-default (GGUF)", "gpu": None}
 
-    def chat(self, system: str, parts: list[dict], *, max_new_tokens: int = 4096) -> tuple[str, dict]:
+    def chat(self, system: str, parts: list[dict], *, think_budget: int = 512, answer_budget: int = 1024,
+             on_progress: Callable[[str], None] | None = None, label: str = "") -> tuple[str, dict]:
+        max_new_tokens = think_budget + answer_budget  # Ollama has no separate thinking budget
         messages: list[dict] = [{"role": "system", "content": system}]
         for part in parts:
             if "image" in part:
@@ -176,6 +279,7 @@ class OllamaQwenBackend:
             "seconds": round(time.perf_counter() - start, 2),
             "tokens_per_second": round(n / eval_s, 2) if eval_s else None, "peak_vram_mb": None,
             "hit_max_new_tokens": n >= max_new_tokens, "thinking_chars": len(message.get("thinking") or ""),
+            "thinking_tokens": None, "answer_tokens": None, "think_forced_close": False,
         }
 
 
@@ -222,7 +326,7 @@ def smoke_test(backend: TransformersQwenBackend) -> dict:
             "You are a careful vision assistant.",
             [{"text": "[t=0.000s]"}, {"image": img},
              {"text": 'What is the dominant colour of this frame? Answer only JSON: {"colour": "<english word>"}'}],
-            max_new_tokens=1024,
+            think_budget=256, answer_budget=128,
         )
     thinking, answer = split_thinking(text)
     match = re.search(r"\{.*\}", answer, re.DOTALL)
