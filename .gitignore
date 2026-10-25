@@ -108,3 +108,4 @@ venv/
 # Anime real-footage trial: user videos, results, venv (never commit anime footage)
 /anime_trial/
 /.venv-anime/
+/.venv-qwen/

@@ -59,6 +59,19 @@ Branch `claude/charming-meitner-s9tzcb`. Plans: `docs/superpowers/plans/2026-10-
   (no Whisper, no scene detection), backs up the old index and a filled dialogue sheet.
 - Not yet confirmed on the user's real files (need `anime_source_index.json` + `work/*_transcript.json`).
 
+## Phase 3 — user chose option D (open source, offline, $0 API) — 2026-10-25
+- `lib/anime_vision_providers.py` (Claude/Ollama/Fake) exists but the Claude path is NOT used in this phase.
+- Tier 1 experiment: `lib/qwen_local_backend.py` (official `Qwen/Qwen3-VL-4B-Thinking` via transformers,
+  bitsandbytes NF4, separate `.venv-qwen`; `qwen3-vl:4b` via Ollama for comparison) +
+  `lib/anime_story_reasoner.py` (VideoMind *ideas* only: planner/answerer/grounder/verifier/synthesizer as
+  prompts + code; no VideoMind code or weights — its checkpoints are Qwen2-VL LoRAs).
+- Frames are fed as an interleaved, time-ordered sequence `[t=…s scNNN]` + image (exact source times), with
+  Whisper lines; not Qwen3-VL's native video input (version-specific API, kept for later).
+- Grounding rules: frame times snap to shown frames within 1 s; unknown line ids dropped; time outside window
+  (±1 s) → hypothesis; observation/inference with no evidence → hypothesis; verifier "unsupported" → hypothesis.
+- Not run on a real GPU yet (container has no GPU, huggingface.co blocked). Tier 2 waits until the user's scored
+  story map shows Tier 1 understands the episode. Guide: `docs/anime-recap/HUONG_DAN_TANG1_QWEN3_VL.md`.
+
 ## Legacy AI_VIDEO_DIRECTOR_CN_JP (private; never commit its source to this public repo)
 | Legacy module | Decision | Why |
 |---|---|---|

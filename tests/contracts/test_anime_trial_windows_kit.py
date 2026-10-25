@@ -78,3 +78,38 @@ def test_guide_tells_where_to_put_video_what_to_run_and_where_results_are():
                    "review_packet.md", "anime_source_index.json", "kiem_tra_loi_thoai.csv", "kiem_tra_canh.csv",
                    "PENDING", "Python 3.11", "FFmpeg"):
         assert needle in text, needle
+
+
+# ── Tier 1 local Qwen3-VL experiment (separate venv, Whisper untouched) ─
+
+QWEN_BATS = {
+    "6_CAI_DAT_QWEN3_VL.bat": "-m lib.qwen_local_backend setup",
+    "7_QWEN3_VL_HIEU_PHIM.bat": "-m lib.anime_story_reasoner run",
+    "8_CHAM_BAN_DO_COT_TRUYEN.bat": "-m lib.anime_story_reasoner score",
+}
+
+
+@pytest.mark.parametrize(("name", "command"), QWEN_BATS.items())
+def test_qwen_bats_use_their_own_venv(name, command):
+    raw = (KIT / name).read_bytes()
+    assert raw.count(b"\n") == raw.count(b"\r\n"), "CRLF"
+    text = raw.decode("utf-8")
+    assert command in text
+    assert ".venv-qwen" in text and ".venv-anime" not in text
+    assert "chcp 65001" in text and 'cd /d "%~dp0..\\.."' in text
+
+
+def test_qwen_setup_bat_creates_the_separate_venv():
+    text = (KIT / "6_CAI_DAT_QWEN3_VL.bat").read_text(encoding="utf-8")
+    assert "-m venv .venv-qwen" in text and "py -3.11" in text
+
+
+def test_qwen_venv_is_git_ignored():
+    assert re.search(r"^/\.venv-qwen/$", (REPO / ".gitignore").read_text(encoding="utf-8"), re.MULTILINE)
+
+
+def test_tier1_guide_states_model_offline_and_videomind_honestly():
+    text = (REPO / "docs" / "anime-recap" / "HUONG_DAN_TANG1_QWEN3_VL.md").read_text(encoding="utf-8")
+    for needle in (*QWEN_BATS, "Qwen/Qwen3-VL-4B-Thinking", "VideoMind", "offline", "$0", "ban_do_cot_truyen.md",
+                   "kiem_tra_ban_do_cot_truyen.csv", "so_sanh_model.csv", "qwen_trial_report.md"):
+        assert needle in text, needle
