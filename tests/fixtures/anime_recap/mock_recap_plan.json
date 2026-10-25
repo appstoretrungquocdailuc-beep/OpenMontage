@@ -1,0 +1,423 @@
+{
+  "version": "1.0",
+  "source_index_id": "mock-ep-001",
+  "language": "ja",
+  "fps": 23.976,
+  "target_duration_seconds": {
+    "min": 60,
+    "max": 90
+  },
+  "title_ja": "ママのご褒美ケーキ事件（モック）",
+  "segments": [
+    {
+      "segment_id": "seg01",
+      "story_role": "hook",
+      "scene_ids": [
+        "sc008"
+      ],
+      "source_start_seconds": 300.0,
+      "source_end_seconds": 306.0,
+      "cut": {
+        "in_frame": 7193,
+        "out_frame": 7337
+      },
+      "timeline_start_seconds": 0.0,
+      "timeline_end_seconds": 6.0,
+      "dialogue_used": [
+        {
+          "line_id": "sc008_l01",
+          "text_ja": "私のケーキが…変な形になってる！",
+          "text_vi": "Bánh của mẹ... sao lại có hình thù kỳ quặc thế này!"
+        }
+      ],
+      "narration": {
+        "text_ja": "冷蔵庫を開けたみさえが、悲鳴を上げる。いったい何があったのか？",
+        "text_vi": "Misae mở tủ lạnh và hét lên. Rốt cuộc đã xảy ra chuyện gì?",
+        "duration_seconds": 4.76,
+        "duration_source": "estimate"
+      },
+      "claims": [
+        {
+          "claim_id": "seg01_c1",
+          "text_ja": "冷蔵庫を開けたみさえが、悲鳴を上げる。",
+          "text_vi": "Misae mở tủ lạnh và hét lên.",
+          "type": "event",
+          "evidence": [
+            {
+              "scene_id": "sc008",
+              "line_id": "sc008_l01",
+              "start_seconds": 300.0,
+              "end_seconds": 306.0,
+              "observation": "みさえが冷蔵庫を開けて叫ぶ"
+            }
+          ]
+        },
+        {
+          "claim_id": "seg01_c2",
+          "text_ja": "いったい何があったのか？",
+          "text_vi": "Rốt cuộc đã xảy ra chuyện gì?",
+          "type": "question",
+          "evidence": []
+        }
+      ],
+      "craft_notes": [
+        "hook: 結果を先に見せる cold open（sw-series-structure / sw-japanese-screenwriting『尽早結束情況説明』）"
+      ]
+    },
+    {
+      "segment_id": "seg02",
+      "story_role": "development",
+      "scene_ids": [
+        "sc002"
+      ],
+      "source_start_seconds": 30.0,
+      "source_end_seconds": 42.0,
+      "cut": {
+        "in_frame": 719,
+        "out_frame": 1007
+      },
+      "timeline_start_seconds": 6.0,
+      "timeline_end_seconds": 18.0,
+      "dialogue_used": [
+        {
+          "line_id": "sc002_l02",
+          "text_ja": "誰も食べちゃダメよ！",
+          "text_vi": "Không ai được ăn đâu nhé!"
+        }
+      ],
+      "narration": {
+        "text_ja": "みさえは、自分へのご褒美にケーキを買ってきた。「誰も食べちゃダメよ！」",
+        "text_vi": "Misae mua bánh ngọt về làm phần thưởng cho bản thân. \"Không ai được ăn đâu nhé!\"",
+        "duration_seconds": 5.07,
+        "duration_source": "estimate"
+      },
+      "claims": [
+        {
+          "claim_id": "seg02_c1",
+          "text_ja": "みさえは、自分へのご褒美にケーキを買ってきた。",
+          "text_vi": "Misae mua bánh ngọt về làm phần thưởng cho bản thân.",
+          "type": "event",
+          "evidence": [
+            {
+              "scene_id": "sc002",
+              "line_id": "sc002_l01",
+              "start_seconds": 31.0,
+              "end_seconds": 34.5,
+              "observation": "ご褒美だと言う"
+            }
+          ]
+        },
+        {
+          "claim_id": "seg02_c2",
+          "text_ja": "「誰も食べちゃダメよ！」",
+          "text_vi": "\"Không ai được ăn đâu nhé!\"",
+          "type": "quote",
+          "evidence": [
+            {
+              "scene_id": "sc002",
+              "line_id": "sc002_l02",
+              "start_seconds": 35.0,
+              "end_seconds": 38.2,
+              "observation": "禁止を宣言する"
+            }
+          ]
+        }
+      ],
+      "craft_notes": [
+        "setup: 禁止＝後のpayoffの種（sw-sitcom-comedy『種了種子就要収割』）"
+      ]
+    },
+    {
+      "segment_id": "seg03",
+      "story_role": "development",
+      "scene_ids": [
+        "sc005"
+      ],
+      "source_start_seconds": 148.0,
+      "source_end_seconds": 160.0,
+      "cut": {
+        "in_frame": 3548,
+        "out_frame": 3836
+      },
+      "timeline_start_seconds": 18.0,
+      "timeline_end_seconds": 30.0,
+      "dialogue_used": [
+        {
+          "line_id": "sc005_l01",
+          "text_ja": "ちょっとだけなら、バレないゾ。",
+          "text_vi": "Ăn một chút thôi thì không bị phát hiện đâu."
+        }
+      ],
+      "narration": {
+        "text_ja": "留守番中のしんのすけは、ついに冷蔵庫を開ける。「ちょっとだけなら、バレないゾ。」",
+        "text_vi": "Ở nhà một mình, Shinnosuke cuối cùng cũng mở tủ lạnh. \"Ăn một chút thôi thì không bị phát hiện đâu.\"",
+        "duration_seconds": 5.83,
+        "duration_source": "estimate"
+      },
+      "claims": [
+        {
+          "claim_id": "seg03_c1",
+          "text_ja": "留守番中のしんのすけは、ついに冷蔵庫を開ける。",
+          "text_vi": "Ở nhà một mình, Shinnosuke cuối cùng cũng mở tủ lạnh.",
+          "type": "event",
+          "evidence": [
+            {
+              "scene_id": "sc005",
+              "line_id": null,
+              "start_seconds": 148.0,
+              "end_seconds": 156.0,
+              "observation": "しんのすけが冷蔵庫を開ける"
+            }
+          ]
+        },
+        {
+          "claim_id": "seg03_c2",
+          "text_ja": "「ちょっとだけなら、バレないゾ。」",
+          "text_vi": "\"Ăn một chút thôi thì không bị phát hiện đâu.\"",
+          "type": "quote",
+          "evidence": [
+            {
+              "scene_id": "sc005",
+              "line_id": "sc005_l01",
+              "start_seconds": 152.0,
+              "end_seconds": 155.0,
+              "observation": "独り言"
+            }
+          ]
+        }
+      ],
+      "craft_notes": [
+        "欲望 vs 禁止（sw-character-conflict）"
+      ]
+    },
+    {
+      "segment_id": "seg04",
+      "story_role": "conflict",
+      "scene_ids": [
+        "sc007"
+      ],
+      "source_start_seconds": 238.0,
+      "source_end_seconds": 250.0,
+      "cut": {
+        "in_frame": 5706,
+        "out_frame": 5994
+      },
+      "timeline_start_seconds": 30.0,
+      "timeline_end_seconds": 42.0,
+      "dialogue_used": [
+        {
+          "line_id": "sc007_l01",
+          "text_ja": "お餅で作れば完璧だゾ。",
+          "text_vi": "Làm bằng bánh mochi là hoàn hảo luôn."
+        }
+      ],
+      "narration": {
+        "text_ja": "ケーキは全部なくなり、しんのすけはお餅で偽物を作り始める。",
+        "text_vi": "Bánh hết sạch, Shinnosuke bắt đầu làm bánh giả bằng mochi.",
+        "duration_seconds": 4.45,
+        "duration_source": "estimate"
+      },
+      "claims": [
+        {
+          "claim_id": "seg04_c1",
+          "text_ja": "ケーキは全部なくなり、しんのすけはお餅で偽物を作り始める。",
+          "text_vi": "Bánh hết sạch, Shinnosuke bắt đầu làm bánh giả bằng mochi.",
+          "type": "event",
+          "evidence": [
+            {
+              "scene_id": "sc006",
+              "line_id": "sc006_l01",
+              "start_seconds": 200.0,
+              "end_seconds": 202.4,
+              "observation": "空の箱"
+            },
+            {
+              "scene_id": "sc007",
+              "line_id": null,
+              "start_seconds": 238.0,
+              "end_seconds": 250.0,
+              "observation": "お餅を丸める"
+            }
+          ]
+        }
+      ],
+      "craft_notes": [
+        "predicament: 嘘をごまかしで隠す（sw-sitcom-comedy『Big Lie → Bigger Lies』）"
+      ]
+    },
+    {
+      "segment_id": "seg05",
+      "story_role": "conflict",
+      "scene_ids": [
+        "sc009"
+      ],
+      "source_start_seconds": 335.0,
+      "source_end_seconds": 347.0,
+      "cut": {
+        "in_frame": 8032,
+        "out_frame": 8320
+      },
+      "timeline_start_seconds": 42.0,
+      "timeline_end_seconds": 54.0,
+      "dialogue_used": [
+        {
+          "line_id": "sc009_l02",
+          "text_ja": "シロが食べたんだゾ。",
+          "text_vi": "Là Shiro ăn đấy."
+        }
+      ],
+      "narration": {
+        "text_ja": "問い詰められたしんのすけは、シロのせいにする。これは苦しい言い訳だ。",
+        "text_vi": "Bị gặng hỏi, Shinnosuke đổ tội cho Shiro. Đúng là một lời bào chữa khó nghe.",
+        "duration_seconds": 5.22,
+        "duration_source": "estimate"
+      },
+      "claims": [
+        {
+          "claim_id": "seg05_c1",
+          "text_ja": "問い詰められたしんのすけは、シロのせいにする。",
+          "text_vi": "Bị gặng hỏi, Shinnosuke đổ tội cho Shiro.",
+          "type": "event",
+          "evidence": [
+            {
+              "scene_id": "sc009",
+              "line_id": "sc009_l02",
+              "start_seconds": 342.0,
+              "end_seconds": 344.6,
+              "observation": "シロが食べたと言う"
+            }
+          ]
+        },
+        {
+          "claim_id": "seg05_c2",
+          "text_ja": "これは苦しい言い訳だ。",
+          "text_vi": "Đúng là một lời bào chữa khó nghe.",
+          "type": "commentary",
+          "evidence": []
+        }
+      ],
+      "craft_notes": [
+        "escalation: 嘘が一段大きくなる（sw-scene-craft 価値転換）"
+      ]
+    },
+    {
+      "segment_id": "seg06",
+      "story_role": "climax",
+      "scene_ids": [
+        "sc010"
+      ],
+      "source_start_seconds": 385.0,
+      "source_end_seconds": 395.0,
+      "cut": {
+        "in_frame": 9231,
+        "out_frame": 9471
+      },
+      "timeline_start_seconds": 54.0,
+      "timeline_end_seconds": 64.0,
+      "dialogue_used": [
+        {
+          "line_id": "sc010_l01",
+          "text_ja": "ごめんなさい、オラが食べたゾ。",
+          "text_vi": "Con xin lỗi, là con ăn đấy."
+        }
+      ],
+      "narration": {
+        "text_ja": "そしてついに、しんのすけは頭を下げた。「オラが食べたゾ。」",
+        "text_vi": "Và cuối cùng, Shinnosuke cúi đầu. \"Là con ăn đấy.\"",
+        "duration_seconds": 4.14,
+        "duration_source": "estimate"
+      },
+      "claims": [
+        {
+          "claim_id": "seg06_c1",
+          "text_ja": "そしてついに、しんのすけは頭を下げた。",
+          "text_vi": "Và cuối cùng, Shinnosuke cúi đầu.",
+          "type": "event",
+          "evidence": [
+            {
+              "scene_id": "sc010",
+              "line_id": null,
+              "start_seconds": 385.0,
+              "end_seconds": 395.0,
+              "observation": "頭を下げる"
+            }
+          ]
+        },
+        {
+          "claim_id": "seg06_c2",
+          "text_ja": "「オラが食べたゾ。」",
+          "text_vi": "\"Là con ăn đấy.\"",
+          "type": "quote",
+          "evidence": [
+            {
+              "scene_id": "sc010",
+              "line_id": "sc010_l01",
+              "start_seconds": 388.0,
+              "end_seconds": 391.0,
+              "observation": "謝罪"
+            }
+          ]
+        }
+      ],
+      "craft_notes": [
+        "climax: 性格使然の転換＝告白（sw-story-structure 危機→高潮）"
+      ]
+    },
+    {
+      "segment_id": "seg07",
+      "story_role": "resolution",
+      "scene_ids": [
+        "sc011",
+        "sc012"
+      ],
+      "source_start_seconds": 445.0,
+      "source_end_seconds": 460.0,
+      "cut": {
+        "in_frame": 10669,
+        "out_frame": 11029
+      },
+      "timeline_start_seconds": 64.0,
+      "timeline_end_seconds": 79.0,
+      "dialogue_used": [
+        {
+          "line_id": "sc011_l01",
+          "text_ja": "おみやげにケーキ買ってきたぞ。",
+          "text_vi": "Bố mua bánh ngọt về làm quà này."
+        }
+      ],
+      "narration": {
+        "text_ja": "その夜、ひろしが同じケーキを買って帰り、家族みんなで食べることになった。",
+        "text_vi": "Tối đó, Hiroshi mua đúng loại bánh ấy về, và cả nhà cùng ăn.",
+        "duration_seconds": 5.53,
+        "duration_source": "estimate"
+      },
+      "claims": [
+        {
+          "claim_id": "seg07_c1",
+          "text_ja": "その夜、ひろしが同じケーキを買って帰り、家族みんなで食べることになった。",
+          "text_vi": "Tối đó, Hiroshi mua đúng loại bánh ấy về, và cả nhà cùng ăn.",
+          "type": "event",
+          "evidence": [
+            {
+              "scene_id": "sc011",
+              "line_id": "sc011_l01",
+              "start_seconds": 448.0,
+              "end_seconds": 451.0,
+              "observation": "おみやげのケーキ"
+            },
+            {
+              "scene_id": "sc012",
+              "line_id": null,
+              "start_seconds": 455.0,
+              "end_seconds": 460.0,
+              "observation": "家族で食べる"
+            }
+          ]
+        }
+      ],
+      "craft_notes": [
+        "合: 日常に戻る（sw-japanese-screenwriting 起承転結）"
+      ]
+    }
+  ]
+}

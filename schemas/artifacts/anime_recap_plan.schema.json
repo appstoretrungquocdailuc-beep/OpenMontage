@@ -1,0 +1,110 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AnimeRecapPlan",
+  "description": "A 60–90 s Japanese review script plus frame-accurate cut list for one anime episode. Every event or quote must cite an anime_source_index scene/line. Semantic rules (timestamps inside scenes, frame math, verbatim quotes, gapless timeline, story order) are enforced by `python -m lib.anime_recap`, not by this schema alone.",
+  "type": "object",
+  "required": ["version", "source_index_id", "language", "fps", "segments"],
+  "properties": {
+    "version": { "type": "string" },
+    "source_index_id": { "type": "string", "minLength": 1 },
+    "language": { "type": "string", "const": "ja" },
+    "fps": { "type": "number", "exclusiveMinimum": 0 },
+    "title_ja": { "type": "string" },
+    "target_duration_seconds": {
+      "type": "object",
+      "properties": {
+        "min": { "type": "number", "minimum": 0 },
+        "max": { "type": "number", "minimum": 0 }
+      }
+    },
+    "segments": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "segment_id", "story_role", "scene_ids",
+          "source_start_seconds", "source_end_seconds", "cut",
+          "timeline_start_seconds", "timeline_end_seconds",
+          "narration", "claims"
+        ],
+        "properties": {
+          "segment_id": { "type": "string", "minLength": 1 },
+          "story_role": {
+            "type": "string",
+            "enum": ["hook", "development", "conflict", "climax", "resolution"]
+          },
+          "scene_ids": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+          "source_start_seconds": { "type": "number", "minimum": 0 },
+          "source_end_seconds": { "type": "number", "exclusiveMinimum": 0 },
+          "cut": {
+            "type": "object",
+            "required": ["in_frame", "out_frame"],
+            "properties": {
+              "in_frame": { "type": "integer", "minimum": 0, "description": "round(source_start_seconds * fps)" },
+              "out_frame": { "type": "integer", "minimum": 0, "description": "round(source_end_seconds * fps)" }
+            }
+          },
+          "timeline_start_seconds": { "type": "number", "minimum": 0 },
+          "timeline_end_seconds": { "type": "number", "exclusiveMinimum": 0 },
+          "dialogue_used": {
+            "type": "array",
+            "description": "Original lines left audible in this cut; text_ja must equal the source line.",
+            "items": {
+              "type": "object",
+              "required": ["line_id", "text_ja"],
+              "properties": {
+                "line_id": { "type": "string" },
+                "text_ja": { "type": "string" },
+                "text_vi": { "type": "string" }
+              }
+            }
+          },
+          "narration": {
+            "type": "object",
+            "required": ["text_ja", "duration_seconds", "duration_source"],
+            "properties": {
+              "text_ja": { "type": "string", "minLength": 1, "description": "Exactly the concatenation of claims[].text_ja." },
+              "text_vi": { "type": "string" },
+              "duration_seconds": { "type": "number", "exclusiveMinimum": 0 },
+              "duration_source": { "type": "string", "enum": ["estimate", "measured"] }
+            }
+          },
+          "claims": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": ["claim_id", "text_ja", "type", "evidence"],
+              "properties": {
+                "claim_id": { "type": "string", "minLength": 1 },
+                "text_ja": { "type": "string", "minLength": 1 },
+                "text_vi": { "type": "string" },
+                "type": {
+                  "type": "string",
+                  "enum": ["event", "quote", "commentary", "question"],
+                  "description": "event/quote need evidence; commentary/question are the narrator's own voice and must not state new facts."
+                },
+                "evidence": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": ["scene_id", "start_seconds", "end_seconds"],
+                    "properties": {
+                      "scene_id": { "type": "string" },
+                      "line_id": { "type": ["string", "null"] },
+                      "start_seconds": { "type": "number", "minimum": 0 },
+                      "end_seconds": { "type": "number", "exclusiveMinimum": 0 },
+                      "observation": { "type": "string" }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "craft_notes": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    }
+  }
+}

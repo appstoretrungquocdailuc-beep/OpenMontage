@@ -1,0 +1,348 @@
+{
+  "version": "1.0",
+  "source_index_id": "mock-ep-001",
+  "provenance": {
+    "kind": "mock",
+    "note": "架空のテスト用データ。実在のエピソードを解析したものではありません。/ Dữ liệu giả lập hư cấu, KHÔNG phải kết quả phân tích tập phim thật."
+  },
+  "video": {
+    "path": "mock/mock_episode.mp4",
+    "fps": 23.976,
+    "duration_seconds": 480.0,
+    "has_subtitles": false
+  },
+  "characters": [
+    {
+      "character_id": "shinnosuke",
+      "name_ja": "しんのすけ"
+    },
+    {
+      "character_id": "misae",
+      "name_ja": "みさえ"
+    },
+    {
+      "character_id": "hiroshi",
+      "name_ja": "ひろし"
+    },
+    {
+      "character_id": "shiro",
+      "name_ja": "シロ"
+    }
+  ],
+  "scenes": [
+    {
+      "scene_id": "sc001",
+      "start_seconds": 0.0,
+      "end_seconds": 22.0,
+      "visual_summary": "朝の食卓。野原家が朝食をとっている。",
+      "characters": [
+        "shinnosuke",
+        "misae",
+        "hiroshi"
+      ],
+      "actions": [
+        "朝食を食べる"
+      ],
+      "keyframes": [],
+      "dialogue": [
+        {
+          "line_id": "sc001_l01",
+          "start_seconds": 4.2,
+          "end_seconds": 6.8,
+          "speaker": "hiroshi",
+          "text_ja": "行ってきます！",
+          "text_vi": "Bố đi làm đây!"
+        }
+      ]
+    },
+    {
+      "scene_id": "sc002",
+      "start_seconds": 22.0,
+      "end_seconds": 58.0,
+      "visual_summary": "みさえがケーキ屋の箱を持って帰宅し、冷蔵庫にしまう。",
+      "characters": [
+        "misae",
+        "shinnosuke"
+      ],
+      "actions": [
+        "ケーキの箱を見せる",
+        "冷蔵庫にしまう"
+      ],
+      "keyframes": [],
+      "dialogue": [
+        {
+          "line_id": "sc002_l01",
+          "start_seconds": 31.0,
+          "end_seconds": 34.5,
+          "speaker": "misae",
+          "text_ja": "これは私のご褒美なんだから。",
+          "text_vi": "Đây là phần thưởng của mẹ đấy."
+        },
+        {
+          "line_id": "sc002_l02",
+          "start_seconds": 35.0,
+          "end_seconds": 38.2,
+          "speaker": "misae",
+          "text_ja": "誰も食べちゃダメよ！",
+          "text_vi": "Không ai được ăn đâu nhé!"
+        }
+      ]
+    },
+    {
+      "scene_id": "sc003",
+      "start_seconds": 58.0,
+      "end_seconds": 95.0,
+      "visual_summary": "しんのすけが冷蔵庫の前でじっと立っている。",
+      "characters": [
+        "shinnosuke"
+      ],
+      "actions": [
+        "冷蔵庫を見つめる"
+      ],
+      "keyframes": [],
+      "dialogue": [
+        {
+          "line_id": "sc003_l01",
+          "start_seconds": 70.0,
+          "end_seconds": 72.5,
+          "speaker": "shinnosuke",
+          "text_ja": "ケーキ、ケーキ〜。",
+          "text_vi": "Bánh ngọt, bánh ngọt~."
+        }
+      ]
+    },
+    {
+      "scene_id": "sc004",
+      "start_seconds": 95.0,
+      "end_seconds": 140.0,
+      "visual_summary": "みさえが買い物に出かける。",
+      "characters": [
+        "misae",
+        "shinnosuke"
+      ],
+      "actions": [
+        "玄関で靴を履く"
+      ],
+      "keyframes": [],
+      "dialogue": [
+        {
+          "line_id": "sc004_l01",
+          "start_seconds": 100.0,
+          "end_seconds": 103.0,
+          "speaker": "misae",
+          "text_ja": "お留守番お願いね、しんちゃん。",
+          "text_vi": "Ở nhà trông nhà giúp mẹ nhé, Shin."
+        }
+      ]
+    },
+    {
+      "scene_id": "sc005",
+      "start_seconds": 140.0,
+      "end_seconds": 190.0,
+      "visual_summary": "しんのすけとシロだけの家。しんのすけが冷蔵庫を開ける。",
+      "characters": [
+        "shinnosuke",
+        "shiro"
+      ],
+      "actions": [
+        "冷蔵庫を開ける",
+        "ケーキを食べる"
+      ],
+      "keyframes": [],
+      "dialogue": [
+        {
+          "line_id": "sc005_l01",
+          "start_seconds": 152.0,
+          "end_seconds": 155.0,
+          "speaker": "shinnosuke",
+          "text_ja": "ちょっとだけなら、バレないゾ。",
+          "text_vi": "Ăn một chút thôi thì không bị phát hiện đâu."
+        }
+      ]
+    },
+    {
+      "scene_id": "sc006",
+      "start_seconds": 190.0,
+      "end_seconds": 235.0,
+      "visual_summary": "空のケーキ箱。しんのすけが慌てる。",
+      "characters": [
+        "shinnosuke",
+        "shiro"
+      ],
+      "actions": [
+        "空の箱を持つ",
+        "部屋を走り回る"
+      ],
+      "keyframes": [],
+      "dialogue": [
+        {
+          "line_id": "sc006_l01",
+          "start_seconds": 200.0,
+          "end_seconds": 202.4,
+          "speaker": "shinnosuke",
+          "text_ja": "全部なくなっちゃった…。",
+          "text_vi": "Hết sạch mất rồi..."
+        }
+      ]
+    },
+    {
+      "scene_id": "sc007",
+      "start_seconds": 235.0,
+      "end_seconds": 280.0,
+      "visual_summary": "しんのすけがお餅でケーキの偽物を作る。",
+      "characters": [
+        "shinnosuke"
+      ],
+      "actions": [
+        "お餅を丸める",
+        "箱に入れる"
+      ],
+      "keyframes": [],
+      "dialogue": [
+        {
+          "line_id": "sc007_l01",
+          "start_seconds": 246.0,
+          "end_seconds": 249.0,
+          "speaker": "shinnosuke",
+          "text_ja": "お餅で作れば完璧だゾ。",
+          "text_vi": "Làm bằng bánh mochi là hoàn hảo luôn."
+        }
+      ]
+    },
+    {
+      "scene_id": "sc008",
+      "start_seconds": 280.0,
+      "end_seconds": 330.0,
+      "visual_summary": "帰宅したみさえが冷蔵庫を開けて叫ぶ。",
+      "characters": [
+        "misae",
+        "shinnosuke"
+      ],
+      "actions": [
+        "冷蔵庫を開ける",
+        "叫ぶ"
+      ],
+      "keyframes": [],
+      "dialogue": [
+        {
+          "line_id": "sc008_l01",
+          "start_seconds": 302.0,
+          "end_seconds": 305.5,
+          "speaker": "misae",
+          "text_ja": "私のケーキが…変な形になってる！",
+          "text_vi": "Bánh của mẹ... sao lại có hình thù kỳ quặc thế này!"
+        }
+      ]
+    },
+    {
+      "scene_id": "sc009",
+      "start_seconds": 330.0,
+      "end_seconds": 380.0,
+      "visual_summary": "みさえがしんのすけを問い詰める。",
+      "characters": [
+        "misae",
+        "shinnosuke",
+        "shiro"
+      ],
+      "actions": [
+        "問い詰める",
+        "シロを指さす"
+      ],
+      "keyframes": [],
+      "dialogue": [
+        {
+          "line_id": "sc009_l01",
+          "start_seconds": 338.0,
+          "end_seconds": 340.5,
+          "speaker": "misae",
+          "text_ja": "しんのすけ、正直に言いなさい。",
+          "text_vi": "Shinnosuke, nói thật đi."
+        },
+        {
+          "line_id": "sc009_l02",
+          "start_seconds": 342.0,
+          "end_seconds": 344.6,
+          "speaker": "shinnosuke",
+          "text_ja": "シロが食べたんだゾ。",
+          "text_vi": "Là Shiro ăn đấy."
+        }
+      ]
+    },
+    {
+      "scene_id": "sc010",
+      "start_seconds": 380.0,
+      "end_seconds": 420.0,
+      "visual_summary": "しんのすけが頭を下げて謝る。",
+      "characters": [
+        "shinnosuke",
+        "misae"
+      ],
+      "actions": [
+        "頭を下げる"
+      ],
+      "keyframes": [],
+      "dialogue": [
+        {
+          "line_id": "sc010_l01",
+          "start_seconds": 388.0,
+          "end_seconds": 391.0,
+          "speaker": "shinnosuke",
+          "text_ja": "ごめんなさい、オラが食べたゾ。",
+          "text_vi": "Con xin lỗi, là con ăn đấy."
+        }
+      ]
+    },
+    {
+      "scene_id": "sc011",
+      "start_seconds": 420.0,
+      "end_seconds": 455.0,
+      "visual_summary": "ひろしが同じケーキ屋の箱を持って帰宅する。",
+      "characters": [
+        "hiroshi",
+        "misae",
+        "shinnosuke"
+      ],
+      "actions": [
+        "箱を差し出す"
+      ],
+      "keyframes": [],
+      "dialogue": [
+        {
+          "line_id": "sc011_l01",
+          "start_seconds": 448.0,
+          "end_seconds": 451.0,
+          "speaker": "hiroshi",
+          "text_ja": "おみやげにケーキ買ってきたぞ。",
+          "text_vi": "Bố mua bánh ngọt về làm quà này."
+        }
+      ]
+    },
+    {
+      "scene_id": "sc012",
+      "start_seconds": 455.0,
+      "end_seconds": 480.0,
+      "visual_summary": "家族みんなでケーキを食べ、みさえが笑う。",
+      "characters": [
+        "hiroshi",
+        "misae",
+        "shinnosuke",
+        "shiro"
+      ],
+      "actions": [
+        "ケーキを食べる",
+        "笑う"
+      ],
+      "keyframes": [],
+      "dialogue": [
+        {
+          "line_id": "sc012_l01",
+          "start_seconds": 458.0,
+          "end_seconds": 460.5,
+          "speaker": "misae",
+          "text_ja": "まったく、しょうがないわね。",
+          "text_vi": "Thật là, hết cách với mấy người."
+        }
+      ]
+    }
+  ]
+}
