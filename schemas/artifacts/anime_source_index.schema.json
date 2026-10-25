@@ -21,7 +21,17 @@
           "items": { "type": "string" },
           "description": "Tools that produced the data, e.g. scene_detect, frame_sampler, transcriber(large-v3, ja)."
         },
-        "note": { "type": "string" }
+        "note": { "type": "string" },
+        "transcript_origin": {
+          "type": "string",
+          "enum": ["faster_whisper", "external_file"],
+          "description": "faster_whisper = transcriber ran in this build; external_file = a transcriber JSON produced earlier was supplied."
+        },
+        "visual_review": {
+          "type": "string",
+          "enum": ["pending", "partial", "complete"],
+          "description": "How many scenes the agent has visually annotated from keyframes (lib/anime_source_indexer.py annotate)."
+        }
       }
     },
     "video": {
@@ -31,7 +41,10 @@
         "path": { "type": "string" },
         "fps": { "type": "number", "exclusiveMinimum": 0 },
         "duration_seconds": { "type": "number", "exclusiveMinimum": 0 },
-        "has_subtitles": { "type": "boolean" }
+        "has_subtitles": { "type": "boolean", "description": "A subtitle stream exists in the container (burned-in text is not detected)." },
+        "has_audio": { "type": "boolean", "description": "The file has an audio stream." },
+        "width": { "type": "integer", "minimum": 0 },
+        "height": { "type": "integer", "minimum": 0 }
       }
     },
     "characters": {
@@ -59,6 +72,12 @@
           "visual_summary": { "type": "string", "description": "What is visible on screen (Japanese). Observation only, no interpretation." },
           "characters": { "type": "array", "items": { "type": "string" } },
           "actions": { "type": "array", "items": { "type": "string" } },
+          "reactions": { "type": "array", "items": { "type": "string" }, "description": "Visible reactions (表情・リアクション) observed in the keyframes." },
+          "visual_review": {
+            "type": "string",
+            "enum": ["pending", "done"],
+            "description": "pending = visual fields not yet filled from keyframes; done = the agent annotated this scene."
+          },
           "keyframes": {
             "type": "array",
             "items": {
@@ -82,7 +101,18 @@
                 "speaker": { "type": ["string", "null"], "description": "character_id, or null when the speaker is not identified." },
                 "text_ja": { "type": "string" },
                 "text_vi": { "type": "string" },
-                "asr_confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+                "asr_confidence": { "type": "number", "minimum": 0, "maximum": 1, "description": "Mean faster-whisper word probability." },
+                "low_confidence": { "type": "boolean", "description": "Do not quote until verified: low ASR confidence, a known hallucination, or marked unreliable." },
+                "asr_flags": {
+                  "type": "array",
+                  "items": { "type": "string", "enum": ["split_at_scene_cut", "no_word_timestamps", "known_hallucination", "likely_no_speech", "agent_marked_unreliable"] },
+                  "description": "Why a line may need checking."
+                },
+                "loudness_db": { "type": "number", "description": "RMS level of the line's audio (dBFS, 16 kHz mono)." },
+                "excite": {
+                  "type": "number", "minimum": 0, "maximum": 3,
+                  "description": "Heuristic beat-mining signal: loudness above the episode median, exclamations, short lines. Not story understanding."
+                }
               }
             }
           }

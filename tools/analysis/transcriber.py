@@ -64,6 +64,11 @@ class Transcriber(BaseTool):
             "language": {"type": "string", "description": "ISO 639-1 language code, or null for auto-detect"},
             "diarize": {"type": "boolean", "default": False},
             "output_dir": {"type": "string", "description": "Directory for output files"},
+            "initial_prompt": {
+                "type": "string",
+                "description": "Optional decoding context, e.g. 以下は日本語のアニメの会話です。 for Japanese anime dialogue",
+            },
+            "beam_size": {"type": "integer", "minimum": 1, "description": "Optional beam width (faster-whisper default if omitted)"},
         },
     }
 
@@ -119,6 +124,9 @@ class Transcriber(BaseTool):
         language = inputs.get("language")
         diarize = inputs.get("diarize", False)
         output_dir = Path(inputs.get("output_dir", input_path.parent))
+        decode_options = {
+            key: inputs[key] for key in ("initial_prompt", "beam_size") if inputs.get(key) is not None
+        }
 
         if not input_path.exists():
             return ToolResult(success=False, error=f"Input file not found: {input_path}")
@@ -164,6 +172,7 @@ class Transcriber(BaseTool):
                 language=language,
                 word_timestamps=True,
                 vad_filter=True,
+                **decode_options,
             )
 
             parsed_segments = []
@@ -177,6 +186,11 @@ class Transcriber(BaseTool):
                     "end": round(seg.end, 3),
                     "text": seg.text.strip(),
                 }
+                # Segment-level confidence signals, when the backend provides them.
+                for signal in ("avg_logprob", "no_speech_prob"):
+                    value = getattr(seg, signal, None)
+                    if isinstance(value, (int, float)):
+                        seg_data[signal] = round(float(value), 4)
 
                 if seg.words:
                     words = []

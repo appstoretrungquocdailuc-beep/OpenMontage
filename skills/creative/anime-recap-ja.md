@@ -54,6 +54,49 @@ creative rulebook its script / scene_plan / edit stages follow.
 
 ### 1. Build the source index (real analysis only)
 
+`lib/anime_source_indexer.py` runs the tools below in order and writes a
+Phase 1–compatible index plus a review packet:
+
+```bash
+python -m lib.anime_source_indexer build --video <episode.mp4> \
+    --out projects/<id>/artifacts/source --model-size small   # or large-v3 for best Japanese
+# → anime_source_index.json, keyframes/<scene>_kfNN.jpg, review_packet.md,
+#   visual_annotations.template.json
+```
+
+- Videos taller than 360 px get an audio-less proxy with identical frame
+  timing for scene detection; keyframes come from the original.
+- Scene cuts are snapped to the exact stream fps (24000/1001 stays 23.976024).
+  A single scene for a long video raises `scene_detect_degenerate` — inspect
+  before trusting it.
+- Without PySceneDetect the ffmpeg fallback is luma-only, so an RGB `scdet`
+  pass is unioned in (cuts between equal-brightness colours). With
+  PySceneDetect the anime threshold 22 is used.
+- ASR runs with `initial_prompt` 「以下は日本語のアニメの会話です。」 and beam 5;
+  `small`/`base`/`tiny` raise `asr_model_small` (use `large-v3` for real
+  episodes). Segments with `no_speech_prob` > 0.6 get `likely_no_speech`.
+- Every line gets `loudness_db` and a heuristic `excite` (0–3: louder than the
+  episode median, ！？/ー stretches, short) — a hint for picking hook/climax
+  candidates, never evidence that something happened.
+- Dialogue is split across cuts by word timestamps. Lines with low
+  `asr_confidence` or `asr_flags: ["known_hallucination"]` (「ご視聴ありがとうございました」…)
+  are `low_confidence: true` — never quote them unverified.
+- No faster-whisper and no `--transcript` → hard error. The builder never
+  invents dialogue. If huggingface.co is unreachable, run the transcriber
+  elsewhere and pass its JSON with `--transcript` (`transcript_origin: "external_file"`).
+- Every scene starts `visual_review: "pending"` with an empty
+  `visual_summary`. Then do the visual pass: open each keyframe listed in
+  `review_packet.md`, fill the template (visual_summary, characters, actions,
+  reactions; per line speaker and `text_vi`), and merge:
+
+```bash
+python -m lib.anime_source_indexer annotate --index .../anime_source_index.json \
+    --annotations .../visual_annotations.json
+```
+
+  Unknown scene / line / character ids reject the whole file. Write the recap
+  only from scenes whose `visual_review` is `done`.
+
 | Need | Tool (existing) | Notes |
 |---|---|---|
 | Scene boundaries | `scene_detect` (`method: content`) | Anime holds and pans can under-split; sample long scenes |

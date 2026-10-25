@@ -1,0 +1,47 @@
+# anime-recap-ja — technical decisions (read this before re-analysing)
+
+Branch `claude/charming-meitner-s9tzcb`. Plans: `docs/superpowers/plans/2026-10-25-*`.
+
+## Phase 1 (commit 6f621d3) — recap contract
+- `skills/creative/anime-recap-ja.md`, `schemas/artifacts/anime_{source_index,recap_plan}.schema.json`,
+  `lib/anime_recap.py` validator (`python -m lib.anime_recap`). Every event/quote claim cites scene/line evidence.
+- Schemas are not in `schemas/artifacts/__init__.py:ARTIFACT_NAMES` on purpose (no checkpoint changes);
+  `load_schema("anime_source_index")` still works by filename.
+
+## Phase 2 — video understanding (`lib/anime_source_indexer.py`)
+- Orchestrates existing tools: `scene_detect` → `frame_sampler` → `transcriber`; no new tool class.
+- fps from `r_frame_rate` (exact 24000/1001). VFR = stream duration drifts > 1 frame from
+  `nb_frames` on the nominal grid → warning (stream-copied joins showed avg 23.84 vs 23.976).
+- Scene detection runs on a 360p audio-less proxy (identical frame timing, verified).
+  ffmpeg `select=scene` is luma-only: green→red cuts scored < 0.02 and were merged (181 of 240
+  scenes on the 8-min test). Fix: union with `format=gbrp,scdet=threshold=10` (scored 49.7).
+  With PySceneDetect installed, ContentDetector threshold 22 is used instead.
+- Dialogue → scenes by word midpoint; a segment spanning a cut is split. Flags:
+  `known_hallucination`, `likely_no_speech` (no_speech_prob > 0.6), `split_at_scene_cut`,
+  `no_word_timestamps`; `low_confidence` lines must not be quoted unverified.
+- Visual understanding is the agent reading keyframes (`review_packet.md`) and merging via
+  `annotate`; ids are validated, nothing is applied on any bad reference. The builder never fills
+  visual fields itself.
+- `tools/analysis/transcriber.py`: additive `initial_prompt` / `beam_size` inputs and per-segment
+  `avg_logprob` / `no_speech_prob`; default call unchanged.
+
+## Legacy AI_VIDEO_DIRECTOR_CN_JP (private; never commit its source to this public repo)
+| Legacy module | Decision | Why |
+|---|---|---|
+| asr/transcribe.py — JA anime prompt, beam 5, no_speech penalty | ADAPT | re-implemented as transcriber options + indexer flags |
+| asr/transcribe.py — SRT/VTT/TXT import | SKIP | episodes have no subtitles; `--transcript` takes transcriber JSON |
+| episode/analyze.py — line dB vs median, exclamation, short line → excite | ADAPT | `measure_line_loudness` (ffmpeg + stdlib) |
+| episode/analyze.py — warn on small Whisper model | ADAPT | `asr_model_small` warning |
+| vision/scenes.py — ContentDetector threshold 22, min 0.4 s | ADAPT | threshold 22 when PySceneDetect present; min 0.5 s kept |
+| vision/scenes.py — text-band crop, motion score (OpenCV) | SKIP | clean episodes; keyframes ≤ 6 s apart; no OpenCV dependency |
+| media/probe.py — VFR check, frame PTS, wav16k | KEEP OpenMontage / SKIP / ADAPT | drift-based VFR is stricter; PTS not needed yet; wav decode reused in loudness |
+| episode/beats.py, script.py, translate/facts.py | Phase 3 | story extraction & Japanese script |
+| align/autofit.py, episode/assemble.py, tts/* (VOICEVOX/AivisSpeech) | Phase 4 | measured voice timing, local JA TTS, cut export |
+| vision/clean_match.py | only for Douyin-vs-clean matching | not episode understanding |
+
+## Environment facts (cloud container, 2026-10-25)
+- huggingface.co is blocked by the network policy (proxy 403) → Whisper models cannot download here;
+  real ASR must run where HF is reachable, or pass `--transcript`. PyPI is reachable.
+- Not installed: faster-whisper, scenedetect, opencv, numpy. ffmpeg 6.1 present.
+- 8-min 1080p synthetic benchmark: 240/240 cuts found, 4 min 42 s end-to-end (no ASR).
+- No real anime episode has been analysed yet.

@@ -87,3 +87,44 @@ def test_fixtures_conform_to_schemas(schema_path, fixture):
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
     data = json.loads((FIXTURES / fixture).read_text(encoding="utf-8"))
     jsonschema.validate(data, schema)
+
+
+# ── Phase 2: video understanding ────────────────────────────────────────
+
+
+def test_skill_points_at_source_indexer_build_and_annotate():
+    text = _skill_text()
+    assert "python -m lib.anime_source_indexer build" in text
+    assert "python -m lib.anime_source_indexer annotate" in text
+    assert "review_packet.md" in text
+
+
+@pytest.mark.parametrize(
+    "dotted",
+    [
+        "provenance.transcript_origin",
+        "provenance.visual_review",
+        "video.has_audio",
+        "scenes.visual_review",
+        "scenes.reactions",
+        "scenes.dialogue.low_confidence",
+        "scenes.dialogue.asr_flags",
+        "scenes.dialogue.loudness_db",
+        "scenes.dialogue.excite",
+    ],
+)
+def test_index_schema_documents_phase2_fields(dotted):
+    node = json.loads(INDEX_SCHEMA.read_text(encoding="utf-8"))
+    for part in dotted.split("."):
+        node = node["properties"][part]
+        if node.get("type") == "array":
+            node = node["items"]
+    assert node.get("description") or node.get("enum") or node.get("type")
+
+
+def test_index_schema_allows_every_flag_the_indexer_emits():
+    schema = json.loads(INDEX_SCHEMA.read_text(encoding="utf-8"))
+    dialogue = schema["properties"]["scenes"]["items"]["properties"]["dialogue"]["items"]["properties"]
+    allowed = set(dialogue["asr_flags"]["items"]["enum"])
+    assert {"split_at_scene_cut", "no_word_timestamps", "known_hallucination",
+            "likely_no_speech", "agent_marked_unreliable"} <= allowed
