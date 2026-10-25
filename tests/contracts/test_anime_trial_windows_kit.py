@@ -21,6 +21,7 @@ BATS = {
     "2_CHAY_THU_DOAN_NGAN.bat": "run --mode clip",
     "3_CHAY_TOAN_BO.bat": "run --mode full",
     "4_CHAM_DIEM.bat": "score",
+    "5_KIEM_TRA_LAI.bat": "recheck",
 }
 
 
@@ -49,7 +50,7 @@ def test_subcommands_exist_in_the_cli():
     from lib import anime_trial
 
     source = Path(anime_trial.__file__).read_text(encoding="utf-8")
-    for sub in ("setup", "check", "run", "score"):
+    for sub in ("setup", "check", "run", "score", "recheck"):
         assert re.search(rf'add_parser\("{sub}"', source), sub
 
 
@@ -67,7 +68,7 @@ def test_kit_scripts_are_not_swallowed_by_the_media_ignore_rule():
     if shutil.which("git") is None:
         pytest.skip("git not installed")
     for path in ["scripts/anime_trial/1_CAI_DAT.bat", "anime_trial/video_vao/ep.mp4", ".venv-anime/x"]:
-        ignored = subprocess.run(["git", "check-ignore", "-q", "--no-index", path], cwd=REPO).returncode == 0
+        ignored = subprocess.run(["git", "check-ignore", "-q", "--no-index", path], cwd=REPO, check=False).returncode == 0
         assert ignored == (not path.startswith("scripts/")), path
 
 

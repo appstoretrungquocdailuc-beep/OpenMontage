@@ -105,9 +105,11 @@
                 "low_confidence": { "type": "boolean", "description": "Do not quote until verified: low ASR confidence, a known hallucination, or marked unreliable." },
                 "asr_flags": {
                   "type": "array",
-                  "items": { "type": "string", "enum": ["split_at_scene_cut", "no_word_timestamps", "known_hallucination", "likely_no_speech", "agent_marked_unreliable"] },
-                  "description": "Why a line may need checking."
+                  "items": { "type": "string", "enum": ["split_at_scene_cut", "no_word_timestamps", "known_hallucination", "likely_no_speech", "agent_marked_unreliable", "clamped_to_scene", "overlaps_previous", "invalid_asr_timing"] },
+                  "description": "Why a line may need checking. clamped_to_scene = ASR times crossed the scene cut and were fitted to it (originals in asr_start/end_seconds); overlaps_previous = starts before the previous line ended (crosstalk or overlapping ASR); invalid_asr_timing = zero-length or inverted ASR times."
                 },
+                "asr_start_seconds": { "type": "number", "description": "Original ASR start (ms precision), present when the line was fitted to its scene." },
+                "asr_end_seconds": { "type": "number", "description": "Original ASR end (ms precision), present when the line was fitted to its scene." },
                 "loudness_db": { "type": "number", "description": "RMS level of the line's audio (dBFS, 16 kHz mono)." },
                 "excite": {
                   "type": "number", "minimum": 0, "maximum": 3,

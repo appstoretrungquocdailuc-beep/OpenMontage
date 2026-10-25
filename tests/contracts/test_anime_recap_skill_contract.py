@@ -127,4 +127,6 @@ def test_index_schema_allows_every_flag_the_indexer_emits():
     dialogue = schema["properties"]["scenes"]["items"]["properties"]["dialogue"]["items"]["properties"]
     allowed = set(dialogue["asr_flags"]["items"]["enum"])
     assert {"split_at_scene_cut", "no_word_timestamps", "known_hallucination",
-            "likely_no_speech", "agent_marked_unreliable"} <= allowed
+            "likely_no_speech", "agent_marked_unreliable",
+            "clamped_to_scene", "overlaps_previous", "invalid_asr_timing"} <= allowed
+    assert {"asr_start_seconds", "asr_end_seconds"} <= set(dialogue)

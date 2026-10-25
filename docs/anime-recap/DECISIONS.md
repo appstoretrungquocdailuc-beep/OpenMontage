@@ -45,6 +45,20 @@ Branch `claude/charming-meitner-s9tzcb`. Plans: `docs/superpowers/plans/2026-10-
   spawns in `frame_sampler`), proxy 51 s, checks 37 s, scene detect 19 s. Keyframe batching is the
   obvious speed-up if it matters on the user's PC (tool left unchanged on purpose).
 
+## Fix: lines_inside_scenes FAIL on episode #253-1 (430.9 s, 70 scenes, 117 lines)
+- Reported ids sc003_l02, sc011_l01, sc036_l01, sc040_l01, sc041_l01 (checker listed at most 5).
+- Root cause (reproduced with 6-decimal frame-grid cuts; the synthetic fixtures used round 3.003 cuts):
+  `assign_dialogue` clamped ASR times to the scene and *then* `round(…, 3)`; a start clamped to
+  12.554208 became 12.554 (before the scene), an end clamped to 30.030542 became 30.031 (after it).
+  Fix: round ASR times first, clamp with the exact scene bounds; keep originals in
+  `asr_start/end_seconds` + flag `clamped_to_scene`; zero-length/inverted → 1 ms line + `invalid_asr_timing`;
+  order kept per scene; lines starting before the previous one ended → `overlaps_previous`.
+- Checker now separates: outside scene (FAIL, with ms deviation), out of order (FAIL),
+  overlap/crosstalk (`line_overlaps` WARN, not a data error); counts all ids, not 5. No tolerance added.
+- Existing runs: `recheck` / `5_KIEM_TRA_LAI.bat` rebuilds dialogue from `work/*_transcript.json`
+  (no Whisper, no scene detection), backs up the old index and a filled dialogue sheet.
+- Not yet confirmed on the user's real files (need `anime_source_index.json` + `work/*_transcript.json`).
+
 ## Legacy AI_VIDEO_DIRECTOR_CN_JP (private; never commit its source to this public repo)
 | Legacy module | Decision | Why |
 |---|---|---|

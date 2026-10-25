@@ -52,9 +52,12 @@ from typing import Any
 from lib.anime_recap import spoken_char_count
 from lib.anime_source_indexer import (
     IndexBuildError,
+    annotations_template,
     build_source_index,
     probe_video,
+    reassign_dialogue,
     snap_to_frame,
+    write_review_packet,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -88,6 +91,7 @@ STAGE_LABELS = {
     "loudness": "Đo độ to từng câu",
     "write": "Ghi index + review packet",
     "checks": "Kiểm tra tự động",
+    "recheck": "Kiểm tra lại (dựng lại thoại từ transcript đã lưu)",
     "total": "TỔNG",
 }
 
@@ -338,8 +342,35 @@ def dialogue_stats(index: dict) -> dict:
         "low_confidence_ratio": round(sum(1 for line in lines if line.get("low_confidence")) / len(lines), 3) if lines else 0.0,
         "hallucinations": sum(1 for line in lines if "known_hallucination" in line.get("asr_flags", [])),
         "split_at_cut": sum(1 for line in lines if "split_at_scene_cut" in line.get("asr_flags", [])),
+        "boundary_adjusted": sum(1 for line in lines if "clamped_to_scene" in line.get("asr_flags", [])),
         "too_fast_lines": fast,
     }
+
+
+def classify_line_timing(index: dict) -> dict[str, list[tuple[str, float]]]:
+    """Sort dialogue timing problems into three different things.
+
+    - ``outside_scene``: the line does not fit inside its own scene (data bug;
+      value = how far outside, seconds);
+    - ``out_of_order``: starts before the previous line of the scene (data bug);
+    - ``overlap``: starts before the previous line *ended* — people talking over
+      each other, or ASR segments overlapping. Not a data error; listen to decide.
+    """
+    found: dict[str, list[tuple[str, float]]] = {"outside_scene": [], "out_of_order": [], "overlap": []}
+    for scene in index["scenes"]:
+        s0, s1 = scene["start_seconds"], scene["end_seconds"]
+        prev_start, prev_end = None, None
+        for line in scene.get("dialogue", []):
+            a, b = line["start_seconds"], line["end_seconds"]
+            if not (s0 <= a < b <= s1):
+                found["outside_scene"].append((line["line_id"], max(s0 - a, b - s1, a - b, 0.0)))
+            if prev_start is not None and a < prev_start:
+                found["out_of_order"].append((line["line_id"], prev_start - a))
+            elif prev_end is not None and a < prev_end:
+                found["overlap"].append((line["line_id"], prev_end - a))
+            prev_start = a if prev_start is None else max(prev_start, a)
+            prev_end = b if prev_end is None else max(prev_end, b)
+    return found
 
 
 def check_index(
@@ -392,15 +423,24 @@ def check_index(
                         "; ".join(bad_kf[:5] + [f"{x} không có keyframe" for x in no_kf[:5]])
                         or f"{sum(len(s.get('keyframes', [])) for s in scenes)} keyframe"))
 
-    stray = []
-    for s in scenes:
-        prev = -1.0
-        for line in s.get("dialogue", []):
-            if not (s["start_seconds"] <= line["start_seconds"] < line["end_seconds"] <= s["end_seconds"]) or line["start_seconds"] < prev:
-                stray.append(line["line_id"])
-            prev = line["start_seconds"]
-    checks.append(Check("lines_inside_scenes", "FAIL" if stray else "PASS",
-                        f"thoại nằm ngoài cảnh / sai thứ tự: {', '.join(stray[:5])}" if stray else "mọi câu thoại nằm trong cảnh"))
+    timing = classify_line_timing(index)
+    problems = []
+    for key, label in (("outside_scene", "ngoài ranh giới cảnh"), ("out_of_order", "sai thứ tự")):
+        items = timing[key]
+        if items:
+            worst = max(v for _, v in items)
+            problems.append(f"{label} ({len(items)}, lệch tối đa {worst * 1000:.1f} ms): "
+                            f"{', '.join(i for i, _ in items[:10])}{' …' if len(items) > 10 else ''}")
+    bad = len({i for key in ("outside_scene", "out_of_order") for i, _ in timing[key]})
+    checks.append(Check("lines_inside_scenes", "FAIL" if bad else "PASS",
+                        f"{bad} câu lỗi — " + "; ".join(problems) if bad else "mọi câu thoại nằm trong cảnh, đúng thứ tự"))
+    overlaps = timing["overlap"]
+    checks.append(Check(
+        "line_overlaps", "WARN" if overlaps else "PASS",
+        (f"{len(overlaps)} câu bắt đầu trước khi câu trước kết thúc (nói chồng thật hoặc ASR chồng mốc — "
+         f"không phải lỗi dữ liệu, nghe lại để xác nhận): {', '.join(i for i, _ in overlaps[:10])}")
+        if overlaps else "không có câu thoại chồng nhau",
+    ))
 
     ids = [s["scene_id"] for s in scenes] + [line["line_id"] for s in scenes for line in s.get("dialogue", [])]
     dupes = sorted({i for i in ids if ids.count(i) > 1})
@@ -414,7 +454,8 @@ def check_index(
         checks.append(Check("dialogue_auto", status,
                             f"{d['line_count']} câu · độ tin cậy TB {d['mean_confidence']} · "
                             f"{d['low_confidence_ratio']:.0%} câu tin cậy thấp · {d['hallucinations']} câu nghi ảo giác · "
-                            f"{d['too_fast_lines']} câu nói nhanh bất thường (tự động, chưa phải độ chính xác thật)"))
+                            f"{d['too_fast_lines']} câu nói nhanh bất thường · "
+                            f"{d['boundary_adjusted']} câu chỉnh mốc tại ranh giới cảnh (tự động, chưa phải độ chính xác thật)"))
 
     boundary_ssim: dict[str, float] = {}
     suspected: list[str] = []
@@ -445,8 +486,11 @@ def check_index(
 
 def write_check_sheets(index: dict, out_dir: Path, *, suspected: list[str] | tuple = ()) -> tuple[Path, Path]:
     """Excel-friendly (UTF-8 BOM) sheets for the human listening / watching pass."""
-    out_dir = Path(out_dir)
-    dialogue_csv, scene_csv = out_dir / DIALOGUE_SHEET, out_dir / SCENE_SHEET
+    return write_dialogue_sheet(index, out_dir), write_scene_sheet(index, out_dir, suspected=suspected)
+
+
+def write_dialogue_sheet(index: dict, out_dir: Path) -> Path:
+    dialogue_csv = Path(out_dir) / DIALOGUE_SHEET
     with dialogue_csv.open("w", encoding="utf-8-sig", newline="") as fh:
         writer = csv.writer(fh)
         writer.writerow(["line_id", "scene_id", "bat_dau", "ket_thuc", "do_tin_cay", "canh_bao", "text_ja",
@@ -455,6 +499,11 @@ def write_check_sheets(index: dict, out_dir: Path, *, suspected: list[str] | tup
             for line in scene.get("dialogue", []):
                 writer.writerow([line["line_id"], scene["scene_id"], f"{line['start_seconds']:.3f}", f"{line['end_seconds']:.3f}",
                                  line.get("asr_confidence", ""), " ".join(line.get("asr_flags", [])), line["text_ja"], "", "", ""])
+    return dialogue_csv
+
+
+def write_scene_sheet(index: dict, out_dir: Path, *, suspected: list[str] | tuple = ()) -> Path:
+    scene_csv = Path(out_dir) / SCENE_SHEET
     with scene_csv.open("w", encoding="utf-8-sig", newline="") as fh:
         writer = csv.writer(fh)
         writer.writerow(["scene_id", "bat_dau", "ket_thuc", "do_dai", "keyframes", "nghi_cat_nham", "ket_qua", "sot_canh", "ghi_chu"])
@@ -463,7 +512,7 @@ def write_check_sheets(index: dict, out_dir: Path, *, suspected: list[str] | tup
             writer.writerow([scene["scene_id"], f"{scene['start_seconds']:.3f}", f"{scene['end_seconds']:.3f}",
                              f"{scene['end_seconds'] - scene['start_seconds']:.2f}", names,
                              "CO" if scene["scene_id"] in suspected else "", "", "", ""])
-    return dialogue_csv, scene_csv
+    return scene_csv
 
 
 def _norm_answer(value: str) -> str:
@@ -715,6 +764,71 @@ def run_trial(
     return report
 
 
+def _sheet_filled(path: Path) -> bool:
+    return any((row.get("ket_qua") or "").strip() for row in _read_sheet(path))
+
+
+def recheck_run(run_dir: Path, *, transcript: Path | None = None) -> dict:
+    """Rebuild dialogue of an existing run from its saved Whisper transcript and
+    re-run the automatic checks — no new ASR, scene detection or keyframes.
+
+    The previous index and a filled dialogue sheet are kept as
+    ``*.before-recheck-<time>`` copies; the scene sheet is left untouched.
+    """
+    run_dir = Path(run_dir)
+    index_path = run_dir / "anime_source_index.json"
+    if not index_path.is_file():
+        raise TrialError(f"không có {index_path}")
+    if transcript is None:
+        found = sorted((run_dir / "work").glob("*_transcript.json"))
+        if not found:
+            raise TrialError(
+                f"không tìm thấy transcript Whisper trong {run_dir / 'work'} (*_transcript.json). "
+                "Hãy đặt file transcript gốc vào đó hoặc chỉ định --transcript — không chạy lại Whisper.")
+        transcript = found[0]
+    started = time.perf_counter()
+    stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    try:
+        new_index, warnings = reassign_dialogue(index, json.loads(Path(transcript).read_text(encoding="utf-8")))
+    except IndexBuildError as exc:
+        raise TrialError(str(exc)) from exc
+
+    shutil.copy2(index_path, run_dir / f"anime_source_index.before-recheck-{stamp}.json")
+    index_path.write_text(json.dumps(new_index, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    write_review_packet(new_index, run_dir / "review_packet.md")
+    (run_dir / "visual_annotations.template.json").write_text(
+        json.dumps(annotations_template(new_index), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    dialogue_csv = run_dir / DIALOGUE_SHEET
+    if dialogue_csv.is_file() and _sheet_filled(dialogue_csv):
+        dialogue_csv.replace(run_dir / f"{DIALOGUE_SHEET}.before-recheck-{stamp}")
+    write_dialogue_sheet(new_index, run_dir)
+    checks, stats = check_index(new_index, run_dir)
+    if not (run_dir / SCENE_SHEET).is_file():
+        write_scene_sheet(new_index, run_dir, suspected=stats["suspected_false_cuts"])
+
+    report_path = run_dir / "trial_report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8")) if report_path.is_file() else {}
+    report.setdefault("run_dir", str(run_dir))
+    report.setdefault("mode", "full")
+    report["checks"] = [asdict(c) for c in checks]
+    report["stats"] = stats
+    report["warnings"] = report.get("warnings", []) + [asdict(w) for w in warnings]
+    report.setdefault("timings", {})["recheck"] = round(time.perf_counter() - started, 3)
+    report["rechecked_at"] = stamp
+    report["recheck_transcript"] = str(transcript)
+    if not report.get("steps"):
+        report["steps"] = _pending_steps(report["mode"])
+    for step in report["steps"]:
+        if step["name"] == "manual_dialogue_check":  # line ids changed — listening check starts over
+            step["status"] = "PENDING"
+    report.pop("score", None)
+    report["overall"] = _overall(report)
+    _write_report(run_dir, report)
+    return report
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────
 
 
@@ -762,6 +876,9 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--out", default=str(OUTPUT_DIR))
     sc = sub.add_parser("score", help="chấm điểm từ 2 file CSV đã điền")
     sc.add_argument("--run", help="thư mục kết quả (mặc định: lần chạy mới nhất)")
+    rc = sub.add_parser("recheck", help="dựng lại thoại từ transcript đã lưu + kiểm tra lại (không chạy lại Whisper)")
+    rc.add_argument("--run", help="thư mục kết quả (mặc định: lần chạy mới nhất)")
+    rc.add_argument("--transcript", help="mặc định: work/*_transcript.json của lần chạy đó")
     args = parser.parse_args(argv)
 
     if args.command in ("setup", "check", "run"):
@@ -811,8 +928,19 @@ def main(argv: list[str] | None = None) -> int:
 
     run_dir = Path(args.run) if args.run else max(OUTPUT_DIR.glob("*_*_*"), key=lambda p: p.stat().st_mtime, default=None)
     if run_dir is None or not run_dir.is_dir():
-        print("Không tìm thấy thư mục kết quả để chấm.")
+        print("Không tìm thấy thư mục kết quả.")
         return 2
+    if args.command == "recheck":
+        try:
+            report = recheck_run(run_dir, transcript=Path(args.transcript) if args.transcript else None)
+        except TrialError as exc:
+            print(f"LỖI: {exc}")
+            return 1
+        for c in report["checks"]:
+            if c["name"] in ("lines_inside_scenes", "line_overlaps", "dialogue_auto"):
+                print(f"  [{c['status']:<7}] {c['name']:<20} {c['detail']}")
+        print(f"Trạng thái: {report['overall']} · Báo cáo: {run_dir / 'trial_report.md'}")
+        return 1 if report["overall"] == "FAIL" else 0
     score = score_run(run_dir)
     print(json.dumps(score, ensure_ascii=False, indent=2))
     print(f"Đã cập nhật {run_dir / 'trial_report.md'}")

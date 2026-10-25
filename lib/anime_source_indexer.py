@@ -73,6 +73,7 @@ JA_ANIME_PROMPT = "以下は日本語のアニメの会話です。"
 JA_BEAM_SIZE = 5
 SMALL_ASR_MODELS = frozenset({"tiny", "base", "small"})
 NO_SPEECH_FLAG_PROBABILITY = 0.6
+MIN_LINE_SECONDS = 0.001  # zero-length / inverted ASR timings become 1 ms lines
 
 # Content-detector threshold tuned lower than PySceneDetect's 27 for flat-shaded
 # anime cuts; RGB scdet catches cuts between colours of equal luma, which the
@@ -201,23 +202,43 @@ def assign_dialogue(
             pieces.append((idx, s0, s1, str(seg.get("text", "")).strip(), [], seg_flags + ["no_word_timestamps"]))
 
     pieces.sort(key=lambda p: p[1])
-    for idx, start, end, text, probs, flags in pieces:
+    last_start: dict[str, float] = {}
+    last_end: dict[str, float] = {}
+    for idx, raw_start, raw_end, text, probs, flags in pieces:
         if not text:
             continue
         scene = scenes[idx]
-        start = min(max(start, scene["start_seconds"]), scene["end_seconds"])
-        end = min(max(end, start), scene["end_seconds"])
-        if end <= start:
-            end = min(scene["end_seconds"], start + 0.01)
-            start = min(start, end - 0.001)
-        lines = by_scene[scene["scene_id"]]
+        sid, s0, s1 = scene["scene_id"], scene["start_seconds"], scene["end_seconds"]
+        # Round the ASR times first, then clamp with the exact (frame-grid,
+        # 6-decimal) scene bounds. Rounding *after* clamping pushed lines that
+        # touch a cut 0.1–0.5 ms outside their scene (episode #253-1).
+        asr_start, asr_end = round(float(raw_start), 3), round(float(raw_end), 3)
+        # Never earlier than the scene start nor the previous line's start (keeps order).
+        start = min(max(asr_start, s0, last_start.get(sid, s0)), s1)
+        end = min(max(asr_end, start), s1)
+        if asr_end <= asr_start:
+            flags.append("invalid_asr_timing")
+        if end - start < MIN_LINE_SECONDS:
+            if start + MIN_LINE_SECONDS <= s1:
+                end = round(start + MIN_LINE_SECONDS, 6)
+            else:  # at the very end of the scene; a previous line cannot start later than this
+                start, end = round(s1 - MIN_LINE_SECONDS, 6), s1
+        if asr_start < s0 or asr_end > s1:
+            flags.append("clamped_to_scene")
+        if start < last_end.get(sid, s0):
+            flags.append("overlaps_previous")
+        last_start[sid] = start
+        last_end[sid] = max(end, last_end.get(sid, s0))
+        lines = by_scene[sid]
         line: dict[str, Any] = {
-            "line_id": f"{scene['scene_id']}_l{len(lines) + 1:02d}",
-            "start_seconds": round(start, 3),
-            "end_seconds": round(end, 3),
+            "line_id": f"{sid}_l{len(lines) + 1:02d}",
+            "start_seconds": start,
+            "end_seconds": end,
             "speaker": None,
             "text_ja": text,
         }
+        if "clamped_to_scene" in flags or "invalid_asr_timing" in flags:
+            line["asr_start_seconds"], line["asr_end_seconds"] = asr_start, asr_end
         confidence = round(sum(probs) / len(probs), 3) if probs else None
         if confidence is not None:
             line["asr_confidence"] = confidence
@@ -695,6 +716,50 @@ def build_source_index(
     return BuildResult(index, index_path, packet_path, template_path, warnings)
 
 
+# ── rebuild dialogue from a saved transcript (no new ASR run) ────────────
+
+
+def reassign_dialogue(
+    index: dict,
+    transcript: dict,
+    *,
+    force: bool = False,
+    low_confidence_threshold: float = DEFAULT_LOW_CONFIDENCE,
+) -> tuple[dict, list[Issue]]:
+    """Re-run dialogue assignment on an existing index with its saved transcript.
+
+    Scenes, keyframes and visual fields are kept; only ``dialogue`` is rebuilt
+    (line ids may change). Refuses when lines already carry annotations
+    (speaker / text_vi) unless ``force`` — they would be lost.
+    """
+    if not isinstance(transcript.get("segments"), list):
+        raise IndexBuildError("transcript has no 'segments' list (expected transcriber output)")
+    annotated = [line["line_id"] for s in index["scenes"] for line in s.get("dialogue", [])
+                 if line.get("speaker") is not None or line.get("text_vi")]
+    if annotated and not force:
+        raise IndexBuildError(
+            f"{len(annotated)} lines already have annotations (speaker/text_vi), e.g. {annotated[0]}; "
+            "rebuilding would drop them — re-annotate afterwards and pass force=True / --force"
+        )
+    scenes = [{k: s[k] for k in ("scene_id", "start_seconds", "end_seconds")} for s in index["scenes"]]
+    dialogue = assign_dialogue(transcript["segments"], scenes, low_confidence_threshold=low_confidence_threshold)
+    warnings: list[Issue] = []
+    video = Path(index.get("video", {}).get("path", ""))
+    if any(dialogue.values()) and index.get("video", {}).get("has_audio"):
+        if video.is_file():
+            measure_line_loudness(video, dialogue)
+        else:
+            warnings.append(Issue("video_missing_for_loudness", "video.path",
+                                  f"{video} not found — loudness_db / excite not recomputed"))
+    merged = copy.deepcopy(index)
+    for scene in merged["scenes"]:
+        scene["dialogue"] = dialogue[scene["scene_id"]]
+    tools = merged.setdefault("provenance", {}).setdefault("tools", [])
+    if "reassign_dialogue" not in tools:
+        tools.append("reassign_dialogue")
+    return merged, warnings
+
+
 # ── merge the agent's visual annotations ─────────────────────────────────
 
 
@@ -796,6 +861,12 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("--annotations", required=True)
     a.add_argument("--out", help="write here instead of overwriting --index")
 
+    ra = sub.add_parser("reassign", help="rebuild dialogue from the saved transcript (no new Whisper run)")
+    ra.add_argument("--index", required=True)
+    ra.add_argument("--transcript", required=True, help="work/<name>_transcript.json")
+    ra.add_argument("--force", action="store_true", help="drop existing speaker/text_vi annotations")
+    ra.add_argument("--out", help="write here instead of overwriting --index")
+
     args = parser.parse_args(argv)
     try:
         if args.command == "build":
@@ -814,6 +885,13 @@ def main(argv: list[str] | None = None) -> int:
             _print_issues(result.warnings, "WARNING")
             return 0
         index = json.loads(Path(args.index).read_text(encoding="utf-8"))
+        if args.command == "reassign":
+            merged, warnings = reassign_dialogue(index, _load_transcript(Path(args.transcript)), force=args.force)
+            target = Path(args.out) if args.out else Path(args.index)
+            target.write_text(json.dumps(merged, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            print(f"reassigned → {target} ({sum(len(s['dialogue']) for s in merged['scenes'])} lines)")
+            _print_issues(warnings, "WARNING")
+            return 0
         annotations = json.loads(Path(args.annotations).read_text(encoding="utf-8"))
         merged, issues = apply_visual_annotations(index, annotations)
         if issues:

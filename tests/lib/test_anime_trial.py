@@ -394,3 +394,93 @@ def test_frame_similarity_sees_hue_not_just_luma(tmp_path):
                         "-frames:v", "1", str(paths[colour])], check=True, timeout=60)
     assert trial.frame_similarity(paths["green"], paths["red"]) < 0.5
     assert trial.frame_similarity(paths["red"], paths["red"]) > 0.99
+
+
+# ── Regression: lines_inside_scenes FAIL on episode #253-1 ──────────────
+
+
+def _scene_index(lines: list[dict], start=12.554208, end=30.030542) -> dict:
+    return {"video": {"fps": FPS, "duration_seconds": 40.0}, "scenes": [
+        {"scene_id": "sc002", "start_seconds": start, "end_seconds": end, "keyframes": [], "dialogue": lines}]}
+
+
+def _line(line_id, s, e, **extra):
+    return {"line_id": line_id, "start_seconds": s, "end_seconds": e, "text_ja": "あ", "asr_flags": [], **extra}
+
+
+def _checks(index):
+    return {c.name: c for c in trial.check_index(index, Path("."), similarity=lambda a, b: 0.0)[0]}
+
+
+def test_real_dialogue_overlap_is_a_warning_not_a_failure():
+    by = _checks(_scene_index([_line("sc002_l01", 14.0, 16.2), _line("sc002_l02", 15.5, 17.0)]))
+    assert by["lines_inside_scenes"].status == "PASS"
+    assert by["line_overlaps"].status == "WARN"
+    assert "sc002_l02" in by["line_overlaps"].detail
+
+
+def test_no_overlap_gives_pass():
+    by = _checks(_scene_index([_line("sc002_l01", 14.0, 15.0), _line("sc002_l02", 15.0, 16.0)]))
+    assert by["line_overlaps"].status == "PASS"
+
+
+def test_line_crossing_scene_boundary_fails_and_says_so():
+    by = _checks(_scene_index([_line("sc002_l01", 12.554, 13.4)]))  # 0.2 ms before the scene start
+    check = by["lines_inside_scenes"]
+    assert check.status == "FAIL"
+    assert "ranh giới" in check.detail and "sc002_l01" in check.detail
+
+
+def test_order_error_is_reported_separately_from_boundary_error():
+    by = _checks(_scene_index([_line("sc002_l01", 15.0, 16.0), _line("sc002_l02", 14.0, 14.5)]))
+    check = by["lines_inside_scenes"]
+    assert check.status == "FAIL"
+    assert "thứ tự" in check.detail and "ranh giới" not in check.detail
+
+
+def test_failure_detail_counts_all_lines_not_just_five():
+    lines = [_line(f"sc002_l{i:02d}", 12.0, 13.0) for i in range(1, 8)]
+    detail = _checks(_scene_index(lines))["lines_inside_scenes"].detail
+    assert "7 câu" in detail
+
+
+def test_boundary_adjusted_lines_are_counted_in_dialogue_check():
+    by = _checks(_scene_index([_line("sc002_l01", 12.554208, 13.4, asr_flags=["clamped_to_scene"])]))
+    assert by["lines_inside_scenes"].status == "PASS"
+    assert "1 câu chỉnh mốc tại ranh giới cảnh" in by["dialogue_auto"].detail
+
+
+@needs_ffmpeg
+def test_recheck_rebuilds_dialogue_from_saved_transcript_without_whisper(built, monkeypatch):
+    index, out = built
+    # simulate the pre-fix output: a line rounded 0.2 ms outside its scene
+    scene = index["scenes"][1]
+    scene["dialogue"] = [{"line_id": "sc002_l01", "start_seconds": round(scene["start_seconds"], 3) - 0.001,
+                          "end_seconds": scene["start_seconds"] + 1.0, "text_ja": "x", "asr_flags": []}]
+    (out / "anime_source_index.json").write_text(json.dumps(index, ensure_ascii=False), encoding="utf-8")
+    (out / "work" / "episode_transcript.json").write_text(json.dumps(_transcript(), ensure_ascii=False), encoding="utf-8")
+    dialogue_csv, _ = trial.write_check_sheets(index, out)
+    _fill(dialogue_csv, [{"ket_qua": "DUNG"}])
+    (out / "trial_report.json").write_text(json.dumps({"steps": [], "timings": {"total": 1.0}, "checks": [],
+                                                       "overall": "FAIL"}), encoding="utf-8")
+    monkeypatch.setattr("lib.anime_source_indexer._faster_whisper_available", lambda: False)
+
+    report = trial.recheck_run(out)
+
+    status = {c["name"]: c["status"] for c in report["checks"]}
+    assert status["lines_inside_scenes"] == "PASS"
+    assert "recheck" in report["timings"]
+    rebuilt = json.loads((out / "anime_source_index.json").read_text(encoding="utf-8"))
+    texts = [line["text_ja"] for s in rebuilt["scenes"] for line in s["dialogue"]]
+    assert "x" not in texts and "ケーキ買ってきたよ。" in texts
+    assert list(out.glob("anime_source_index.before-recheck*.json"))  # old index kept
+    assert list(out.glob(f"{trial.DIALOGUE_SHEET}.before-recheck*"))  # filled sheet kept, not overwritten
+
+
+@needs_ffmpeg
+def test_recheck_without_saved_transcript_asks_for_it(built):
+    _, out = built
+    for path in (out / "work").glob("*_transcript.json"):
+        path.unlink()
+    with pytest.raises(trial.TrialError, match="transcript"):
+        trial.recheck_run(out)

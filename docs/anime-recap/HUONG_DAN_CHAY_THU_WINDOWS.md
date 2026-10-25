@@ -35,6 +35,7 @@ Tất cả nằm trong `scripts\anime_trial\` — **bấm đúp** để chạy:
 | `2_CHAY_THU_DOAN_NGAN.bat` | Mở hộp chọn video → cắt **đoạn thử 45 giây** (bắt đầu ở giây 60 nếu video dài ≥ 3 phút, để bỏ qua phần mở đầu) → phân tích. | Luôn chạy cái này trước |
 | `3_CHAY_TOAN_BO.bat` | Phân tích **toàn bộ** video (~8 phút). | Chỉ sau khi đoạn thử ổn |
 | `4_CHAM_DIEM.bat` | Đọc 2 file CSV bạn đã điền, tính độ chính xác thoại / tỉ lệ cắt nhầm, cập nhật báo cáo. | Sau khi tự nghe & xem kiểm tra |
+| `5_KIEM_TRA_LAI.bat` | Dựng lại phần thoại từ transcript Whisper **đã lưu** trong `work\` rồi chạy lại các kiểm tra — **không chạy lại Whisper, không cắt cảnh lại**. Giữ bản cũ `anime_source_index.before-recheck-….json`; file `kiem_tra_loi_thoai.csv` đã điền cũng được giữ lại. | Sau khi cập nhật code, với một lần chạy cũ (kéo thả thư mục kết quả lên file .bat) |
 
 Mẹo: có thể **kéo thả file video lên** `2_...bat` / `3_...bat` để bỏ qua hộp chọn file;
 kéo thả **thư mục kết quả** lên `4_CHAM_DIEM.bat` để chấm đúng lần chạy đó.
@@ -155,6 +156,8 @@ thoại đúng ≥ 85% và CER ≤ 15% → PASS; cắt nhầm ≤ 10% và bỏ s
 | `cublas64_12.dll` / `cudnn_ops64_9.dll` not found | Chạy lại `1_CAI_DAT.bat`. Công cụ tự nạp DLL từ `.venv-anime\Lib\site-packages\nvidia\*\bin`. Vẫn lỗi → cập nhật driver NVIDIA. Trong lúc đó vẫn chạy được bằng CPU (báo cáo ghi rõ). |
 | Hết bộ nhớ GPU (out of memory) | Đóng game/trình duyệt nặng; hoặc `--model-size medium`; hoặc `--device cpu`. |
 | Tải model `huggingface.co` lỗi | Kiểm tra mạng / tường lửa; chạy lại `1_CAI_DAT.bat`. |
+| `lines_inside_scenes: FAIL` (bản trước ngày 25/10) | Lỗi làm tròn mốc thoại tại điểm cắt cảnh đã được sửa. Cập nhật code rồi kéo thư mục kết quả cũ lên `5_KIEM_TRA_LAI.bat`. Nếu vẫn FAIL, gửi `anime_source_index.json` và `work\*_transcript.json` cho Claude. |
+| `line_overlaps: WARN` | Hai câu thoại chồng thời gian — thường là nhân vật nói chồng nhau hoặc Whisper chồng mốc. Không phải lỗi dữ liệu; các câu có cờ `overlaps_previous` trong `kiem_tra_loi_thoai.csv`, nghe lại để xác nhận. |
 | `scene_detect_degenerate` (chỉ 1 cảnh cho cả video) | Báo lại cho Claude kèm báo cáo — phát hiện cảnh đã thất bại, đừng dùng kết quả đó. |
 | Excel hiện chữ Nhật lỗi font | File đã có BOM UTF-8; nếu vẫn lỗi, dùng Data → From Text/CSV → UTF-8. |
 | Thoại toàn câu kiểu 「ご視聴ありがとうございました」 | Đó là ảo giác quen thuộc của Whisper trên đoạn nhạc/im lặng — công cụ đã đánh dấu `known_hallucination`, không dùng làm bằng chứng. |

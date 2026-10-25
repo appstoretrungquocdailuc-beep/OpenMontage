@@ -580,3 +580,139 @@ def test_build_passes_asr_device_to_transcriber(sample_video, tmp_path, monkeypa
     monkeypatch.setattr(asi, "_faster_whisper_available", lambda: True)
     asi.build_source_index(sample_video, tmp_path / "dev", model_size="large-v3", provenance_kind="mock", asr_device="cpu")
     assert seen["device"] == "cpu"
+
+
+# ── Regression: episode #253-1 reported lines_inside_scenes FAIL ───────
+# Real scene cuts sit on the frame grid with 6-decimal timestamps
+# (e.g. 12.554208); the synthetic fixtures above used round values (3.003),
+# which hid a rounding bug at scene boundaries.
+
+REAL_SCENES = [
+    {"scene_id": "sc001", "start_seconds": 0.0, "end_seconds": 12.554208},
+    {"scene_id": "sc002", "start_seconds": 12.554208, "end_seconds": 30.030542},
+    {"scene_id": "sc003", "start_seconds": 30.030542, "end_seconds": 40.0},
+]
+
+
+def _inside(line: dict, scene: dict) -> bool:
+    return scene["start_seconds"] <= line["start_seconds"] < line["end_seconds"] <= scene["end_seconds"]
+
+
+def test_start_clamped_to_cut_is_not_rounded_below_scene_start():
+    # word starts 54 ms before the cut, its midpoint is after it → belongs to sc002
+    seg = [{"start": 12.50, "end": 13.4, "words": [_word("あの", 12.50, 12.70), _word("さ", 12.70, 13.4)]}]
+    line = asi.assign_dialogue(seg, REAL_SCENES)["sc002"][0]
+    assert _inside(line, REAL_SCENES[1]), line
+
+
+def test_end_clamped_to_cut_is_not_rounded_above_scene_end():
+    # word midpoint 30.0 is before the 30.030542 cut, but it ends after it
+    seg = [{"start": 29.9, "end": 30.1, "words": [_word("えっ", 29.9, 30.1)]}]
+    line = asi.assign_dialogue(seg, REAL_SCENES)["sc002"][0]
+    assert _inside(line, REAL_SCENES[1]), line
+
+
+def test_boundary_adjustment_is_flagged_and_original_asr_times_kept():
+    seg = [{"start": 12.50, "end": 13.4, "words": [_word("あの", 12.50, 12.70), _word("さ", 12.70, 13.4)]}]
+    line = asi.assign_dialogue(seg, REAL_SCENES)["sc002"][0]
+    assert "clamped_to_scene" in line["asr_flags"]
+    assert line["asr_start_seconds"] == 12.5 and line["asr_end_seconds"] == 13.4
+    untouched = asi.assign_dialogue([{"start": 14.0, "end": 15.0, "words": [_word("はい", 14.0, 15.0)]}], REAL_SCENES)["sc002"][0]
+    assert "clamped_to_scene" not in untouched["asr_flags"] and "asr_start_seconds" not in untouched
+
+
+def test_overlapping_asr_segments_keep_every_line_in_order_and_flag_overlap():
+    """Crosstalk / overlapping Whisper segments, given out of order."""
+    segs = [
+        {"start": 15.5, "end": 17.0, "words": [_word("やだ", 15.5, 16.0), _word("もん", 16.0, 17.0)]},
+        {"start": 14.0, "end": 16.2, "words": [_word("しんちゃん", 14.0, 15.0), _word("待って", 15.0, 16.2)]},
+    ]
+    lines = asi.assign_dialogue(segs, REAL_SCENES)["sc002"]
+    assert [l["text_ja"] for l in lines] == ["しんちゃん待って", "やだもん"]
+    assert [l["line_id"] for l in lines] == ["sc002_l01", "sc002_l02"]
+    assert lines[0]["start_seconds"] <= lines[1]["start_seconds"]
+    assert "overlaps_previous" in lines[1]["asr_flags"]
+    assert "overlaps_previous" not in lines[0]["asr_flags"]
+    assert all(_inside(l, REAL_SCENES[1]) for l in lines)
+
+
+def test_zero_length_and_inverted_words_still_produce_valid_lines():
+    segs = [
+        {"start": 12.554208, "end": 12.554208, "words": [_word("ん", 12.554208, 12.554208)]},
+        {"start": 20.0, "end": 19.8, "words": [_word("あ", 20.0, 19.8)]},
+        {"start": 40.0, "end": 40.0, "words": [_word("お", 40.0, 40.0)]},  # exactly at the video end
+    ]
+    by_scene = asi.assign_dialogue(segs, REAL_SCENES)
+    lines = [(sid, l) for sid, ls in by_scene.items() for l in ls]
+    assert sorted(l["text_ja"] for _, l in lines) == ["あ", "お", "ん"]
+    scene = {s["scene_id"]: s for s in REAL_SCENES}
+    assert all(_inside(l, scene[sid]) for sid, l in lines), lines
+
+
+def test_fuzz_every_line_inside_its_scene_in_order_and_no_text_lost():
+    import random
+
+    rng = random.Random(2531)
+    fps = 24000 / 1001
+    for _ in range(200):
+        cuts = sorted({round(round(rng.uniform(0.5, 59.5) * fps) / fps, 6) for _ in range(rng.randint(1, 8))})
+        bounds = [0.0, *cuts, round(round(60.0 * fps) / fps, 6)]
+        scenes = [{"scene_id": f"sc{i + 1:03d}", "start_seconds": a, "end_seconds": b}
+                  for i, (a, b) in enumerate(itertools.pairwise(bounds))]
+        segments, chars = [], []
+        for _ in range(rng.randint(1, 12)):
+            t = rng.uniform(0, 59.0)
+            words = []
+            for k in range(rng.randint(1, 5)):
+                w0 = t + rng.uniform(-0.3, 0.6)  # overlapping / non-monotonic, like real ASR
+                w1 = w0 + rng.choice([0.0, rng.uniform(0.01, 1.2)])
+                text = rng.choice("あいうえおかきくけこ") * (k + 1)
+                words.append(_word(text, round(w0, 3), round(w1, 3)))
+                chars.append(text)
+                t = w1
+            segments.append({"start": words[0]["start"], "end": words[-1]["end"], "words": words})
+        rng.shuffle(segments)
+        by_scene = asi.assign_dialogue(segments, scenes)
+        got = []
+        for scene in scenes:
+            prev = -1.0
+            for line in by_scene[scene["scene_id"]]:
+                assert _inside(line, scene), (scene, line)
+                assert line["start_seconds"] >= prev
+                prev = line["start_seconds"]
+                got.append(line["text_ja"])
+        assert sorted("".join(got)) == sorted("".join(chars))  # every character kept, none invented
+
+
+def test_reassign_dialogue_rebuilds_lines_from_saved_transcript():
+    index = {
+        "source_index_id": "ep", "provenance": {"kind": "analyzed", "tools": ["scene_detect"]},
+        "video": {"path": "/nonexistent.mp4", "fps": 24000 / 1001, "duration_seconds": 40.0, "has_audio": True},
+        "scenes": [{**s, "keyframes": [{"timestamp_seconds": s["start_seconds"] + 0.1, "path": "k.jpg"}],
+                    "visual_summary": "", "dialogue": [{"line_id": "old", "start_seconds": 12.554,
+                                                        "end_seconds": 13.4, "text_ja": "あのさ"}]}
+                   for s in REAL_SCENES],
+    }
+    transcript = {"language": "ja", "segments": [
+        {"start": 12.50, "end": 13.4, "words": [_word("あの", 12.50, 12.70), _word("さ", 12.70, 13.4)]}]}
+    new_index, warnings = asi.reassign_dialogue(index, transcript)
+    assert [s["keyframes"] for s in new_index["scenes"]] == [s["keyframes"] for s in index["scenes"]]
+    sc2 = new_index["scenes"][1]
+    assert [l["text_ja"] for l in sc2["dialogue"]] == ["あのさ"] and _inside(sc2["dialogue"][0], sc2)
+    assert new_index["scenes"][0]["dialogue"] == []
+    assert "reassign_dialogue" in new_index["provenance"]["tools"]
+    assert "video_missing_for_loudness" in {w.code for w in warnings}
+    assert index["scenes"][1]["dialogue"][0]["line_id"] == "old"  # input untouched
+
+
+def test_reassign_refuses_to_drop_existing_line_annotations():
+    index = {
+        "source_index_id": "ep", "provenance": {"kind": "analyzed", "tools": []},
+        "video": {"path": "/nonexistent.mp4", "fps": 24000 / 1001, "duration_seconds": 40.0, "has_audio": False},
+        "scenes": [{**REAL_SCENES[0], "keyframes": [], "dialogue": [
+            {"line_id": "sc001_l01", "start_seconds": 1.0, "end_seconds": 2.0, "text_ja": "はい", "speaker": "misae"}]}],
+    }
+    with pytest.raises(asi.IndexBuildError, match="annotat"):
+        asi.reassign_dialogue(index, {"segments": []})
+    new_index, _ = asi.reassign_dialogue(index, {"segments": []}, force=True)
+    assert new_index["scenes"][0]["dialogue"] == []
