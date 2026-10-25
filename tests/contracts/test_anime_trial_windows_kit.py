@@ -113,3 +113,34 @@ def test_tier1_guide_states_model_offline_and_videomind_honestly():
     for needle in (*QWEN_BATS, "Qwen/Qwen3-VL-4B-Thinking", "VideoMind", "offline", "$0", "ban_do_cot_truyen.md",
                    "kiem_tra_ban_do_cot_truyen.csv", "so_sanh_model.csv", "qwen_trial_report.md"):
         assert needle in text, needle
+
+
+# ── Claude Pro workflow (no API): packet export / answer import, inside .venv-anime ─
+
+CLAUDE_BATS = {
+    "9_XUAT_GOI_CHO_CLAUDE.bat": ("-m lib.anime_claude_packet export --mode overview",
+                                  "-m lib.anime_claude_packet export --mode detail", "-m lib.anime_claude_packet more"),
+    "10_NHAP_KET_QUA_CLAUDE.bat": ("-m lib.anime_claude_packet understanding --paste", "-m lib.anime_claude_packet approve",
+                                   "-m lib.anime_claude_packet script --paste"),
+}
+
+
+@pytest.mark.parametrize(("name", "commands"), CLAUDE_BATS.items())
+def test_claude_bats_call_the_packet_module(name, commands):
+    raw = (KIT / name).read_bytes()
+    assert raw.count(b"\n") == raw.count(b"\r\n"), "CRLF"
+    text = raw.decode("utf-8")
+    for command in commands:
+        assert command in text, command
+    assert ".venv-anime" in text and ".venv-qwen" not in text
+    assert "chcp 65001" in text and 'cd /d "%~dp0..\\.."' in text
+    assert "anthropic" not in text.lower() and "api_key" not in text.lower()
+
+
+def test_claude_pro_guide_covers_the_workflow():
+    text = (REPO / "docs" / "anime-recap" / "HUONG_DAN_CLAUDE_PRO.md").read_text(encoding="utf-8")
+    for needle in (*CLAUDE_BATS, "01_khung_hinh.pdf", "02_loi_thoai_va_canh.md", "03_PROMPT_HIEU_PHIM.md",
+                   "04_PROMPT_VIET_KICH_BAN.md", "hieu_phim.md", "kich_ban.md", "cut_list.csv", "DUYET", "#253-1",
+                   "sw-sitcom-comedy", "sw-japanese-screenwriting", "sw-scene-craft", "sw-character-conflict",
+                   "sw-story-structure", "không chạy lại Whisper", "Không render", "$0"):
+        assert needle.lower() in text.lower(), needle

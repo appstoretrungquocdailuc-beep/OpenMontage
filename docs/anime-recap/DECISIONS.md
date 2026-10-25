@@ -93,6 +93,37 @@ Branch `claude/charming-meitner-s9tzcb`. Plans: `docs/superpowers/plans/2026-10-
 - `--extract-model Qwen/Qwen3-VL-4B-Instruct` optional (extra ~9 GB download, both models in VRAM) — not claimed
   better; compare on scored runs. BAT 7 default = 1 window of 20 s, 8 frames, ≤4 calls; full episode only after it passes.
 
+## Phase 3 re-prioritised — Claude Pro as the brain, no API (2026-10-25)
+- User decision: Qwen3-VL-4B misread the comedy in real tests; it stays for later comparison (code + results kept).
+  Claude Pro (claude.ai upload, or Claude Code logged in with Pro — no API key, no API cost) does understanding and
+  screenwriting. OpenMontage only exports evidence and validates answers: `lib/anime_claude_packet.py`,
+  `scripts/anime_trial/9_XUAT_GOI_CHO_CLAUDE.bat`, `10_NHAP_KET_QUA_CLAUDE.bat`, guide `HUONG_DAN_CLAUDE_PRO.md`.
+- Export reads `anime_source_index.json` + the source video; Whisper is not re-run, Phase 1–2 files are never written
+  (tested by mtime). Packet = `claude_pro/<packet>/`; no episode title / file name / Qwen output reaches Claude.
+- Frames are extracted **by frame number** (one ffmpeg per ≤20 s cluster: `-ss (n0-0.25)/fps` + `select=eq(n,k)`),
+  verified on a red→testsrc2 cut (frame 479 red, 480 not). IDs `f%06d` = round(t·fps), the same grid as the cut list.
+- Density (detail, 20–150 s): 0.5 s grid (auto-widened to fit 320 frames), first/last frame of every scene, 2 frames
+  per line, 5 fps in machine hotspots: ffmpeg scene score (relative top quarter, floor 0.003 — testsrc2 motion is only
+  0.001–0.005, so an absolute 0.02 missed it), excite ≥1.5 or "！", misunderstanding cues (え？ 違う なんで 本当…) or
+  "？", phrases (≥2 chars with kanji/katakana) repeated ≥8 s later. Hints decide sampling only; the PDF says so.
+  Overview: 2 s grid + scene cuts, 4×4 tiles, to pick one complete 60–90 s situation. `more` = 8 fps evidence requests.
+- PDF: Pillow pages (mixed-script runs: JA font for kana/kanji, Latin font for Vietnamese — one CJK font dropped
+  Vietnamese diacritics), written by a minimal JPEG-per-page PDF writer (no extra dependency, low memory), split at
+  24 MB (claude.ai limit 30 MB). Pillow is auto-installed by BAT 9 into `.venv-anime` if missing.
+- Understanding JSON: beats (frames/line_ids/time), characters, causal chain, misunderstandings, gags, doubts,
+  evidence requests. Checks: ids exist in the packet/index, beat inside scope, frame within 2 s (warn) / 5 s (error),
+  observation needs evidence, reasoning is never "observation", inference on hypotheses only → error, payoff before
+  setup → error, 0 grounded beats → FAIL. Rendered md inserts the real transcript text next to each line id.
+- Approval is human-only (typed DUYET), bound to the JSON's SHA-256; re-import deletes it. Claude Code is told not to approve.
+- Script JSON is story-only; code fills frames (grid-snapped), gapless timeline, narration = claim concatenation,
+  estimated durations, dialogue text; then `validate_recap_plan` + checks vs approved beats (event/quote need
+  non-hypothesis beat_ids; cuts inside the analysed scope). `cut_list.csv` only on OK, re-read by `check_cut_list`.
+  Timecode column is non-drop on nominal 24; frames/seconds are authoritative. No render.
+- 5 screenwriting skills: the script prompt says use them directly if installed on the claude.ai account, and carries
+  a distilled checklist from each SKILL.md (起承転結/hook, value turn + enter late, want/obstacle escalation,
+  setup→punchline last word + callbacks, tsukkomi narrator voice) plus the fact limits.
+- Not yet run on Windows or on a real episode; no Claude analysis of #253-1 exists yet.
+
 ## Legacy AI_VIDEO_DIRECTOR_CN_JP (private; never commit its source to this public repo)
 | Legacy module | Decision | Why |
 |---|---|---|
