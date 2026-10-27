@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import json
 import logging
-import resource
 import sys
 import time
 from pathlib import Path
@@ -53,14 +52,24 @@ def main():
     if not edit.exists():
         build_edit(edit, srcs, segs, fps=30.0, size=(720, 1280), layout="letterbox", watermark=True)
     truth = json.loads(edit.with_suffix(".truth.json").read_text())
+    # tool đặt tên nguồn theo thứ tự nhập: L1 -> S1, L2 -> S2
+    for f in truth["frames"]:
+        if f["source_id"]:
+            f["source_id"] = {"L1": "S1", "L2": "S2"}[f["source_id"]]
     cfg = AppConfig()
     cfg.cache_dir = str(root / "cache")
     cfg.render.allow_unverified = True
     t = time.time()
     res = run_mode_a(str(edit), [str(paths["L1"]), str(paths["L2"])], root / "out", cfg)
     dt = time.time() - t
-    st = score_table(json.loads((root / "out" / "BANG_CAT_AUTO.json").read_text("utf-8"))["frames"], truth, srcs)
-    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    st = score_table(json.loads((root / "out" / "BANG_CAT_AUTO.json").read_text("utf-8"))["frames"], truth,
+                     {"S1": srcs["L1"], "S2": srcs["L2"]})
+    try:
+        import resource  # không có trên Windows
+
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    except ImportError:
+        rss = float("nan")
     print(json.dumps({k: v for k, v in st.items() if k != "wrong_list"}))
     print(f"tổng thời gian (phân tích+dựng+QA): {dt:.0f}s, RAM đỉnh {rss:.0f} MB, "
           f"QA={res['qa']['status'] if res['qa'] else None}")

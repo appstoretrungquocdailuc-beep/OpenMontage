@@ -119,6 +119,9 @@ Không cần video Douyin. Chọn `BANG_CAT_AUTO.csv` (hoặc `.json`) + các vi
 * **Tiếp tục khi bị gián đoạn**: fingerprint, kết quả so khớp và từng đoạn video đã dựng đều được lưu; chạy lại
   với cùng đầu vào sẽ bỏ qua phần đã xong. Nút *Hủy / Tạm dừng* dừng ở điểm an toàn.
 * So khớp các cảnh chạy song song theo số nhân CPU.
+* Đo thực tế (máy ảo 4 nhân, **không GPU**): 2 nguồn 1080p dài 6 + 5 phút, bản Douyin dọc 50 giây
+  (1.504 khung) → lập vân tay nguồn ≈ 165 khung/giây, phân tích + dựng 2K + QA ≈ 5,5 phút, RAM đỉnh ≈ 0,85 GB.
+  Trên RTX 3060 + CPU desktop sẽ nhanh hơn (giải mã CUDA, NVENC).
 
 ---
 

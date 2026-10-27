@@ -1,3 +1,4 @@
+"""Chấm điểm nhanh 1 kịch bản: python tests/cham_diem.py <tên_kịch_bản> <thư_mục> [--per] [-v]"""
 import json, sys, time, logging
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
