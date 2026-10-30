@@ -20,14 +20,14 @@ STATUS_LABEL = {GREEN: "XANH - đã kiểm định", YELLOW: "VÀNG - nghi vấn
 MANUAL_OK, MANUAL_SKIP = "OK", "BO_QUA"
 
 SEG_FIELDS = [
-    "segment_id", "status", "manual_action", "edit_frame_start", "edit_frame_end", "edit_pts_start",
+    "segment_id", "status", "method", "manual_action", "edit_frame_start", "edit_frame_end", "edit_pts_start",
     "edit_time_start", "edit_time_end", "duration", "source_id", "source_frame_start", "source_frame_end",
     "source_pts_start", "source_time_start", "source_time_end", "source_frame_exact", "speed", "flip", "crop_x", "crop_y",
     "crop_w", "crop_h", "score", "ok_ratio", "audio_offset_ms", "candidates", "reasons",
     "geom_sx", "geom_sy", "geom_tx", "geom_ty",
 ]
 FRAME_FIELDS = [
-    "edit_frame", "edit_pts", "edit_time", "segment_id", "status", "source_id", "source_frame",
+    "edit_frame", "edit_pts", "edit_time", "segment_id", "status", "method", "source_id", "source_frame",
     "source_pts", "source_time", "similarity", "flip", "crop", "speed",
 ]
 
@@ -81,7 +81,7 @@ def segment_rows(segs: list[Segment], edit_fp: Fingerprint, edit_info, src_fps: 
         t1 = float(edit_fp.pts[sg.end]) if sg.end < edit_fp.n else \
             float(edit_fp.pts[-1]) + 1.0 / edit_fp.fps
         row = {
-            "segment_id": k, "status": sg.status, "manual_action": "",
+            "segment_id": k, "status": sg.status, "method": sg.method if sg.sid else "", "manual_action": "",
             "edit_frame_start": sg.start, "edit_frame_end": sg.end - 1,
             "edit_pts_start": to_pts(t0, e_tb), "edit_time_start": round(t0, 6), "edit_time_end": round(t1, 6),
             "duration": round(t1 - t0, 6),
@@ -112,7 +112,8 @@ def segment_rows(segs: list[Segment], edit_fp: Fingerprint, edit_info, src_fps: 
             ei = sg.start + j
             te = float(edit_fp.pts[ei])
             fr = {"edit_frame": ei, "edit_pts": to_pts(te, e_tb), "edit_time": round(te, 6), "segment_id": k,
-                  "status": sg.frame_status[j] if sg.frame_status else sg.status}
+                  "status": sg.frame_status[j] if sg.frame_status else sg.status,
+                  "method": sg.method if sg.sid else ""}
             if sid is not None:
                 f = int(sg.frames[j])
                 v = sg.sims[j]
@@ -243,7 +244,8 @@ def read_table(path: str | Path) -> dict:
             "source_frame_start": _num(r.get("source_frame_start"), int),
             "source_frame_exact": _num(r.get("source_frame_exact")),
             "source_time_start": _num(r.get("source_time_start")),
-            "speed": _num(r.get("speed"), float, 1.0) or 1.0,
+            "speed": _num(r.get("speed"), float, 1.0),  # 0 = giữ khung (freeze)
+            "method": (r.get("method") or "").strip().lower() or "match",
             "flip": bool(_num(r.get("flip"), int, 0)),
             "crop": tuple(_num(r.get(k)) for k in ("crop_x", "crop_y", "crop_w", "crop_h")),
             "audio_offset_ms": _num(r.get("audio_offset_ms"), float, 0.0),

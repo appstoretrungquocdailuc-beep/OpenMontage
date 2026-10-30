@@ -54,6 +54,17 @@ tool **không đoán nguồn, không chèn màn trắng**: các đoạn được
 Muốn xem thử vẫn có thể tick **"Cho phép xuất BẢN NHÁP"** → file `THANH_PHAM_2K_CHUA_XAC_MINH.mp4`
 (đoạn ĐỎ bị bỏ, không lấp bằng hình giả).
 
+### Mới trong v1.1.0
+
+* **Tầng 2 SIFT + RANSAC** cho đoạn ĐỎ (Douyin phóng to mạnh, phụ đề cứng): tìm trong cửa sổ giữa 2 đoạn kề
+  (±5 giây), bỏ 22% dưới khung (phụ đề), cần ≥ 40 inlier và ≥ 2 khung đồng thuận cùng thời điểm. Kết quả được
+  căn chỉnh lại từng khung; nếu ảnh thu nhỏ không xác minh được thì đoạn là VÀNG (`method = sift`).
+* **DP theo thứ tự thời gian (Viterbi)**: phân xử các ứng viên sát điểm nhau (cảnh lặp) theo tính liền mạch.
+* **Nội suy đoạn ĐỎ** (tùy chọn, tick ô *Nội suy đoạn ĐỎ từ đoạn kề*): đoạn không tìm được nguồn được lấp theo
+  2 đoạn kề (hoặc giữ khung nếu nguồn không đủ dài), giữ đủ thời lượng bản Douyin. Đoạn này luôn VÀNG
+  (`method = interp/freeze`), thành phẩm mang hậu tố `_CHUA_XAC_MINH`; đoạn giữ khung không có tiếng.
+* Cột mới `method` trong bảng cắt: `match` | `sift` | `interp` | `freeze`.
+
 ### Ba trạng thái
 
 * 🟩 **XANH** — khớp và đã qua kiểm định.

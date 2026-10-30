@@ -53,7 +53,7 @@ def normalize_sources(sources: list) -> list[dict]:
 def _code_hash() -> str:
     """Băm mã nguồn thuật toán: đổi/cập nhật thuật toán -> không dùng lại checkpoint cũ."""
     h = hashlib.sha1()
-    for name in ("align.py", "matcher.py", "scenes.py", "fingerprint.py", "index.py", "config.py"):
+    for name in ("align.py", "matcher.py", "scenes.py", "fingerprint.py", "index.py", "config.py", "sift_tier.py"):
         h.update((Path(__file__).parent / name).read_bytes())
     return h.hexdigest()[:10]
 
@@ -162,7 +162,7 @@ def _plan_segments_from_analysis(segs, edit_fp, allow_unverified: bool) -> tuple
         d = {"segment_id": k, "status": sg.status, "edit_t0": t0, "edit_t1": t1, "n_edit": sg.n,
              "source_id": sg.sid, "render": False}
         if sg.sid is not None:
-            d.update({"a": float(sg.a), "speed": float(sg.speed), "t_ref": float(sg.t_ref),
+            d.update({"a": float(sg.a), "speed": float(sg.speed), "t_ref": float(sg.t_ref), "method": sg.method,
                       "flip": bool(sg.geom.flip), "crop_norm": sg.geom.source_crop(), "geometry": sg.geom})
         if sg.sid is None:
             skipped.append((k, "ĐỎ/UNMATCHED"))
@@ -231,8 +231,10 @@ def run_mode_a(edit_path: str, sources: list, out_dir: str | Path, cfg: AppConfi
     verified = bool(doc["summary"]["fully_verified"])
     rinfo = qa = None
     if do_render:
-        if verified or cfg.render.allow_unverified:
-            plan_segs, skipped = _plan_segments_from_analysis(segs, res["edit_fp"], cfg.render.allow_unverified)
+        # bật nội suy = chấp nhận dựng đoạn VÀNG (file vẫn mang hậu tố _CHUA_XAC_MINH)
+        allow = cfg.render.allow_unverified or cfg.analysis.interpolate_unmatched
+        if verified or allow:
+            plan_segs, skipped = _plan_segments_from_analysis(segs, res["edit_fp"], allow)
             if any(s["render"] for s in plan_segs):
                 edit_meta = dict(doc["edit"])
                 rinfo, qa = render_and_qa(plan_segs, _sources_for_render(res["manifest"], res["src_fps"]),
@@ -374,7 +376,8 @@ def run_mode_b(table_path: str, sources: list, out_dir: str | Path, cfg: AppConf
         crop_norm = (crop[0] / m["width"], crop[1] / m["height"], crop[2] / m["width"], crop[3] / m["height"]) \
             if all(c is not None for c in crop) else None
         d.update({"a": float(f_exact), "speed": float(r["speed"]), "t_ref": float(t0), "flip": r["flip"],
-                  "crop_norm": crop_norm, "geometry": r["geometry"], "render": True})
+                  "crop_norm": crop_norm, "geometry": r["geometry"], "render": True,
+                  "method": "freeze" if float(r["speed"] or 0) <= 0 else r["method"]})
         if not (r["status"] == GREEN or act == MANUAL_OK):
             verified = False
         segments.append(d)

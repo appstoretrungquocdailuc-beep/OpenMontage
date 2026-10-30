@@ -184,6 +184,9 @@ class App(tk.Tk):
         self.draft = tk.BooleanVar(value=False)
         ttk.Checkbutton(opt, text="Cho phép xuất BẢN NHÁP khi chưa xác minh 100% (file *_CHUA_XAC_MINH)",
                         variable=self.draft).grid(row=0, column=0, columnspan=4, sticky="w")
+        self.interp = tk.BooleanVar(value=False)
+        ttk.Checkbutton(opt, text="Nội suy đoạn ĐỎ từ đoạn kề (giữ đủ thời lượng, đánh dấu VÀNG 'NỘI SUY')",
+                        variable=self.interp).grid(row=0, column=4, columnspan=4, sticky="w")
         ttk.Label(opt, text="Khung hình:").grid(row=1, column=0, sticky="e")
         self.crop = ttk.Combobox(opt, state="readonly", width=34,
                                  values=["Giống bản Douyin (crop/zoom/lật)", "Toàn khung nguồn (chỉ lật)"])
@@ -263,6 +266,7 @@ class App(tk.Tk):
     def _cfg(self):
         cfg = load_config()
         cfg.render.allow_unverified = bool(self.draft.get())
+        cfg.analysis.interpolate_unmatched = bool(self.interp.get())
         cfg.render.crop_mode = "match_edit" if self.crop.current() == 0 else "full_source"
         cfg.render.codec = ["auto", "h264_nvenc", "libx264"][self.codec.current()]
         cfg.render.nvenc_cq = cfg.render.x264_crf = int(self.cq.get())

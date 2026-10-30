@@ -8,10 +8,10 @@ from pathlib import Path
 from synth import CartoonSource, EditSeg, SourceSpec, build_edit
 
 
-def make_sources(root: Path, which=("S1", "S2", "S3"), upscale_s2=False, dup=False):
+def make_sources(root: Path, which=("S1", "S2", "S3"), upscale_s2=False, dup=False, textured=False):
     root.mkdir(parents=True, exist_ok=True)
     specs = {
-        "S1": SourceSpec("S1", 11, 40.0),
+        "S1": SourceSpec("S1", 11, 40.0, textured=textured),
         "S2": SourceSpec("S2", 22, 36.0, width=1280 if upscale_s2 else 640, height=720 if upscale_s2 else 360),
         "S3": SourceSpec("S3", 33, 30.0, fps_num=25, fps_den=1),
     }
@@ -70,13 +70,22 @@ SCENARIOS = {
         segs=[EditSeg(None, seconds=1.5, foreign_seed=4242), EditSeg("S2", 120, 2.0),
               EditSeg("S1", 333, 1.6), EditSeg("S2", 120, 2.0), EditSeg("S1", 333, 1.6, flip=True),
               EditSeg(None, seconds=1.2, foreign_seed=99)]),
+    # 7) (v1.1) phóng to rất mạnh + phụ đề cứng + watermark; cảnh ngoài nguồn kẹp giữa 2 đoạn cùng nguồn
+    "zoom_manh_noi_suy": dict(
+        sources=("S1",), fps=30.0, size=(960, 540), layout="fill", watermark=True, textured=True,
+        segs=[EditSeg("S1", 100, 2.0, subtitle="Shin-chan: Oi!"),
+              EditSeg("S1", 300, 2.5, crop=(0.40, 0.28, 0.36, 0.36), subtitle="Zoom manh qua"),
+              EditSeg("S1", 400, 2.0),
+              EditSeg(None, seconds=1.5, foreign_seed=555),
+              EditSeg("S1", 520, 2.0, subtitle="Het")]),
 }
 
 
 def build_scenario(name: str, root: Path, per_scenario_sources: bool = False):
     sc = SCENARIOS[name]
     srcs, paths = make_sources(root / f"sources_{name}" if per_scenario_sources else root / "sources",
-                               sc["sources"], sc.get("upscale_s2", False), sc.get("dup", False))
+                               sc["sources"], sc.get("upscale_s2", False), sc.get("dup", False),
+                               sc.get("textured", False))
     edit = root / f"edit_{name}.mp4"
     truth_path = edit.with_suffix(".truth.json")
     if not edit.exists() or not truth_path.exists():

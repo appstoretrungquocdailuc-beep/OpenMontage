@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .align import (Alignment, Canvas, Geometry, align_scene, estimate_orb, estimate_template, geometry_from_windows,
+from .align import (Alignment, Canvas, Geometry, _from_px, align_scene, estimate_orb, estimate_template, geometry_from_windows,
                     pair_block_sims, pair_score, refine_direct, refine_ecc)
 from .config import AnalysisConfig
 from .fingerprint import Fingerprint, crop_norm, window_feature
@@ -59,6 +59,8 @@ class Segment:
     merged_cuts: list = field(default_factory=list)
     frame_status: list = field(default_factory=list)
     options: list = field(default_factory=list)  # ứng viên còn mơ hồ: (sid, Geometry, score)
+    method: str = "match"  # match | sift | interp | freeze
+    alts: list = field(default_factory=list)  # ứng viên đã căn chỉnh (sid, Geometry, Alignment, rank) cho DP
 
     @property
     def n(self) -> int:
@@ -319,6 +321,8 @@ class Matcher:
         if best.align.ambiguous_frames > 2:
             seg.notes.append(f"CẢNH TĨNH: offset mơ hồ ±{best.align.ambiguous_frames} khung")
         seg.options.insert(0, (best.sid, best.geom, best.score))
+        seg.alts = [(c.sid, c.geom, c.align, self._rank(c)) for c in evald[:5]
+                    if c.align is not None and len(c.align.frames) == seg.n]
         return [self._finish(seg)]
 
     def _rank(self, c: Candidate) -> float:
@@ -387,6 +391,12 @@ class Matcher:
     def _finish(self, seg: Segment) -> Segment:
         """Gán trạng thái khung/cảnh theo ngưỡng kiểm định."""
         cfg = self.cfg
+        if seg.sid is not None and seg.method in ("sift", "interp", "freeze"):
+            # không xác minh được bằng hình ở độ phân giải phân tích -> luôn VÀNG
+            seg.status = YELLOW
+            seg.reasons = list(seg.notes)
+            seg.frame_status = [YELLOW] * seg.n
+            return seg
         if seg.sid is not None:  # không đủ bằng chứng -> không được gán nguồn (kể cả trạng thái VÀNG)
             v = np.asarray(seg.sims, dtype=np.float64)
             fin = v[np.isfinite(v)]
@@ -462,8 +472,11 @@ class Matcher:
         with ThreadPoolExecutor(max_workers=workers) as ex:
             for r in ex.map(work, scenes):
                 segs += r
-        self.progress(0.9, "kiểm tra tính liên tục")
         segs.sort(key=lambda x: x.start)
+        if self.cfg.dp_enable:
+            self.progress(0.89, "DP theo thứ tự thời gian")
+            self.viterbi(segs)
+        self.progress(0.9, "kiểm tra tính liên tục")
         self.refine_boundaries(segs)
         segs = [x for x in segs if x.n > 0]
         self.progress(0.92, "đồng thuận hình học & phép thử mơ hồ thời gian")
@@ -472,13 +485,233 @@ class Matcher:
             list(ex.map(self.ambiguity_test, segs))
         self.resolve_continuity(segs)
         segs = self.merge_continuous(segs)
+        if self.cfg.sift_enable and any(x.sid is None for x in segs):
+            self.progress(0.94, "tầng 2: SIFT cho đoạn ĐỎ")
+            self.sift_tier(segs)
+            segs = self.merge_continuous(segs)
         if self.cfg.hires_refine:
             self.progress(0.95, "tinh chỉnh crop ở độ phân giải cao")
             for sg in segs:
                 if sg.sid is not None:
                     self.hires_geometry(sg)
+        if self.cfg.interpolate_unmatched:
+            self.interpolate(segs)
         self.progress(1.0, "xong")
         return segs
+
+    # ------------------------------------------------------------ P1: DP theo thứ tự thời gian
+    def viterbi(self, segs: list[Segment]):
+        """Chọn ứng viên cho chuỗi đoạn tối đa hóa tổng điểm - phạt nhảy thời gian (Viterbi).
+
+        Chỉ xét ứng viên có điểm sát ứng viên tốt nhất (dp_window): DP phân xử nhập nhằng
+        (cảnh lặp, mặt nhân vật xuất hiện nhiều lần), không lật ngược kết quả khớp rõ ràng.
+        """
+        cfg = self.cfg
+        idx = [k for k, sg in enumerate(segs) if sg.sid is not None and sg.method == "match" and sg.alts]
+        if len(idx) < 2:
+            return
+        cands = []
+        for k in idx:
+            sg = segs[k]
+            top = max(a[3] for a in sg.alts)
+            cs = [a for a in sg.alts if a[2].score >= cfg.scene_match and a[3] >= top - cfg.dp_window]
+            cur = next((a for a in sg.alts if a[0] == sg.sid and abs(a[2].a - sg.a) < 0.5), None)
+            if cur is not None and cur not in cs:
+                cs.insert(0, cur)
+            cands.append(cs or sg.alts[:1])
+        if all(len(c) == 1 for c in cands):
+            return
+
+        def t_of(sid, al):
+            return al.a / self.sources[sid].fps
+
+        INF = -1e9
+        dp = [[INF] * len(c) for c in cands]
+        bp = [[-1] * len(c) for c in cands]
+        for m, c in enumerate(cands[0]):
+            dp[0][m] = c[3]
+        for i in range(1, len(cands)):
+            te_prev = float(self.edit.pts[segs[idx[i - 1]].start])
+            te_cur = float(self.edit.pts[segs[idx[i]].start])
+            for m, (sid2, _, al2, s2) in enumerate(cands[i]):
+                for k, (sid1, _, al1, _) in enumerate(cands[i - 1]):
+                    if dp[i - 1][k] <= INF / 2:
+                        continue
+                    if sid1 != sid2:
+                        pen = 0.3
+                    else:
+                        gap = t_of(sid2, al2) - (t_of(sid1, al1) + (te_cur - te_prev) * al1.speed)
+                        tol = 2.0 / self.sources[sid2].fps
+                        pen = 0.0 if abs(gap) <= tol else (0.3 if gap > 0 else 1.0 + min(5.0, -gap))
+                    v = dp[i - 1][k] + s2 - cfg.dp_lambda * pen * 10
+                    if v > dp[i][m]:
+                        dp[i][m], bp[i][m] = v, k
+        m = int(np.argmax(dp[-1]))
+        path = [m]
+        for i in range(len(cands) - 1, 0, -1):
+            m = bp[i][m]
+            path.append(m)
+        path = path[::-1]
+
+        def continuous(i, j):  # ứng viên đã chọn của 2 đoạn i, j (i < j) liền mạch thời gian?
+            sid1, _, al1, _ = cands[i][path[i]]
+            sid2, _, al2, _ = cands[j][path[j]]
+            if sid1 != sid2:
+                return False
+            dt = float(self.edit.pts[segs[idx[j]].start] - self.edit.pts[segs[idx[i]].start])
+            gap = t_of(sid2, al2) - (t_of(sid1, al1) + dt * al1.speed)
+            return abs(gap) <= 2.0 / self.sources[sid2].fps
+
+        for i, (k, m) in enumerate(zip(idx, path)):
+            sg = segs[k]
+            sid, geom, al, _ = cands[i][m]
+            if sid == sg.sid and abs(al.a - sg.a) < 0.5:
+                continue
+            def firm(j):  # đoạn kề không tự mang cờ mơ hồ
+                return not any(r.startswith(AMBIG) for r in segs[idx[j]].notes)
+
+            linked = (i > 0 and continuous(i - 1, i) and firm(i - 1)) or \
+                     (i + 1 < len(cands) and continuous(i, i + 1) and firm(i + 1))
+            old = f"{sg.sid}@{int(sg.frames[0])}"
+            sg.sid, sg.geom, sg.a, sg.speed = sid, geom, al.a, al.speed
+            sg.t_ref = float(self.edit.pts[sg.start])
+            sg.frames, sg.sims, sg.score = al.frames.copy(), al.sims.copy(), al.score
+            sg.ambiguous_frames = al.ambiguous_frames
+            if linked:  # liền mạch với đoạn kề -> tính liên tục xác nhận, gỡ cờ mơ hồ
+                sg.notes = [r for r in sg.notes if not r.startswith(AMBIG)]
+            sg.notes.append(f"DP: chọn {sid}@{int(al.frames[0])} theo chuỗi thời gian (thay {old})"
+                            + ("" if linked else " - không liền mạch với đoạn kề, vẫn nghi vấn"))
+            log.info("DP đoạn %d-%d: %s -> %s@%d", sg.start, sg.end, old, sid, int(al.frames[0]))
+            self._finish(sg)
+
+    # ------------------------------------------------------------ P1: tầng 2 SIFT
+    def _neighbor(self, segs, k, step):
+        j = k + step
+        while 0 <= j < len(segs):
+            if segs[j].sid is not None:
+                return segs[j]
+            j += step
+        return None
+
+    def sift_tier(self, segs: list[Segment]):
+        from .sift_tier import match_segment, source_sift
+
+        cfg = self.cfg
+        sdata = {}
+        for k, sg in enumerate(segs):
+            if sg.sid is not None or sg.n < cfg.min_evidence_frames:
+                continue
+            if self.cancel is not None and self.cancel.is_set():
+                raise InterruptedError("Đã hủy")
+            prev, nxt = self._neighbor(segs, k, -1), self._neighbor(segs, k, 1)
+            src_list = []
+            for sid, fp in self.sources.items():
+                if sid not in sdata:
+                    sdata[sid] = source_sift(self.source_paths[sid], fp, cfg.sift_step, cfg.sift_width,
+                                             cfg.sift_nfeat, self.cancel)
+                sd = sdata[sid]
+                lo, hi = 0, len(sd["frame"])
+                if prev is not None and nxt is not None and prev.sid == sid and nxt.sid == sid:
+                    # cửa sổ [cuối đoạn trước - 5s, đầu đoạn sau + 5s]
+                    f_lo = prev.a + prev.speed * fp.fps * (self.edit.pts[prev.end - 1] - prev.t_ref) \
+                        - cfg.sift_window_s * fp.fps
+                    f_hi = nxt.a + nxt.speed * fp.fps * (self.edit.pts[nxt.start] - nxt.t_ref) \
+                        + cfg.sift_window_s * fp.fps
+                    if f_hi > f_lo:
+                        lo = int(np.searchsorted(sd["frame"], f_lo))
+                        hi = int(np.searchsorted(sd["frame"], f_hi, side="right"))
+                src_list.append((sid, sd, fp.fps, (lo, max(lo, hi))))
+            if prev is not None and nxt is not None and prev.sid == nxt.sid:
+                src_list.sort(key=lambda x: x[0] != prev.sid)
+            n = sg.n
+            qs = (0.1, 0.3, 0.5, 0.7, 0.9) if n >= 15 else (0.15, 0.5, 0.85)
+            times = sorted({float(self.edit.pts[sg.start + int(q * (n - 1))]) for q in qs})
+            res = match_segment(self.edit_path, times, src_list, cfg, cfg.sift_mask_bottom)
+            if res is None:
+                sg.notes.append("SIFT: không tìm được nguồn đủ tin cậy")
+                self._finish(sg)
+                continue
+            fp = self.sources[res["sid"]]
+            g = _from_px(res["M"], res["edit_size"], res["src_size"])
+            if g is None:
+                continue
+            if res["flip"]:
+                g = Geometry(-g.sx, g.sy, g.tx + g.sx, g.ty)
+            # thời điểm SIFT ứng với times[0] -> quy về đầu đoạn
+            a0 = res["f_start"] - fp.fps * (times[0] - float(self.edit.pts[sg.start]))
+            info = f"SIFT: {res['sid']}@{int(a0)} ({res['inliers']} inlier, thứ hai {res['second']}, " \
+                   f"{res['n_frames_ok']}/{len(times)} khung)"
+            log.info("Đoạn %d-%d: %s", sg.start, sg.end, info)
+            c = Candidate(res["sid"], a0, g, float(res["inliers"]), sg.start + n // 2,
+                          int(round(a0 + fp.fps * (self.edit.pts[sg.start + n // 2] - self.edit.pts[sg.start]))))
+            c = self.evaluate(sg.start, sg.end, c)
+            notes = [r for r in sg.notes if not r.startswith("UNMATCHED")]
+            if c.align is not None:
+                trial = Segment(sg.start, sg.end, notes=notes + [info])
+                self._apply(trial, c)
+                self._finish(trial)
+                if trial.sid is not None:
+                    sg.__dict__.update(trial.__dict__)
+                    continue
+            # ảnh thu nhỏ không xác minh được (phóng to mạnh) -> tin SIFT, đánh dấu VÀNG
+            sg.sid, sg.geom, sg.a, sg.speed, sg.method = res["sid"], g, a0, 1.0, "sift"
+            sg.t_ref = float(self.edit.pts[sg.start])
+            sg.frames, sg.sims, _ = self._model_sims(sg.sid, g, a0, 1.0, sg.t_ref, range(sg.start, sg.end))
+            fin = sg.sims[np.isfinite(sg.sims)]
+            sg.score = float(np.median(fin)) if len(fin) else -1.0
+            sg.notes = notes + [info + " - ảnh thu nhỏ không xác minh được, cần xem lại"]
+            self._finish(sg)
+
+    # ------------------------------------------------------------ P0: nội suy đoạn ĐỎ
+    def interpolate(self, segs: list[Segment]):
+        """Đoạn ĐỎ nằm giữa các đoạn đã khớp -> nội suy vị trí nguồn (hoặc giữ khung), đánh dấu VÀNG."""
+        cfg = self.cfg
+        last_t = float(self.edit.pts[-1]) + 1.0 / max(self.edit.fps, 1)
+
+        def t_at(k):
+            return float(self.edit.pts[k]) if k < self.edit.n else last_t
+
+        for k, sg in enumerate(segs):
+            if sg.sid is not None:
+                continue
+            a, b = self._neighbor(segs, k, -1), self._neighbor(segs, k, 1)
+            if a is None and b is None:
+                continue
+            ref = a if a is not None else b
+            fp = self.sources[ref.sid]
+            t_i, dur = t_at(sg.start), t_at(sg.end) - t_at(sg.start)
+            method, speed = "interp", 1.0
+            if a is not None:
+                t_ae = t_at(a.end)
+                f_ae = a.a + a.speed * fp.fps * (t_ae - a.t_ref)  # khung (thực) cuối đoạn a
+            if a is not None and b is not None and b.sid == a.sid:
+                f_bs = b.a + b.speed * fp.fps * (t_at(b.start) - b.t_ref)
+                gap_src = (f_bs - f_ae) / fp.fps
+                gap_edit = max(1e-6, t_at(b.start) - t_ae)
+                if gap_src < dur:
+                    method, start = "freeze", float(a.frames[-1])
+                else:
+                    speed = float(np.clip(gap_src / gap_edit, cfg.interp_speed_min, cfg.interp_speed_max))
+                    start = f_ae + (t_i - t_ae) * speed * fp.fps
+            elif a is not None:
+                start = f_ae + (t_i - t_ae) * fp.fps
+                if start + dur * fp.fps > fp.n - 1:
+                    method, start = "freeze", float(a.frames[-1])
+            else:
+                start = b.a + b.speed * fp.fps * (t_at(b.start) - b.t_ref) - dur * fp.fps
+                if start < 0:
+                    method, start = "freeze", float(b.frames[0])
+            if method == "freeze":
+                speed = 0.0
+            sg.sid, sg.geom, sg.a, sg.speed, sg.method = ref.sid, ref.geom, float(start), speed, method
+            sg.t_ref = t_i
+            sg.frames, sg.sims, _ = self._model_sims(sg.sid, sg.geom, sg.a, speed, t_i, range(sg.start, sg.end))
+            fin = sg.sims[np.isfinite(sg.sims)]
+            sg.score = float(np.median(fin)) if len(fin) else -1.0
+            what = "GIỮ KHUNG (freeze)" if method == "freeze" else f"NỘI SUY tốc độ {speed:.3f}"
+            sg.notes.append(f"{what} từ {ref.sid}@{int(start)} theo đoạn kề - KHÔNG phải kết quả so khớp")
+            log.info("Đoạn %d-%d: %s", sg.start, sg.end, sg.notes[-1])
+            self._finish(sg)
 
     def _expected_a(self, prev: Segment, cur: Segment) -> float:
         """Khung nguồn (số thực) mà mô hình tuyến tính của ``prev`` dự đoán tại đầu cảnh ``cur``."""
@@ -571,6 +804,7 @@ class Matcher:
         sg.t_ref = float(self.edit.pts[sg.start])
         sg.frames, sg.sims, sg.score = al.frames.copy(), al.sims.copy(), al.score
         sg.ambiguous_frames = al.ambiguous_frames
+        sg.method = "match"
         sg.notes.append(note)
         self._finish(sg)
 
@@ -592,7 +826,7 @@ class Matcher:
             return
         groups.sort(key=lambda g: -g[1])
         for sg in segs:
-            if sg.sid is None:
+            if sg.sid is None or sg.method != "match":
                 continue
             for G, _, _ in groups[:2]:
                 if sg.geom.close_to(G, 0.006):
@@ -727,6 +961,7 @@ class Matcher:
                 sel, nb, al, direction = best
                 old = f"{sg.sid}@{int(sg.frames[0])}"
                 sg.sid, sg.geom, sg.a, sg.speed = nb.sid, nb.geom, al.a, al.speed
+                sg.method = "match"
                 sg.t_ref = float(self.edit.pts[sg.start])
                 sg.frames, sg.sims, sg.score = al.frames, al.sims, al.score
                 sg.notes = [r for r in sg.notes if not r.startswith(AMBIG + ("RANH GIỚI",))]
@@ -792,7 +1027,10 @@ class Matcher:
         for r in p.notes + sg.notes:
             if r.startswith("RANH GIỚI"):
                 continue
-            if r.startswith(AMBIG):  # đã được căn chỉnh chung liên tục xác nhận
+            # căn chỉnh chung liên tục chỉ giải quyết nhập nhằng CÙNG nguồn; nội dung trùng ở
+            # nguồn KHÁC vẫn là nghi vấn (bản sao cũng liền mạch như vậy)
+            other_src = r.startswith("NHIỀU NGUỒN: ") and not r.startswith(f"NHIỀU NGUỒN: {p.sid}@")
+            if r.startswith(AMBIG) and not other_src:
                 r = "LIÊN TỤC xác nhận (" + r + ")"
             if r not in notes:
                 notes.append(r)

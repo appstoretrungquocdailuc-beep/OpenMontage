@@ -278,3 +278,35 @@ def test_do_tre_audio_rieng_tung_nguon(root):
     ref = extract_audio_pcm(str(paths["S1"]), 1, seg["audio_start"] - 0.120 + 0.5, 1.0)
     lag, peak = _xcorr_lag(o[k0 + int(0.5 * sr): k0 + int(1.5 * sr)], ref, sr)
     assert abs(abs(lag) - 120) < 3, (lag, peak)
+
+
+# ---------------------------------------------------------------------------- v1.1: SIFT tầng 2 + nội suy
+
+def test_sift_tang2_zoom_manh(root):
+    """Douyin phóng to ~2,8x + phụ đề + watermark: chỉ mục ảnh nhỏ bỏ sót -> SIFT tìm lại, không khớp sai."""
+    srcs, paths, edit, truth, res = run_analysis(root, "zoom_manh_noi_suy")
+    st = score_table(res["doc"]["frames"], truth, srcs)
+    assert st["green_wrong"] == 0 and st["false_match"] == 0
+    assert st["visual"] == st["total"] - st["foreign"], st
+    seg = next(s for s in res["doc"]["segments"] if s["edit_frame_start"] <= 100 <= s["edit_frame_end"])
+    assert seg["source_id"] == "S1" and seg["status"] != RED
+    assert abs(seg["crop_x"] - 0.40 * 640) < 8 and abs(seg["crop_w"] - 0.36 * 640) < 8
+    # cảnh ngoài nguồn vẫn ĐỎ khi chưa bật nội suy
+    assert all(r["status"] == RED for r, g in _frames_by_gt(res, truth) if g["source_id"] is None)
+
+
+def test_noi_suy_giu_du_thoi_luong(root):
+    """Bật nội suy: đoạn ĐỎ được lấp từ đoạn kề (VÀNG 'NỘI SUY'), thành phẩm đủ thời lượng bản Douyin."""
+    srcs, paths, edit, truth = build_scenario("zoom_manh_noi_suy", root, per_scenario_sources=True)
+    cfg = _cfg(root)
+    cfg.analysis.interpolate_unmatched = True
+    out = root / "full_noi_suy"
+    r = run_mode_a(str(edit), [str(paths["S1"])], out, cfg)
+    doc = json.loads((out / "BANG_CAT_AUTO.json").read_text("utf-8"))
+    interp = [s for s in doc["segments"] if s["method"] in ("interp", "freeze")]
+    assert interp and all(s["status"] == YELLOW for s in interp)
+    assert doc["summary"]["frames_red"] == 0
+    assert r["verified"] is False and (out / "THANH_PHAM_2K_CHUA_XAC_MINH.mp4").exists()
+    edit_dur = len(truth["frames"]) / truth["fps"]
+    assert abs(r["qa"]["duration"] - edit_dur) <= 1.0 / truth["fps"] + 1e-3, (r["qa"]["duration"], edit_dur)
+    assert r["qa"]["status"] != RED  # các đoạn so khớp đều khớp; đoạn nội suy chỉ là VÀNG

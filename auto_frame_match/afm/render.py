@@ -263,6 +263,8 @@ def segment_audio(plan: RenderPlan, s: dict, n_samples: int, rate: int) -> tuple
     src = plan.sources[s["source_id"]]
     a = src.get("audio_stream")
     info = {"audio_start": None, "audio_stream": a["index"] if a else None}
+    if s["speed"] <= 0:  # giữ khung (freeze): không có tiếng tương ứng -> im lặng
+        return np.zeros((n_samples, 2), np.float32), info
     if not a:
         log.warning("Nguồn %s không có âm thanh -> đoạn %s im lặng", s["source_id"], s["segment_id"])
         return np.zeros((n_samples, 2), np.float32), info

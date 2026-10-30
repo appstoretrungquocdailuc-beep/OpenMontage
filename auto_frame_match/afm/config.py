@@ -11,7 +11,7 @@ import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-TOOL_VERSION = "1.0.0"
+TOOL_VERSION = "1.1.0"
 # Tăng khi thay đổi cách tính fingerprint -> cache cũ tự động bị bỏ qua.
 FINGERPRINT_VERSION = 6
 
@@ -63,6 +63,27 @@ class AnalysisConfig:
     ambiguity_margin: float = 0.015  # chênh lệch điểm giữa 2 nguồn ứng viên
     min_evidence_frames: int = 3  # không chấp nhận 1 khung giống làm bằng chứng
     static_texture_min: float = 2.0
+
+    # --- tầng 2: SIFT + RANSAC cho đoạn UNMATCHED ---
+    sift_enable: bool = True
+    sift_step: float = 0.5  # giây giữa 2 khung nguồn lấy SIFT
+    sift_width: int = 640
+    sift_nfeat: int = 800
+    sift_ratio: float = 0.7
+    sift_min_inliers: int = 40
+    sift_unique: float = 1.5  # phải gấp >= 1.5 lần ứng viên thứ hai
+    sift_mask_bottom: float = 0.22  # bỏ phần dưới khung edit (phụ đề cứng)
+    sift_window_s: float = 5.0  # nới cửa sổ tìm quanh 2 đoạn kề
+
+    # --- DP theo thứ tự thời gian (Viterbi) ---
+    dp_enable: bool = True
+    dp_lambda: float = 0.02
+    dp_window: float = 0.03  # chỉ xét ứng viên có điểm cách ứng viên tốt nhất <= mức này
+
+    # --- nội suy đoạn ĐỎ từ đoạn kề (tùy chọn, mặc định TẮT) ---
+    interpolate_unmatched: bool = False
+    interp_speed_min: float = 0.5
+    interp_speed_max: float = 1.1
 
     # --- xác minh độ phân giải cao ---
     hires_refine: bool = True

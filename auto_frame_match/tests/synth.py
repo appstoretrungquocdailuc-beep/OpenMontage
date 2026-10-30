@@ -26,6 +26,7 @@ class SourceSpec:
     fps_den: int = 1001
     width: int = 640
     height: int = 360
+    textured: bool = False  # nền vẽ có họa tiết (nhiều điểm đặc trưng như nền anime)
 
     @property
     def fps(self) -> float:
@@ -90,6 +91,22 @@ class CartoonSource:
         img[:] = s["bg"]
         img[int(H * 0.62):] = s["bg2"]
         off = int(s["pan"] * t)
+        if self.spec.textured:
+            if "tex" not in s:
+                r = np.random.default_rng(self.spec.seed * 1000 + k)
+                tex = np.zeros((H, 1400, 3), np.uint8)
+                tex[:] = s["bg"]
+                for _ in range(900):  # nét cọ / chi tiết nền ngẫu nhiên, cố định theo cảnh
+                    c = tuple(int(v) for v in r.integers(20, 235, 3))
+                    p0 = (int(r.integers(0, 1400)), int(r.integers(0, H)))
+                    if r.random() < 0.5:
+                        cv2.circle(tex, p0, int(r.integers(2, 12)), c, int(r.choice([-1, 1, 2])))
+                    else:
+                        p1 = (p0[0] + int(r.integers(-60, 60)), p0[1] + int(r.integers(-40, 40)))
+                        cv2.line(tex, p0, p1, c, int(r.integers(1, 4)))
+                s["tex"] = tex
+            sh = int(off % 1400)
+            img[:] = np.roll(s["tex"], -sh, axis=1)[:, :W]
         for (x, y, w, h, col) in s["scenery"]:
             xx = int((x - off) % 1400) - 300
             cv2.rectangle(img, (xx, int(y) - int(h)), (xx + int(w), int(y)), col, -1)

@@ -107,6 +107,11 @@ def verify_output(out_path: str, plan, render_info: dict, cfg: AnalysisConfig, e
             res["status"] = RED
             seg_results.append(res)
             continue
+        if s.get("method") in ("interp", "freeze"):
+            res["issues"].append("NỘI SUY/GIỮ KHUNG - không phải kết quả so khớp, không đối chiếu được")
+            res["status"] = YELLOW
+            seg_results.append(res)
+            continue
         src = plan.sources[s["source_id"]]
         rw, rh = src["_render_wh"]
         crop_fit = plan.crop_px(s, rw, rh)[4]
@@ -212,7 +217,7 @@ def verify_output(out_path: str, plan, render_info: dict, cfg: AnalysisConfig, e
     if info.audio_streams:
         out_a = extract_audio_pcm(out_path, info.audio_streams[0]["index"], info.start_time, info.duration + 1, rate)
     for s, ri in zip(used, render_info.get("segments", [])):
-        if out_a is None or ri.get("audio_start") is None:
+        if out_a is None or ri.get("audio_start") is None or s.get("method") in ("interp", "freeze"):
             continue
         src = plan.sources[s["source_id"]]
         dur = (s["out_end"] - s["out_start"]) / float(plan.fps)
