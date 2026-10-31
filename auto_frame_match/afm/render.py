@@ -223,6 +223,12 @@ def _render_segment_video(plan: RenderPlan, s: dict, out_file: Path, cancel, pro
             while cur_idx < want:
                 buf = pd.stdout.read(fsize)
                 if len(buf) < fsize:
+                    # decoder hết khung sớm 1-3 khung ở rìa đoạn (trim/seek lệch): lặp khung cuối
+                    if cur is not None and (want - cur_idx) <= 3:
+                        log.warning("Đoạn %s: thiếu %d khung cuối nguồn, lặp khung cuối",
+                                    s["segment_id"], want - cur_idx)
+                        cur_idx = want
+                        break
                     raise RuntimeError(f"Thiếu khung nguồn khi dựng đoạn {s['segment_id']} "
                                        f"(cần khung {f_lo + want}, chỉ đọc được {f_lo + cur_idx})")
                 cur, cur_idx = buf, cur_idx + 1
