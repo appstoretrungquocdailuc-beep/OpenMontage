@@ -195,7 +195,7 @@ def _render_segment_video(plan: RenderPlan, s: dict, out_file: Path, cancel, pro
     t_lo = rpts[f_lo]
     t_hi = rpts[f_hi]
     half = 0.5 / float(src.get("render_fps") or src["fps"])
-    vf = [f"trim=start={t_lo - half:.6f}:end={t_hi + half:.6f}",
+    vf = [f"trim=start={t_lo - half * 1.4:.6f}:end={t_hi + half * 1.4:.6f}",
           f"crop={W}:{H}:{X}:{Y}"]
     if s["flip"]:
         vf.append("hflip")
