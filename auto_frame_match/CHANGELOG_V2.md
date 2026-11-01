@@ -1,6 +1,6 @@
 # CHANGELOG — AUTO FRAME MATCH V2 (2.0.0)
 
-Bản sao lưu để quay lại: git tag `afm-v1.1.0-backup` (xem mục Rollback trong README_VI.md).
+Bản sao lưu để quay lại: commit `4d91086` (v1.1 + 2 bản sửa dựng hình), xem mục Rollback trong README_VI.md.
 
 ## Giai đoạn A — Kiểm toán: nguyên nhân video bị ngắn và cảnh ĐỎ
 

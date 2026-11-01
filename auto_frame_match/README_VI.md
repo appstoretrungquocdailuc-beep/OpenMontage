@@ -173,8 +173,9 @@ chép `afm_config.example.json` thành `afm_config.json` rồi sửa.
 
 ## 8. Rollback về bản cũ
 
-Bản v1.1.0 được giữ ở git tag `afm-v1.1.0-backup`. Quay lại: `git checkout afm-v1.1.0-backup -- auto_frame_match`
-(hoặc tải ZIP của tag đó trên GitHub). Cache fingerprint dùng chung được (cùng `FINGERPRINT_VERSION`).
+Bản v1.1 (kèm 2 bản sửa dựng hình) là commit `4d91086` trên nhánh này. Quay lại: `git checkout 4d91086 -- auto_frame_match`
+hoặc tải ZIP: https://github.com/appstoretrungquocdailuc-beep/OpenMontage/archive/4d91086.zip
+(tag cục bộ `afm-v1.1.0-backup` = commit `1d320f3`, bản v1.1 gốc). Cache fingerprint dùng chung được (cùng `FINGERPRINT_VERSION`).
 
 ## 9. Giới hạn đã biết (nói thẳng)
 
