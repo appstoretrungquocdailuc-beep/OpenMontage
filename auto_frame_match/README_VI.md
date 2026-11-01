@@ -1,4 +1,8 @@
-# AUTO FRAME MATCH 2K — Phân tích & cắt ghép khung hình 100% trên máy
+# AUTO FRAME MATCH 2K (V2) — Phân tích & cắt ghép khung hình 100% trên máy
+
+> **V2 (2.0.0):** giữ ĐỦ 100% số khung và thời lượng bản Douyin; tốc độ 0,2×–6×, speed ramp, đứng hình;
+> cứu hộ cảnh ĐỎ nhiều tầng; khung Douyin sạch làm fallback; STRICT / PREVIEW. Chi tiết: `CHANGELOG_V2.md`,
+> `BENCHMARK_BEFORE_AFTER.md`, `DEPENDENCY_AUDIT.md`.
 
 Đưa vào **video Douyin đã edit** + **1, 2, 3 hoặc nhiều video gốc** → nhấn **TỰ ĐỘNG PHÂN TÍCH & CẮT GHÉP** →
 phần mềm tự tìm từng khung hình của bản edit trong các video gốc, lập bảng cắt, kiểm định rồi xuất video
@@ -53,6 +57,24 @@ Phần mềm tự chạy 11 bước, hiển thị tiến độ từng bước:
 tool **không đoán nguồn, không chèn màn trắng**: các đoạn được đưa vào `KIEM_TRA_THU_CONG.csv`.
 Muốn xem thử vẫn có thể tick **"Cho phép xuất BẢN NHÁP"** → file `THANH_PHAM_2K_CHUA_XAC_MINH.mp4`
 (đoạn ĐỎ bị bỏ, không lấp bằng hình giả).
+
+### V2: giữ đủ dòng thời gian, STRICT và PREVIEW
+
+* **Mỗi khung Douyin có đúng một khung xuất** — không còn bỏ đoạn ĐỎ làm video ngắn lại. Mỗi khung mang nguồn gốc:
+  `SOURCE_RAW` (anime gốc) · `SOURCE_INTERPOLATED` (ảnh trộn 2 khung gốc, do Douyin nội suy) ·
+  `DOUYIN_CLEAN_FALLBACK` (khung Douyin đã kiểm SẠCH: không chữ/phụ đề/logo/watermark) · `UNVERIFIED`.
+* **STRICT VERIFIED (mặc định):** chỉ xuất `THANH_PHAM_2K.mp4` khi MỌI khung đã xác minh. Còn khung chưa xác minh →
+  không xuất, chỉ tạo bảng + báo cáo; duyệt ở tab **C. DUYỆT CẢNH VÀNG/ĐỎ** rồi bấm *Lưu bảng & CẮT THEO BẢNG ĐÃ DUYỆT*.
+* **PREVIEW FULL TIMELINE:** xuất đủ khung, đủ thời lượng; khung chưa xác minh lấy từ bản Douyin; tên file
+  `*_CHUA_XAC_MINH.mp4`. Không phải thành phẩm hoàn chỉnh.
+* **Âm thanh:** khung Douyin/đứng hình không có tiếng Nhật tương ứng → để im lặng và ghi `AUDIO_UNRESOLVED`
+  trong `QA_RESULT.json` (tool không bịa vị trí tiếng).
+* Tab C: chọn cảnh → xem ảnh Douyin cạnh ảnh nguồn → *Chấp nhận nguồn (OK)* / *Sửa nguồn/khung rồi chấp nhận* /
+  *Duyệt dùng khung Douyin sạch* (bạn xác nhận đã xem kỹ không có chữ/logo).
+* Tùy chọn: *Adaptive Per-Frame Speed Matching*, *Deep Rescue*, *Clean Douyin Fallback*, *Dùng GPU*,
+  cấu hình **MAX ACCURACY** (mặc định) / **FAST** (bớt khung truy vấn, tắt DTW và tinh chỉnh crop độ phân giải cao;
+  ngưỡng kiểm định giữ nguyên).
+* Lần cài đầu `CAI_DAT.bat` tải thêm mô hình nhận dạng chữ CRNN (73 MB, kiểm SHA-256) để kiểm tra khung sạch.
 
 ### Mới trong v1.1.0
 
@@ -149,7 +171,22 @@ chép `afm_config.example.json` thành `afm_config.json` rồi sửa.
 
 ---
 
-## 8. Giới hạn đã biết (nói thẳng)
+## 8. Rollback về bản cũ
+
+Bản v1.1.0 được giữ ở git tag `afm-v1.1.0-backup`. Quay lại: `git checkout afm-v1.1.0-backup -- auto_frame_match`
+(hoặc tải ZIP của tag đó trên GitHub). Cache fingerprint dùng chung được (cùng `FINGERPRINT_VERSION`).
+
+## 9. Giới hạn đã biết (nói thẳng)
+
+* **V2 chưa chạy trên GPU thật và chưa chạy trên video Douyin/anime thật** — chỉ kiểm thử bằng video tổng hợp có
+  đáp án (xem `BENCHMARK_BEFORE_AFTER.md`). Hãy chạy `KIEM_THU.bat` và một cặp video thật trước khi tin tưởng.
+* DINOv2/DINOv3, LightGlue, TransNetV2, RIFE, RAFT: **chưa tích hợp** (lý do trong `DEPENDENCY_AUDIT.md`).
+* Bản edit VFR: thành phẩm CFR theo FPS trung bình, đủ số khung và tổng thời lượng; từng khung có thể lệch PTS
+  tối đa ~1 khung (QA ghi rõ số ms).
+* Logo thuần hình (không có chữ) chỉ xuất hiện trong 1 cảnh có thể không bị phát hiện → khung đó có thể bị coi
+  SẠCH. Vì vậy hãy xem lại `CLEAN_FALLBACK_REPORT.csv` trước khi dùng thành phẩm có fallback.
+* Vùng hiển thị tĩnh (nền không đổi), cảnh lia nền không nhân vật, nội dung trùng giữa 2 nguồn: thời điểm/tốc độ
+  không quan sát được bằng hình → VÀNG, cần duyệt.
 
 * Cảnh **hoàn toàn tĩnh** hoặc **lia máy nền không nhân vật** có thể khớp như nhau ở nhiều offset → VÀNG,
   trừ khi tính liên tục với cảnh kề xác định được (khi đó ghi chú `LIÊN TỤC`).

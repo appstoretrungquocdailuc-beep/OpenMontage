@@ -6,3 +6,4 @@ bin/
 gui_settings.json
 __pycache__/
 *.pyc
+models/text_recognition_*.onnx

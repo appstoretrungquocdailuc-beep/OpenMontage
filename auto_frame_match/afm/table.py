@@ -18,16 +18,18 @@ from .matcher import GREEN, RED, YELLOW, Segment
 STATUS_LABEL = {GREEN: "XANH - đã kiểm định", YELLOW: "VÀNG - nghi vấn", RED: "ĐỎ - không khớp/UNMATCHED"}
 # Trạng thái người dùng có thể ghi vào cột manual_action khi kiểm tra thủ công
 MANUAL_OK, MANUAL_SKIP = "OK", "BO_QUA"
+MANUAL_FALLBACK = "DUYET_FALLBACK"  # V2: duyệt dùng khung Douyin (đã xem là sạch) cho đoạn không có nguồn
 
 SEG_FIELDS = [
-    "segment_id", "status", "method", "manual_action", "edit_frame_start", "edit_frame_end", "edit_pts_start",
+    "segment_id", "status", "method", "clean_check", "manual_action", "edit_frame_start", "edit_frame_end", "edit_pts_start",
     "edit_time_start", "edit_time_end", "duration", "source_id", "source_frame_start", "source_frame_end",
     "source_pts_start", "source_time_start", "source_time_end", "source_frame_exact", "speed", "flip", "crop_x", "crop_y",
     "crop_w", "crop_h", "score", "ok_ratio", "audio_offset_ms", "candidates", "reasons",
     "geom_sx", "geom_sy", "geom_tx", "geom_ty",
 ]
 FRAME_FIELDS = [
-    "edit_frame", "edit_pts", "edit_time", "segment_id", "status", "method", "source_id", "source_frame",
+    "edit_frame", "edit_pts", "edit_time", "segment_id", "status", "method", "origin", "verified", "clean_check",
+    "source_id", "source_frame",
     "source_pts", "source_time", "similarity", "flip", "crop", "speed",
 ]
 
@@ -138,7 +140,8 @@ def write_csv(path: Path, rows: list[dict], fields: list[str]):
             w.writerow(r)
 
 
-def write_outputs(out_dir: Path, seg_rows, frame_rows, manifest: dict, edit_meta: dict, analysis_meta: dict):
+def write_outputs(out_dir: Path, seg_rows, frame_rows, manifest: dict, edit_meta: dict, analysis_meta: dict,
+                  timeline: dict | None = None):
     out_dir.mkdir(parents=True, exist_ok=True)
     write_csv(out_dir / "BANG_CAT_AUTO.csv", seg_rows, SEG_FIELDS)
     write_csv(out_dir / "BANG_CAT_TUNG_FRAME.csv", frame_rows, FRAME_FIELDS)
@@ -148,7 +151,7 @@ def write_outputs(out_dir: Path, seg_rows, frame_rows, manifest: dict, edit_meta
     doc = {
         "tool_version": TOOL_VERSION, "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         "edit": edit_meta, "analysis": analysis_meta,
-        "summary": summarize(seg_rows, frame_rows),
+        "summary": summarize(seg_rows, frame_rows, timeline),
         "sources": {k: {kk: v[kk] for kk in ("source_id", "path", "render_path", "content_hash", "fps",
                                                "fps_fraction", "time_base", "start_time", "audio_offset_ms")}
                     for k, v in manifest["sources"].items()},
@@ -158,7 +161,7 @@ def write_outputs(out_dir: Path, seg_rows, frame_rows, manifest: dict, edit_meta
     return doc
 
 
-def summarize(seg_rows, frame_rows) -> dict:
+def summarize(seg_rows, frame_rows, timeline: dict | None = None) -> dict:
     cnt = {GREEN: 0, YELLOW: 0, RED: 0}
     for r in frame_rows:
         cnt[r["status"]] = cnt.get(r["status"], 0) + 1
@@ -170,7 +173,10 @@ def summarize(seg_rows, frame_rows) -> dict:
             "frames_red": cnt[RED], "segments_total": len(seg_rows), "segments_green": segc[GREEN],
             "segments_yellow": segc[YELLOW], "segments_red": segc[RED],
             "verified_ratio": round(cnt[GREEN] / n, 4),
-            "fully_verified": cnt[YELLOW] == 0 and cnt[RED] == 0 and len(frame_rows) > 0}
+            # V2: "đã xác minh" = mọi khung có nguồn gốc đã kiểm định (anime gốc XANH hoặc Douyin sạch đã duyệt)
+            "fully_verified": bool(timeline["all_verified"]) if timeline else
+            (cnt[YELLOW] == 0 and cnt[RED] == 0 and len(frame_rows) > 0),
+            "timeline": timeline or {}}
 
 
 # ---------------------------------------------------------------- đọc bảng (Chế độ B)
@@ -258,3 +264,89 @@ def read_table(path: str | Path) -> dict:
             seg["duration"] = seg["edit_time_end"] - seg["edit_time_start"]
         segs.append(seg)
     return {"segments": segs, "meta": meta}
+
+
+# ---------------------------------------------------------------- V2: dòng thời gian & báo cáo
+
+TIMELINE_FIELDS = [
+    "edit_frame", "edit_pts", "edit_duration", "source_id", "source_frame", "source_pts", "speed", "crop", "flip",
+    "confidence", "status", "method", "origin", "clean_check", "notes",
+]
+
+
+def write_v2_reports(out_dir: Path, recs: list[dict], segs, edit_fp, edit_info, src_fps: dict, manifest: dict,
+                     clean_by_seg: dict) -> None:
+    """FRAME_TIMELINE_EXACT.csv, SPEED_RAMP_REPORT.csv, CLEAN_FALLBACK_REPORT.csv, UNMATCHED_RESCUE_REPORT.csv."""
+    e_tb = edit_info.time_base
+    last = float(edit_fp.pts[-1]) + 1.0 / edit_fp.fps
+    rows = []
+    for r in recs:
+        i = r["edit_frame"]
+        sg = segs[r["segment_id"] - 1]
+        te = float(edit_fp.pts[i])
+        te1 = float(edit_fp.pts[i + 1]) if i + 1 < edit_fp.n else last
+        row = {"edit_frame": i, "edit_pts": to_pts(te, e_tb), "edit_duration": round(te1 - te, 6),
+               "status": r["status"], "method": r.get("method", ""), "origin": r["origin"],
+               "clean_check": r.get("clean_check", ""), "speed": round(r["speed"], 4) if "speed" in r else ""}
+        if r["source_id"]:
+            sid, f = r["source_id"], r["source_frame"]
+            crop = sg.geom.source_crop() or (0, 0, 1, 1)
+            m = manifest["sources"][sid]
+            k = i - sg.start
+            v = sg.sims[k] if sg.sims is not None else float("nan")
+            row.update({"source_id": sid, "source_frame": f,
+                        "source_pts": to_pts(float(src_fps[sid].pts[f]), m["time_base"]),
+                        "crop": f"{crop[0] * m['width']:.1f},{crop[1] * m['height']:.1f},"
+                                f"{crop[2] * m['width']:.1f},{crop[3] * m['height']:.1f}",
+                        "flip": int(sg.geom.flip), "confidence": round(float(v), 4) if np.isfinite(v) else "",
+                        "notes": (f"trộn với khung {r['pair']}" if r["pair"] >= 0 else "")})
+        else:
+            row.update({"source_id": "", "source_frame": "", "source_pts": "", "crop": "", "flip": "",
+                        "confidence": "", "notes": "lấy khung Douyin" if r["origin"] == "DOUYIN_CLEAN_FALLBACK"
+                        else "chưa xác minh - cần duyệt"})
+        rows.append(row)
+    write_csv(out_dir / "FRAME_TIMELINE_EXACT.csv", rows, TIMELINE_FIELDS)
+
+    # tốc độ: mỗi đoạn có tốc độ thay đổi -> các khúc tốc độ không đổi
+    sp_rows = []
+    for k, sg in enumerate(segs, 1):
+        if sg.sid is None:
+            continue
+        sp = sg.local_speed if sg.local_speed is not None else np.full(sg.n, sg.speed)
+        a = 0
+        for j in range(1, sg.n + 1):
+            if j == sg.n or abs(sp[j] - sp[a]) > 1e-6:
+                sp_rows.append({"segment_id": k, "edit_frame_start": sg.start + a, "edit_frame_end": sg.start + j - 1,
+                                "source_id": sg.sid, "source_frame_start": int(sg.frames[a]),
+                                "source_frame_end": int(sg.frames[j - 1]), "speed": round(float(sp[a]), 4),
+                                "kind": "dong_hinh" if sp[a] == 0 else ("ramp" if sg.local_speed is not None
+                                                                        else "tuyen_tinh"),
+                                "status": sg.status})
+                a = j
+    write_csv(out_dir / "SPEED_RAMP_REPORT.csv", sp_rows,
+              ["segment_id", "edit_frame_start", "edit_frame_end", "source_id", "source_frame_start",
+               "source_frame_end", "speed", "kind", "status"])
+
+    cf_rows = []
+    for (k, part), cc in sorted(clean_by_seg.items()):
+        sg = segs[k - 1]
+        cf_rows.append({"segment_id": k, "phan": "ca_doan" if part == "seg" else "khung_do_trong_doan",
+                        "edit_frame_start": sg.start, "edit_frame_end": sg.end - 1, "verdict": cc.verdict,
+                        "used_as_fallback": int(any(r["origin"] == "DOUYIN_CLEAN_FALLBACK"
+                                                    for r in recs if r["segment_id"] == k)),
+                        "reasons": " | ".join(cc.reasons), "scores": json.dumps(cc.scores, ensure_ascii=False)})
+    write_csv(out_dir / "CLEAN_FALLBACK_REPORT.csv", cf_rows,
+              ["segment_id", "phan", "edit_frame_start", "edit_frame_end", "verdict", "used_as_fallback",
+               "reasons", "scores"])
+
+    un_rows = []
+    for k, sg in enumerate(segs, 1):
+        tiers = [n for n in sg.notes if n.startswith(("UNMATCHED", "SIFT", "TẦNG", "LIÊN TỤC", "DP"))]
+        if sg.sid is None or any(n.startswith(("UNMATCHED", "SIFT", "TẦNG")) for n in sg.notes):
+            un_rows.append({"segment_id": k, "edit_frame_start": sg.start, "edit_frame_end": sg.end - 1,
+                            "final_status": sg.status, "final_source": sg.sid or "UNMATCHED",
+                            "method": sg.method if sg.sid else "", "tiers": " | ".join(tiers),
+                            "classification": getattr(sg, "red_class", "")})
+    write_csv(out_dir / "UNMATCHED_RESCUE_REPORT.csv", un_rows,
+              ["segment_id", "edit_frame_start", "edit_frame_end", "final_status", "final_source", "method",
+               "tiers", "classification"])

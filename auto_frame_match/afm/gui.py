@@ -178,15 +178,41 @@ class App(tk.Tk):
                                font=("Segoe UI", 13, "bold"), height=2, command=self.start_b)
         self.btn_b.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         fb.columnconfigure(1, weight=1)
+        # --- C. duyệt cảnh VÀNG/ĐỎ (V2)
+        from .gui_review import ReviewTab
+
+        self.review = ReviewTab(nb, on_cut=self._cut_reviewed)
+        nb.add(self.review, text="  C. DUYỆT CẢNH VÀNG/ĐỎ  ")
         # --- tùy chọn chung
         opt = ttk.LabelFrame(self, text="Tùy chọn xuất", padding=6)
         opt.pack(fill="x", **pad)
+        # V2: chế độ xuất (thay cho ô "bản nháp" cũ - biến self.draft giữ nguyên ý nghĩa = PREVIEW)
         self.draft = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opt, text="Cho phép xuất BẢN NHÁP khi chưa xác minh 100% (file *_CHUA_XAC_MINH)",
-                        variable=self.draft).grid(row=0, column=0, columnspan=4, sticky="w")
+        ttk.Label(opt, text="Chế độ xuất:").grid(row=0, column=0, sticky="e")
+        self.export = ttk.Combobox(opt, state="readonly", width=46, values=[
+            "STRICT VERIFIED - chỉ xuất khi MỌI khung đã xác minh (mặc định)",
+            "PREVIEW FULL TIMELINE - xem thử đủ thời lượng (*_CHUA_XAC_MINH)"])
+        self.export.current(0)
+        self.export.grid(row=0, column=1, sticky="w", padx=4)
+        self.export.bind("<<ComboboxSelected>>", lambda e: self.draft.set(self.export.current() == 1))
+        ttk.Label(opt, text="Cấu hình:").grid(row=0, column=2, sticky="e")
+        self.profile = ttk.Combobox(opt, state="readonly", width=30,
+                                    values=["MAX ACCURACY (mặc định)", "FAST (nhanh hơn, ít tầng cứu hộ)"])
+        self.profile.current(0)
+        self.profile.grid(row=0, column=3, sticky="w", padx=4)
+        flags = ttk.Frame(opt)
+        flags.grid(row=3, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        self.speed_pf = tk.BooleanVar(value=True)
+        self.rescue = tk.BooleanVar(value=True)
+        self.clean_fb = tk.BooleanVar(value=True)
+        self.gpu = tk.BooleanVar(value=True)
         self.interp = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opt, text="Nội suy đoạn ĐỎ từ đoạn kề (giữ đủ thời lượng, đánh dấu VÀNG 'NỘI SUY')",
-                        variable=self.interp).grid(row=0, column=4, columnspan=4, sticky="w")
+        for txt, var in (("Adaptive Per-Frame Speed Matching (ramp/đứng hình/0.2x-6x)", self.speed_pf),
+                         ("Deep Rescue cho cảnh ĐỎ (SIFT/RANSAC + DP)", self.rescue),
+                         ("Clean Douyin Fallback (chỉ khung đã kiểm sạch)", self.clean_fb),
+                         ("Dùng GPU (giải mã CUDA / NVENC)", self.gpu),
+                         ("[Cũ] Nội suy đoạn ĐỎ từ đoạn kề", self.interp)):
+            ttk.Checkbutton(flags, text=txt, variable=var).pack(side="left", padx=(0, 10))
         ttk.Label(opt, text="Khung hình:").grid(row=1, column=0, sticky="e")
         self.crop = ttk.Combobox(opt, state="readonly", width=34,
                                  values=["Giống bản Douyin (crop/zoom/lật)", "Toàn khung nguồn (chỉ lật)"])
@@ -208,6 +234,8 @@ class App(tk.Tk):
         self.banner = tk.Label(prog, text="Sẵn sàng", font=("Segoe UI", 12, "bold"), bg="#e9ecef", anchor="w",
                                padx=10, pady=6)
         self.banner.pack(fill="x")
+        self.stats = ttk.Label(prog, text="", font=("Consolas", 9), justify="left")
+        self.stats.pack(fill="x")
         self.step_lbl = ttk.Label(prog, text="")
         self.step_lbl.pack(fill="x", pady=(4, 0))
         self.pb_step = ttk.Progressbar(prog, maximum=1000)
@@ -266,9 +294,22 @@ class App(tk.Tk):
     def _cfg(self):
         cfg = load_config()
         cfg.render.allow_unverified = bool(self.draft.get())
+        cfg.render.export_mode = "preview" if self.export.current() == 1 else "strict"
         cfg.analysis.interpolate_unmatched = bool(self.interp.get())
+        cfg.analysis.per_frame_speed = bool(self.speed_pf.get())
+        cfg.analysis.sift_enable = bool(self.rescue.get())
+        cfg.analysis.dp_enable = bool(self.rescue.get())
+        cfg.analysis.clean_fallback = bool(self.clean_fb.get())
+        cfg.analysis.use_gpu_decode = bool(self.gpu.get())
+        if self.profile.current() == 1:  # FAST: bớt khung truy vấn & tầng nặng, giữ nguyên ngưỡng kiểm định
+            cfg.analysis.query_per_scene = 12
+            cfg.analysis.topk = 8
+            cfg.analysis.hires_refine = False
+            cfg.analysis.per_frame_speed = False
         cfg.render.crop_mode = "match_edit" if self.crop.current() == 0 else "full_source"
         cfg.render.codec = ["auto", "h264_nvenc", "libx264"][self.codec.current()]
+        if not self.gpu.get():
+            cfg.render.codec = "libx264"
         cfg.render.nvenc_cq = cfg.render.x264_crf = int(self.cq.get())
         return cfg
 
@@ -280,6 +321,7 @@ class App(tk.Tk):
         self.out_a.set(d.get("out_a", ""))
         self.out_b.set(d.get("out_b", ""))
         self.draft.set(bool(d.get("draft", False)))
+        self.export.current(1 if self.draft.get() else 0)  # ô chọn luôn khớp thiết lập thực tế
 
     def _save_settings(self):
         try:
@@ -418,16 +460,61 @@ class App(tk.Tk):
         else:
             pct = 100 * summ.get("verified_ratio", 0) if summ else 0
             reason = []
-            if summ:
+            tl = res.get("timeline") or summ.get("timeline") or {}
+            if tl:
+                n = tl.get("frames_total", 0)
+                reason.append(f"{tl.get('verified', 0)}/{n} khung đã kiểm chứng "
+                              f"({100.0 * tl.get('verified', 0) / max(1, n):.1f}%), {n - tl.get('verified', 0)} chưa")
+            elif summ:
                 reason.append(f"{summ.get('frames_green', 0)}/{summ.get('frames_total', 0)} khung XANH "
                               f"({pct:.1f}%), {summ.get('frames_yellow', 0)} VÀNG, {summ.get('frames_red', 0)} ĐỎ")
             if qa:
                 reason.append(f"QA thành phẩm: {LABEL.get(qa['status'])}")
             if not res.get("render"):
-                reason.append("CHƯA xuất video (cần kiểm tra thủ công hoặc bật bản nháp)")
+                reason.append("STRICT: CHƯA xuất video - duyệt ở tab C hoặc chọn PREVIEW")
             st = RED if (summ and summ.get("frames_red")) or (qa and qa["status"] == RED) else YELLOW
             self._set_banner("CHƯA XÁC MINH 100% — " + "; ".join(reason), st)
+        self._show_stats(res)
+        if res.get("out_dir") and (Path(res["out_dir"]) / "BANG_CAT_AUTO.json").exists():
+            try:
+                self.review.open(str(Path(res["out_dir"]) / "BANG_CAT_AUTO.json"))
+            except Exception:
+                pass
         self._log(f"Hoàn tất sau {secs:.0f}s. Báo cáo: {res.get('report')}")
+
+    def _show_stats(self, res):
+        tl = res.get("timeline") or (res.get("summary") or {}).get("timeline") or {}
+        summ = res.get("summary") or {}
+        qa = res.get("qa") or {}
+        if not tl:
+            self.stats.configure(text="")
+            return
+        n = tl.get("frames_total", 0)
+        exp = qa.get("expected_duration")
+        dur = qa.get("duration")
+        lines = [
+            f"Tổng khung edit: {n} | Gốc đã xác minh: {tl.get('source_verified', 0)} (nội suy: "
+            f"{tl.get('interp_verified', 0)}) | Douyin sạch: {tl.get('DOUYIN_CLEAN_FALLBACK', 0)} | "
+            f"Chưa xác minh: {n - tl.get('verified', 0)}",
+            f"Khớp nguồn: XANH {summ.get('frames_green', 0)} · VÀNG {summ.get('frames_yellow', 0)} · "
+            f"ĐỎ {summ.get('frames_red', 0)} | Cảnh cần duyệt: "
+            f"{summ.get('segments_yellow', 0) + summ.get('segments_red', 0)} | Tỉ lệ khung đã kiểm chứng: "
+            f"{100.0 * tl.get('verified', 0) / max(1, n):.1f}%",
+        ]
+        if qa:
+            lines.append(f"Thành phẩm: {qa.get('frames')} khung @ {qa.get('fps')} | thời lượng {dur:.3f}s "
+                         f"(dự kiến {exp:.3f}s, lệch {abs(dur - exp) * 1000:.1f} ms)")
+        self.stats.configure(text="\n".join(lines))
+
+    def _cut_reviewed(self, table_path: str):
+        doc = self.review.doc or {}
+        self.table_var.set(table_path)
+        self.src_b.items = [{"path": v["path"], "render_path": v.get("render_path"),
+                             "audio_offset_ms": v.get("audio_offset_ms", 0.0)}
+                            for k, v in sorted((doc.get("sources") or {}).items())]
+        self.src_b.refresh()
+        self.nb.select(1)
+        self.start_b()
 
 
 def main():

@@ -20,7 +20,7 @@ from .media import grab_frames
 log = get_logger()
 
 GREEN, YELLOW, RED = "XANH", "VANG", "DO"
-AMBIG = ("NHIỀU NGUỒN", "CẢNH TĨNH", "MƠ HỒ THỜI GIAN")
+AMBIG = ("NHIỀU NGUỒN", "CẢNH TĨNH", "MƠ HỒ THỜI GIAN", "MƠ HỒ TỐC ĐỘ")
 
 
 @dataclass
@@ -60,11 +60,32 @@ class Segment:
     frame_status: list = field(default_factory=list)
     options: list = field(default_factory=list)  # ứng viên còn mơ hồ: (sid, Geometry, score)
     method: str = "match"  # match | sift | interp | freeze
+    frame_map: np.ndarray | None = None  # V2: khung nguồn từng khung khi tốc độ thay đổi (DTW)
+    local_speed: np.ndarray | None = None  # V2: tốc độ cục bộ từng khung
+    interp_pair: np.ndarray | None = None  # V2: khung edit là ảnh nội suy giữa frames[k] và interp_pair[k]
     alts: list = field(default_factory=list)  # ứng viên đã căn chỉnh (sid, Geometry, Alignment, rank) cho DP
 
     @property
     def n(self) -> int:
         return self.end - self.start
+
+
+class _WindowSource:
+    """Nguồn chỉ nạp một dải khung ở độ phân giải cao (thay cho thumbnail) - dùng cho xác minh 640px."""
+
+    def __init__(self, fp: Fingerprint, frames: list, j0: int):
+        self.fp, self.j0, self._frames = fp, j0, frames
+        self.n, self.fps, self.pts = fp.n, fp.fps, fp.pts
+        self.size = (frames[0].shape[1], frames[0].shape[0])
+        outer = self
+
+        class _T:
+            def __getitem__(self, j):
+                k = int(j) - outer.j0
+                k = min(max(k, 0), len(outer._frames) - 1)  # ngoài dải: dùng khung biên (điểm thấp tự nhiên)
+                return outer._frames[k]
+
+        self.thumbs = _T()
 
 
 class Matcher:
@@ -78,6 +99,17 @@ class Matcher:
         self.cancel = cancel
         self.index = SourceIndex(sources)
         self.qwins = self._query_windows()
+
+    def plausible(self, g: Geometry | None, sid: str) -> bool:
+        """Hình học hợp lý: co giãn gần ĐỀU theo 2 trục (Douyin chỉ kéo giãn nhẹ). Chặn ánh xạ méo kiểu
+        sx=1.65/sy=0.44 mà bộ tối ưu tự do có thể 'uốn' cho vừa một cảnh lạ."""
+        if g is None:
+            return False
+        ew, eh = self.edit.size
+        fp = self.sources[sid]
+        sw, sh = fp.size
+        r = (abs(g.sx) / max(1e-6, g.sy)) / ((ew / eh) / (sw / sh))
+        return 1 / self.cfg.max_anisotropy <= r <= self.cfg.max_anisotropy
 
     # ------------------------------------------------------------ tầng 2
     def _query_windows(self):
@@ -167,7 +199,7 @@ class Matcher:
 
         def consider(g, s_img):
             nonlocal best_g, best_s
-            if g is None:
+            if g is None or not self.plausible(g, c.sid):
                 return
             try:
                 sc = pair_score(e_img, s_img, g, self.edit.size, fp.size, cfg)
@@ -235,6 +267,9 @@ class Matcher:
     def evaluate(self, s: int, e: int, c: Candidate) -> Candidate:
         fp = self.sources[c.sid]
         c.geom = self._refine_geometry(c)
+        if not self.plausible(c.geom, c.sid):
+            c.align = None
+            return c
         try:
             c.align, dbg = align_scene(self.edit, fp, s, e, c.geom, c.a, self.cfg)
         except ValueError:
@@ -242,7 +277,7 @@ class Matcher:
             return c
         if c.align is not None and c.align.score > 0.5:
             g2 = self._polish_geometry(s, c)
-            if g2 is not None and not g2.close_to(c.geom, 0.004):
+            if g2 is not None and self.plausible(g2, c.sid) and not g2.close_to(c.geom, 0.004):
                 try:
                     al2, _ = align_scene(self.edit, fp, s, e, g2, c.align.a, self.cfg, c.geom.valid_edit_rect(0.004))
                 except ValueError:
@@ -344,6 +379,9 @@ class Matcher:
         seg.sid, seg.geom, seg.a, seg.speed = c.sid, c.geom, al.a, al.speed
         seg.t_ref = float(self.edit.pts[seg.start])
         seg.frames, seg.sims, seg.score = al.frames.copy(), al.sims.copy(), al.score
+        seg.frame_map = None if al.frame_map is None else al.frame_map.copy()
+        seg.local_speed = None if al.local_speed is None else al.local_speed.copy()
+        self._speed_note(seg, al)
         seg.ambiguous_frames = al.ambiguous_frames
 
     def _split_retry(self, seg: Segment, best: Candidate, depth: int, force_half: bool = False):
@@ -483,17 +521,28 @@ class Matcher:
         self.consensus_geometry(segs)
         with ThreadPoolExecutor(max_workers=workers) as ex:
             list(ex.map(self.ambiguity_test, segs))
+        for sg in segs:
+            self.static_view_test(sg)
         self.resolve_continuity(segs)
         segs = self.merge_continuous(segs)
         if self.cfg.sift_enable and any(x.sid is None for x in segs):
             self.progress(0.94, "tầng 2: SIFT cho đoạn ĐỎ")
             self.sift_tier(segs)
             segs = self.merge_continuous(segs)
+        if self.cfg.hires_zoom_verify:
+            self.progress(0.945, "xác minh đoạn phóng to ở 640px")
+            for sg in segs:
+                self.hires_align(sg)
+            for sg in segs:
+                self.static_view_test(sg)
+            segs = self.merge_continuous(segs)
         if self.cfg.hires_refine:
             self.progress(0.95, "tinh chỉnh crop ở độ phân giải cao")
             for sg in segs:
                 if sg.sid is not None:
                     self.hires_geometry(sg)
+        if self.cfg.detect_interpolated_frames:
+            self.detect_interpolated(segs)
         if self.cfg.interpolate_unmatched:
             self.interpolate(segs)
         self.progress(1.0, "xong")
@@ -576,6 +625,8 @@ class Matcher:
             sg.sid, sg.geom, sg.a, sg.speed = sid, geom, al.a, al.speed
             sg.t_ref = float(self.edit.pts[sg.start])
             sg.frames, sg.sims, sg.score = al.frames.copy(), al.sims.copy(), al.score
+            sg.frame_map = None if al.frame_map is None else al.frame_map.copy()
+            sg.local_speed = None if al.local_speed is None else al.local_speed.copy()
             sg.ambiguous_frames = al.ambiguous_frames
             if linked:  # liền mạch với đoạn kề -> tính liên tục xác nhận, gỡ cờ mơ hồ
                 sg.notes = [r for r in sg.notes if not r.startswith(AMBIG)]
@@ -599,10 +650,18 @@ class Matcher:
         cfg = self.cfg
         sdata = {}
         for k, sg in enumerate(segs):
-            if sg.sid is not None or sg.n < cfg.min_evidence_frames:
+            if sg.sid is not None:
+                continue
+            if sg.n < cfg.min_evidence_frames:
+                sg.red_class = self.classify_red(segs, k)
+                sg.notes.append(f"TẦNG 7: phân loại = {sg.red_class}")
+                self._finish(sg)
                 continue
             if self.cancel is not None and self.cancel.is_set():
                 raise InterruptedError("Đã hủy")
+            # Tầng 2: tìm lại bằng chỉ mục với Top-K lớn hơn và nhiều khung truy vấn hơn
+            if self.deep_retry(sg):
+                continue
             prev, nxt = self._neighbor(segs, k, -1), self._neighbor(segs, k, 1)
             src_list = []
             for sid, fp in self.sources.items():
@@ -627,8 +686,17 @@ class Matcher:
             qs = (0.1, 0.3, 0.5, 0.7, 0.9) if n >= 15 else (0.15, 0.5, 0.85)
             times = sorted({float(self.edit.pts[sg.start + int(q * (n - 1))]) for q in qs})
             res = match_segment(self.edit_path, times, src_list, cfg, cfg.sift_mask_bottom)
+            windowed = any(lo > 0 or hi < len(sdata[sid]["frame"]) for sid, _, _, (lo, hi) in src_list)
+            if res is None and windowed:
+                # Tầng 6: cửa sổ quanh đoạn kề thất bại -> tìm trên TOÀN BỘ các video nguồn
+                full = [(sid, sd, fps_, (0, len(sd["frame"]))) for sid, sd, fps_, _ in src_list]
+                res = match_segment(self.edit_path, times, full, cfg, cfg.sift_mask_bottom)
+                if res is not None:
+                    sg.notes.append("TẦNG 6: SIFT toàn bộ nguồn (cửa sổ ±5s quanh đoạn kề không có)")
             if res is None:
-                sg.notes.append("SIFT: không tìm được nguồn đủ tin cậy")
+                sg.notes.append("SIFT: không tìm được nguồn đủ tin cậy (cửa sổ + toàn bộ nguồn)")
+                sg.red_class = self.classify_red(segs, k)
+                sg.notes.append(f"TẦNG 7: phân loại = {sg.red_class}")
                 self._finish(sg)
                 continue
             fp = self.sources[res["sid"]]
@@ -661,6 +729,216 @@ class Matcher:
             sg.score = float(np.median(fin)) if len(fin) else -1.0
             sg.notes = notes + [info + " - ảnh thu nhỏ không xác minh được, cần xem lại"]
             self._finish(sg)
+
+    # ------------------------------------------------------------ V2: khung nội suy của Douyin
+    def detect_interpolated(self, segs: list[Segment]):
+        """Khung edit không khớp 1 khung nguồn nhưng khớp ảnh TRỘN 2 khung liền nhau -> khung nội suy
+        (slow-motion của Douyin). Ghi lại cặp khung để dựng lại bằng phép trộn tương ứng."""
+        cfg = self.cfg
+        for sg in segs:
+            if sg.sid is None or sg.method != "match" or sg.sims is None:
+                continue
+            fp = self.sources[sg.sid]
+            weak = [k for k in range(sg.n) if np.isfinite(sg.sims[k]) and sg.sims[k] < cfg.frame_ok]
+            if not weak:
+                continue
+            try:
+                canvas = Canvas(sg.geom, self.edit.size, fp.size, cfg)
+            except ValueError:
+                continue
+            found = 0
+            for k in weak:
+                f = int(sg.frames[k])
+                E, Es = canvas.blocks([self.edit.thumbs[sg.start + k]], "edit")
+                best = (sg.sims[k], -1)
+                for f2 in (f - 1, f + 1):
+                    if not 0 <= f2 < fp.n:
+                        continue
+                    mix = (fp.thumbs[f].astype(np.float32) + fp.thumbs[f2].astype(np.float32)) / 2
+                    S, Ss = canvas.blocks([mix], "source")
+                    v = float(pair_block_sims(E, Es, S, Ss, cfg)[1][0])
+                    if np.isfinite(v) and v > best[0] + 0.03:
+                        best = (v, f2)
+                if best[1] >= 0 and best[0] >= cfg.frame_ok:
+                    if sg.interp_pair is None:
+                        sg.interp_pair = np.full(sg.n, -1, np.int64)
+                    sg.interp_pair[k] = best[1]
+                    sg.sims[k] = best[0]
+                    found += 1
+            if found:
+                sg.notes.append(f"NỘI SUY KHUNG: {found} khung là ảnh trộn của 2 khung nguồn liền nhau "
+                                "(dựng lại bằng phép trộn tương ứng)")
+                fin = sg.sims[np.isfinite(sg.sims)]
+                sg.score = float(np.median(fin)) if len(fin) else sg.score
+                self._finish(sg)
+
+    def _hires_geometry_search(self, sg: Segment, hi, j0: int, j1: int) -> Geometry | None:
+        """Tìm (khung nguồn, crop) cùng lúc ở 640px: với 3 khung edit, thử template matching trên mọi khung
+        nguồn trong cửa sổ quanh ánh xạ hiện tại; lấy crop của cặp khớp nhất từng khung, rồi trung vị."""
+        r = sg.geom.valid_edit_rect(0.004)
+        if r is None:
+            return None
+        s0 = abs(sg.geom.sx) * r[2]
+        scales = np.arange(s0 * 0.95, s0 * 1.0501, 0.005)
+        found = []
+        for q in (0.2, 0.5, 0.8):
+            k = int(q * (sg.n - 1))
+            f_c = int(sg.frames[k])
+            best = (-1.0, None)
+            for f in range(max(j0, f_c - 15), min(j1, f_c + 16)):
+                g, v = estimate_template(self.edit.thumbs[sg.start + k], hi.thumbs[f], r, sg.geom.flip, scales)
+                if g is not None and v > best[0]:
+                    best = (v, g)
+            if best[1] is not None:
+                found.append(best[1])
+        if not found:
+            return None
+        p = np.median([[g.sx, g.sy, g.tx, g.ty] for g in found], axis=0)
+        return Geometry(*map(float, p))
+
+    def _speed_note(self, seg: Segment, al: Alignment):
+        sa = getattr(al, "speed_alt", None)
+        if sa is not None and sa[1] < self.cfg.speed_ambiguity_margin and \
+                not any(r.startswith("MƠ HỒ TỐC ĐỘ") for r in seg.notes):
+            seg.notes.append(f"MƠ HỒ TỐC ĐỘ: x{al.speed:g} chỉ hơn x{sa[0]:g} {sa[1]:.3f} - hình không đủ phân biệt "
+                             "tốc độ (âm thanh có thể lệch)")
+
+    def static_view_test(self, sg: Segment):
+        """Vùng hiển thị (sau crop) gần như không đổi suốt đoạn -> thời điểm/tốc độ nguồn KHÔNG quan sát được
+        bằng hình -> nghi vấn (trừ khi tính liên tục với cảnh kề xác nhận)."""
+        if sg.sid is None or sg.n < 6 or sg.geom is None or any(r.startswith("CẢNH TĨNH") for r in sg.notes):
+            return
+        r = sg.geom.valid_edit_rect(0.01)
+        if r is None:
+            return
+        ew, eh = self.edit.size
+        x0, y0 = int(r[0] * ew), int(r[1] * eh)
+        x1, y1 = int((r[0] + r[2]) * ew), int((r[1] + r[3]) * eh)
+        first = self.edit.thumbs[sg.start][y0:y1, x0:x1].astype(np.int16)
+        mx = max(float(np.abs(self.edit.thumbs[i][y0:y1, x0:x1].astype(np.int16) - first).mean())
+                 for i in range(sg.start + 1, sg.end))
+        if mx < self.cfg.static_view_max_diff:
+            sg.notes.append(f"CẢNH TĨNH: vùng hiển thị gần như không đổi ({mx:.2f}) - không xác định được "
+                            "thời điểm/tốc độ nguồn bằng hình")
+            self._finish(sg)
+
+    # ------------------------------------------------------------ V2: xác minh đoạn phóng to ở 640px
+    def hires_align(self, sg: Segment):
+        """Đoạn Douyin phóng to >= 2x: ảnh nguồn 160px không đủ chi tiết -> căn chỉnh LẠI bằng khung nguồn
+        640px (giải mã đúng dải cần dùng). Kết quả 640px là quyết định: không khớp -> UNMATCHED."""
+        from .media import decode_range
+
+        cfg = self.cfg
+        if sg.sid is None or sg.method not in ("match", "sift") or abs(sg.geom.sx) >= cfg.hires_zoom_threshold:
+            return
+        fp = self.sources[sg.sid]
+        n = sg.n
+        rel = self.edit.pts[sg.start:sg.end] - self.edit.pts[sg.start]
+        dur = float(rel[-1]) + 1.0 / max(self.edit.fps, 1)
+        a_hint = float(sg.frames[0])
+        j0 = int(max(0, np.floor(a_hint - cfg.window_margin_frames - n * 0.1)))
+        j1 = int(min(fp.n, np.ceil(a_hint + dur * fp.fps * cfg.speed_max + cfg.window_margin_frames)))
+        frames = decode_range(self.source_paths[sg.sid], fp.pts, j0, j1, cfg.hires_width)
+        if len(frames) < (j1 - j0) * 0.98:
+            log.warning("Đoạn %d-%d: giải mã 640px thiếu khung (%d/%d) - giữ kết quả cũ, đánh VÀNG",
+                        sg.start, sg.end, len(frames), j1 - j0)
+            sg.notes.append("XÁC MINH 640px: không giải mã đủ khung")
+            sg.status = YELLOW
+            return
+        hi = _WindowSource(fp, frames, j0)
+        import dataclasses
+
+        # lưới so sánh mịn hơn: lưới 96x54 làm nhòe các dịch chuyển nhỏ của chi tiết khi phóng to
+        fine = dataclasses.replace(cfg, canvas_area=cfg.hires_canvas_area)
+        # crop ước lượng từ ảnh 160px lệch vài pixel ở 640px; khi nền lia, (khung sai + crop lệch) có thể khớp
+        # hơn (khung đúng + crop lệch) -> ước lượng LẠI crop cùng lúc với khung nguồn bằng template matching
+        g_hi = self._hires_geometry_search(sg, hi, j0, j1)
+        geom = g_hi if g_hi is not None and self.plausible(g_hi, sg.sid) else sg.geom
+        try:
+            al, _ = align_scene(self.edit, hi, sg.start, sg.end, geom, a_hint, fine)
+        except ValueError:
+            al = None
+        if al is not None and geom is not sg.geom:
+            sg.geom = geom
+        old = f"{sg.sid}@{int(sg.frames[0])} x{sg.speed:g}"
+        ok = al is not None and al.score >= cfg.scene_match and \
+            np.mean(np.nan_to_num(al.sims, nan=0) >= cfg.frame_ok) >= cfg.match_ok_ratio
+        log.debug("640px %d-%d: geom cũ %s | geom 640 %s | điểm %s | đạt %s", sg.start, sg.end, sg.geom, geom,
+                  None if al is None else round(al.score, 4),
+                  None if al is None else round(float(np.mean(np.nan_to_num(al.sims, nan=0) >= cfg.frame_ok)), 3))
+        if not ok:
+            log.info("Đoạn %d-%d: xác minh 640px THẤT BẠI (%s) -> UNMATCHED", sg.start, sg.end, old)
+            sg.notes.append(f"UNMATCHED: xác minh 640px không khớp (ứng viên {old} ở ảnh thu nhỏ bị loại)")
+            sg.sid, sg.frames, sg.sims, sg.geom, sg.frame_map, sg.local_speed = None, None, None, None, None, None
+            sg.method = "match"
+            self._finish(sg)
+            return
+        sg.a, sg.speed, sg.t_ref = al.a, al.speed, float(self.edit.pts[sg.start])
+        sg.frames, sg.sims, sg.score = al.frames.copy(), al.sims.copy(), al.score
+        sg.frame_map = None if al.frame_map is None else al.frame_map.copy()
+        sg.local_speed = None if al.local_speed is None else al.local_speed.copy()
+        sg.ambiguous_frames = al.ambiguous_frames
+        sg.notes = [r for r in sg.notes if not r.startswith("MƠ HỒ TỐC ĐỘ")]
+        self._speed_note(sg, al)
+        if sg.method == "sift":
+            sg.method = "match"
+        sg.notes.append(f"XÁC MINH 640px (zoom {1 / abs(sg.geom.sx):.1f}x): {sg.sid}@{int(sg.frames[0])} "
+                        f"x{sg.speed:g} (ảnh thu nhỏ: {old})")
+        log.info("Đoạn %d-%d: %s", sg.start, sg.end, sg.notes[-1])
+        self._finish(sg)
+
+    # ------------------------------------------------------------ V2: tầng cứu hộ bổ sung
+    def deep_retry(self, sg: Segment) -> bool:
+        """Tầng 2: chỉ mục với Top-K x3 và gấp đôi số khung truy vấn; chỉ nhận nếu qua kiểm định thường."""
+        import dataclasses
+
+        base = self.cfg
+        self.cfg = dataclasses.replace(base, topk=max(base.topk * 3, 30), query_per_scene=base.query_per_scene * 2)
+        try:
+            cands = self.find_candidates(sg.start, sg.end, max_cand=8)
+            evald = [c for c in (self.evaluate(sg.start, sg.end, c) for c in cands) if c.align is not None]
+        finally:
+            self.cfg = base
+        if not evald:
+            return False
+        evald.sort(key=lambda c: -self._rank(c))
+        trial = Segment(sg.start, sg.end, notes=[n for n in sg.notes if not n.startswith("UNMATCHED")]
+                        + ["TẦNG 2: tìm lại với Top-K lớn hơn"])
+        self._apply(trial, evald[0])
+        self._finish(trial)
+        if trial.sid is None:
+            sg.notes.append("TẦNG 2: Top-K lớn hơn vẫn không có ứng viên đạt kiểm định")
+            return False
+        log.info("Đoạn %d-%d: tầng 2 cứu được (%s@%d)", sg.start, sg.end, trial.sid, int(trial.frames[0]))
+        sg.__dict__.update(trial.__dict__)
+        return True
+
+    def classify_red(self, segs, k: int) -> str:
+        """Tầng 7: đoạn ĐỎ là gì? (để người duyệt biết vì sao không có nguồn)."""
+        sg = segs[k]
+        th = [self.edit.thumbs[i].astype(np.float32) for i in range(sg.start, sg.end)]
+        if sg.n <= 2:
+            return "quá ngắn (1-2 khung)"
+        means = np.array([t.mean() for t in th])
+        stds = np.array([t.std() for t in th])
+        if (stds < 6).all():
+            return "khung trơn / flash (đen, trắng hoặc một màu)"
+        diffs = [float(np.abs(th[i] - th[i - 1]).mean()) for i in range(1, len(th))]
+        prev, nxt = self._neighbor(segs, k, -1), self._neighbor(segs, k, 1)
+        if prev is not None and nxt is not None:  # chuyển cảnh trộn (dissolve) giữa 2 đoạn kề?
+            a = self.edit.thumbs[prev.end - 1].astype(np.float32)
+            b = self.edit.thumbs[nxt.start].astype(np.float32)
+            errs = []
+            for t in th:
+                best = min(float(np.abs(t - (w * a + (1 - w) * b)).mean()) for w in np.linspace(0, 1, 11))
+                errs.append(best)
+            if np.median(errs) < 4.0:
+                return "chuyển cảnh trộn (dissolve) giữa 2 cảnh kề"
+        if np.median(diffs) < 0.8:
+            return "cảnh tĩnh, không tìm thấy trong nguồn"
+        if abs(means[-1] - means[0]) > 40 and np.median(diffs) > 2:
+            return "hiệu ứng sáng/tối dần (fade)"
+        return "cảnh có chuyển động, không tìm thấy trong mọi nguồn (có thể không thuộc anime gốc)"
 
     # ------------------------------------------------------------ P0: nội suy đoạn ĐỎ
     def interpolate(self, segs: list[Segment]):
@@ -714,9 +992,22 @@ class Matcher:
             self._finish(sg)
 
     def _expected_a(self, prev: Segment, cur: Segment) -> float:
-        """Khung nguồn (số thực) mà mô hình tuyến tính của ``prev`` dự đoán tại đầu cảnh ``cur``."""
+        """Khung nguồn (số thực) mà mô hình của ``prev`` dự đoán tại đầu cảnh ``cur`` (hai chiều).
+
+        Đoạn có tốc độ thay đổi (frame_map): ngoại suy từ khung đầu/cuối với tốc độ cục bộ tại đó."""
         fp = self.sources[prev.sid]
+        if prev.frame_map is not None:
+            if prev.start >= cur.end:  # đoạn kề nằm SAU cur
+                return float(prev.frame_map[0] - prev.local_speed[0] * fp.fps
+                             * (self.edit.pts[prev.start] - self.edit.pts[cur.start]))
+            return float(prev.frame_map[-1] + prev.local_speed[-1] * fp.fps
+                         * (self.edit.pts[cur.start] - self.edit.pts[prev.end - 1]))
         return float(prev.a + prev.speed * fp.fps * (self.edit.pts[cur.start] - prev.t_ref))
+
+    def _edge_speed(self, nb: Segment, before: bool) -> float:
+        if nb.frame_map is not None:
+            return float(nb.local_speed[-1] if before else nb.local_speed[0])
+        return nb.speed
 
     def _model_sims(self, sid: str, geom: Geometry, a: float, speed: float, t_ref: float, idx):
         """Khung nguồn + điểm tương đồng của các khung edit ``idx`` theo mô hình tuyến tính đã cho."""
@@ -762,23 +1053,26 @@ class Matcher:
         cfg = self.cfg
         for k in range(len(segs) - 1):
             A, B = segs[k], segs[k + 1]
-            if (A.sid is None and B.sid is None) or A.n == 0 or B.n == 0:
+            if (A.sid is None and B.sid is None) or A.n == 0 or B.n == 0 or \
+                    A.frame_map is not None or B.frame_map is not None:
                 continue
             lo = max(A.start + (1 if A.sid is not None else 0), B.start - radius)
             hi = min(B.end - (1 if B.sid is not None else 0), B.start + radius)
             if hi <= lo:
                 continue
             rng_ = list(range(lo, hi))
+            base = lo  # sa/sb đánh chỉ số theo dải ban đầu (lo có thể bị thu hẹp bên dưới)
 
             def side_sims(sg):
                 if sg.sid is None:
                     return np.full(len(rng_), cfg.frame_min)  # cảnh ĐỎ: chỉ nhận khung không khớp
-                if sg.n < cfg.min_evidence_frames:  # đoạn quá ngắn: không đủ tin cậy -> nhường cảnh kề
-                    return np.full(len(rng_), cfg.frame_ok - 0.05)
                 _, _, v = self._model_sims(sg.sid, sg.geom, sg.a, sg.speed, sg.t_ref, rng_)
+                if sg.n < cfg.min_evidence_frames:  # đoạn quá ngắn: chỉ giữ khung nó tự khớp tốt
+                    v = np.maximum(np.where(np.isfinite(v), v, -1), cfg.frame_ok - 0.05)
                 return np.where(np.isfinite(v), v, cfg.frame_min)
 
             sa, sb = side_sims(A), side_sims(B)
+            log.debug("Ranh giới %d|%d: khung %s sa=%s sb=%s", A.start, B.start, rng_, np.round(sa, 2), np.round(sb, 2))
             best_p, best_v = B.start, -1e9
             # đoạn quá ngắn chỉ được nhường khung, không được lấn sang cảnh kề
             if A.n < cfg.min_evidence_frames and A.sid is not None:
@@ -786,7 +1080,7 @@ class Matcher:
             if B.n < cfg.min_evidence_frames and B.sid is not None:
                 lo = max(lo, B.start)
             for p in range(lo, hi + 1):
-                v = sa[: p - lo].sum() + sb[p - lo:].sum()
+                v = sa[: p - base].sum() + sb[p - base:].sum()
                 if v > best_v + 1e-6 or (abs(v - best_v) <= 1e-6 and p == B.start):
                     best_p, best_v = p, v
             if best_p != B.start:
@@ -803,6 +1097,8 @@ class Matcher:
         sg.sid, sg.geom, sg.a, sg.speed = sid, geom, al.a, al.speed
         sg.t_ref = float(self.edit.pts[sg.start])
         sg.frames, sg.sims, sg.score = al.frames.copy(), al.sims.copy(), al.score
+        sg.frame_map = None if al.frame_map is None else al.frame_map.copy()
+        sg.local_speed = None if al.local_speed is None else al.local_speed.copy()
         sg.ambiguous_frames = al.ambiguous_frames
         sg.method = "match"
         sg.notes.append(note)
@@ -826,7 +1122,7 @@ class Matcher:
             return
         groups.sort(key=lambda g: -g[1])
         for sg in segs:
-            if sg.sid is None or sg.method != "match":
+            if sg.sid is None or sg.method != "match" or sg.frame_map is not None:
                 continue
             for G, _, _ in groups[:2]:
                 if sg.geom.close_to(G, 0.006):
@@ -853,10 +1149,11 @@ class Matcher:
         """
         cfg = self.cfg
         amb = any(r.startswith(AMBIG) for r in sg.notes)
-        if sg.sid is None or sg.n < cfg.min_evidence_frames or (sg.status != GREEN and not amb) or depth > 3:
+        if sg.sid is None or sg.n < cfg.min_evidence_frames or (sg.status != GREEN and not amb) or depth > 3 \
+                or sg.frame_map is not None:
             return
         if shifts is None:  # cảnh đã mơ hồ -> dò rộng hơn
-            shifts = tuple(d for d in range(-16, 17, 2) if d) if amb else (-8, -4, 4, 8)
+            shifts = tuple(d for d in range(-16, 17, 2) if d) if amb else (-8, -4, -2, -1, 1, 2, 4, 8)
         fp = self.sources[sg.sid]
         cur = self._sel_mean(sg, sg.sid, sg.geom, sg.a, sg.speed, sg.t_ref)
         ks = np.unique(np.linspace(0, sg.n - 1, min(4, sg.n)).astype(int))
@@ -881,7 +1178,7 @@ class Matcher:
                     g2, best_v = gg, v
             if amb and best_v >= cur - 0.03:  # chỉ tinh chỉnh kỹ giả thuyết có triển vọng
                 g2, best_v = refine_direct(pairs, g2, self.edit.size, fp.size, cfg, max_evals=120, region=region)
-            if g2.valid_edit_rect(0.004) is None:
+            if g2.valid_edit_rect(0.004) is None or not self.plausible(g2, sg.sid):
                 continue
             alt = self._sel_mean(sg, sg.sid, g2, sg.a + d, sg.speed, sg.t_ref)
             if alt >= cur - 0.003 and (worst is None or alt > worst[0]):
@@ -925,7 +1222,7 @@ class Matcher:
         cfg = self.cfg
         for _pass in range(2):
             for k, sg in enumerate(segs):
-                if sg.sid is None or sg.n == 0:
+                if sg.sid is None or sg.n == 0 or sg.frame_map is not None:
                     continue
                 amb = [r for r in sg.notes if r.startswith(AMBIG)]
                 cur_sel = self._sel_mean(sg, sg.sid, sg.geom, sg.a, sg.speed, sg.t_ref)
@@ -935,16 +1232,19 @@ class Matcher:
                     if nb is None or nb.status != GREEN or nb.sid is None or nb.n < cfg.min_evidence_frames:
                         continue
                     a_exp = self._expected_a(nb, sg)  # mô hình liên tục của cảnh kề (hai chiều)
+                    nb_speed = self._edge_speed(nb, direction < 0)
+                    if nb_speed <= 0:  # đoạn kề đứng hình: không suy ra được vị trí tiếp theo
+                        continue
                     same_model = (nb.sid == sg.sid and nb.geom.close_to(sg.geom, 0.004)
-                                  and abs(nb.speed - sg.speed) < 1e-3 and abs(a_exp - sg.a) < 0.3)
+                                  and abs(nb_speed - sg.speed) < 1e-3 and abs(a_exp - sg.a) < 0.3)
                     if same_model:
                         continue
                     # dò pha dưới-khung quanh dự đoán (làm tròn khung nguồn ở ranh giới cảnh)
                     t0 = float(self.edit.pts[sg.start])
-                    phases = [(self._sel_mean(sg, nb.sid, nb.geom, a_exp + d, nb.speed, t0), a_exp + d)
+                    phases = [(self._sel_mean(sg, nb.sid, nb.geom, a_exp + d, nb_speed, t0), a_exp + d)
                               for d in np.arange(-1.0, 1.001, 0.125)]
                     sel, a_exp = max(phases)
-                    al = self._reeval_at(sg, nb.sid, nb.geom, a_exp, nb.speed)
+                    al = self._reeval_at(sg, nb.sid, nb.geom, a_exp, nb_speed)
                     # Hai giả thuyết chênh nhau trong biên mơ hồ = không phân biệt được bằng hình -> tính liên tục
                     # với cảnh kề đã XANH là bằng chứng quyết định (đúng yêu cầu 'kiểm tra tính liên tục').
                     need = cur_sel - cfg.ambiguity_margin
@@ -988,6 +1288,8 @@ class Matcher:
         return out
 
     def _try_merge(self, p: Segment, sg: Segment) -> bool:
+        if p.frame_map is not None or sg.frame_map is not None:
+            return False
         if (p.sid is None or sg.sid != p.sid or not p.geom.close_to(sg.geom, 0.02)
                 or abs(p.speed - sg.speed) > 0.08 or abs(self._expected_a(p, sg) - sg.frames[0]) > 2.5
                 or p.status == RED or sg.status == RED):

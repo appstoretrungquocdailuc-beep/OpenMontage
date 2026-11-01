@@ -219,23 +219,62 @@ class EditSeg:
     subtitle: str | None = None
     speed: float = 1.0
     foreign_seed: int = 0
+    # --- V2 ---
+    speed_curve: list | None = None  # speed ramp: tốc độ từng khúc bằng nhau trong đoạn
+    freeze: bool = False  # đứng hình: giữ khung src_start suốt đoạn
+    blend: bool = False  # khung nội suy kiểu Douyin (trộn 50/50 hai khung nguồn liền nhau)
+    overlay: str | None = None  # "text" (chữ chèn) | "logo" - dùng để kiểm tra fallback sạch
+    frames: int | None = None  # số khung cố định (cảnh 1-2 khung)
+
+
+def _src_pos(sg: EditSeg, t: float, fs: float) -> float:
+    """Vị trí nguồn (đơn vị khung, số thực) tại thời điểm t trong đoạn."""
+    if sg.freeze:
+        return 0.0
+    if sg.speed_curve:
+        piece = sg.seconds / len(sg.speed_curve)
+        pos, tt = 0.0, t
+        for sp in sg.speed_curve:
+            d = min(tt, piece)
+            pos += d * sp
+            tt -= d
+            if tt <= 1e-9:
+                break
+        return pos * fs
+    return t * sg.speed * fs
+
+
+def _overlay(img, kind):
+    h, w = img.shape[:2]
+    if kind == "text":  # chữ chèn kiểu Douyin (chữ to, viền đen)
+        for k, line in enumerate(("GIAI THICH CANH NAY", "ZIMU 12345")):
+            org = (int(w * 0.08), int(h * (0.18 + 0.12 * k)))
+            cv2.putText(img, line, org, cv2.FONT_HERSHEY_DUPLEX, w / 520, (0, 0, 0), 7, cv2.LINE_AA)
+            cv2.putText(img, line, org, cv2.FONT_HERSHEY_DUPLEX, w / 520, (40, 230, 255), 2, cv2.LINE_AA)
+    elif kind == "logo":  # logo góc phải trên
+        x0, y0 = int(w * 0.78), int(h * 0.04)
+        cv2.rectangle(img, (x0, y0), (x0 + int(w * 0.18), y0 + int(h * 0.11)), (30, 30, 200), -1)
+        cv2.putText(img, "LOGO", (x0 + 8, y0 + int(h * 0.085)), cv2.FONT_HERSHEY_SIMPLEX, w / 700,
+                    (255, 255, 255), 2, cv2.LINE_AA)
 
 
 def build_edit(path: Path, sources: dict[str, CartoonSource], segs: list[EditSeg], fps: float = 30.0,
-               size=(960, 540), layout: str = "fill", watermark: bool = False) -> dict:
+               size=(960, 540), layout: str = "fill", watermark: bool = False, vfr_drop: int = 0) -> dict:
     """layout: fill (lấp đầy khung) | letterbox (khung dọc, nền mờ, nội dung 16:9 ở giữa)."""
     W, H = size
     gt = []
+    tmp = path.with_suffix(".cfr.mp4") if vfr_drop else path
     cmd = ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "bgr24",
            "-s", f"{W}x{H}", "-r", str(fps), "-i", "pipe:0",
            "-f", "lavfi", "-i", "sine=frequency=330:sample_rate=48000",
            "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
-           "-c:a", "aac", "-shortest", str(path)]
+           "-c:a", "aac", "-shortest", str(tmp)]
     p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
     foreign_cache = {}
+    kept_pts = []
     k_global = 0
     for si, sg in enumerate(segs):
-        n = int(round(sg.seconds * fps))
+        n = sg.frames if sg.frames else int(round(sg.seconds * fps))
         for k in range(n):
             t = k / fps
             if sg.sid is None:
@@ -245,11 +284,17 @@ def build_edit(path: Path, sources: dict[str, CartoonSource], segs: list[EditSeg
                 gt_entry = {"edit_frame": k_global, "source_id": None, "source_frame": None, "seg": si}
             else:
                 cs = sources[sg.sid]
-                f = sg.src_start + int(np.floor(t * sg.speed * cs.spec.fps + 1e-6))
+                pos = _src_pos(sg, t, cs.spec.fps)
+                f = sg.src_start + int(np.floor(pos + 1e-6))
                 src_img = cs.frame(f)
                 gt_entry = {"edit_frame": k_global, "source_id": sg.sid, "source_frame": f,
                             "drawing": list(map(str, cs.drawing_id(f))), "seg": si,
                             "flip": sg.flip, "crop": sg.crop, "speed": sg.speed}
+                frac = pos - np.floor(pos + 1e-6)
+                if sg.blend and 0.25 < frac < 0.75:  # khung nội suy: trộn f và f+1
+                    src_img = cv2.addWeighted(src_img, 0.5, cs.frame(f + 1), 0.5, 0)
+                    gt_entry["interp"] = [f, f + 1]
+                    gt_entry["drawing_alt"] = list(map(str, cs.drawing_id(f + 1)))
             img = src_img
             if sg.crop:
                 h, w = img.shape[:2]
@@ -274,14 +319,32 @@ def build_edit(path: Path, sources: dict[str, CartoonSource], segs: list[EditSeg
                 frame = bg
             if sg.subtitle:
                 _subtitle(frame, sg.subtitle)
+            if sg.overlay:
+                _overlay(frame, sg.overlay)
             if watermark:
                 _watermark(frame)
+            if sg.sid is None:
+                gt_entry["overlay"] = sg.overlay
+            if vfr_drop and k_global % vfr_drop == 1:  # VFR: bỏ khung theo chu kỳ -> PTS không đều
+                k_global += 1
+                continue
             p.stdin.write(np.ascontiguousarray(frame).tobytes())
+            kept_pts.append(k_global / fps)
             gt.append(gt_entry)
             k_global += 1
     p.stdin.close()
     p.wait()
     assert p.returncode == 0
-    truth = {"fps": fps, "frames": gt, "segments": [sg.__dict__ for sg in segs]}
+    if vfr_drop:  # gán lại PTS gốc (có khoảng trống) -> file VFR thật
+        n_out = len(gt)
+        expr = "+".join(f"eq(N,{i})*{t:.6f}" for i, t in enumerate(kept_pts)) if n_out < 400 else None
+        assert expr, "VFR kiểm thử chỉ hỗ trợ video ngắn"
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(tmp), "-vf",
+                        f"setpts='({expr})/TB'", "-fps_mode", "passthrough", "-c:v", "libx264", "-crf", "18",
+                        "-preset", "veryfast", "-c:a", "copy", str(path)], check=True)
+        tmp.unlink()
+    for i, g in enumerate(gt):
+        g["edit_frame"] = i  # chỉ số khung sau khi bỏ (VFR)
+    truth = {"fps": fps, "frames": gt, "segments": [sg.__dict__ for sg in segs], "vfr_drop": vfr_drop}
     path.with_suffix(".truth.json").write_text(json.dumps(truth, indent=1))
     return truth

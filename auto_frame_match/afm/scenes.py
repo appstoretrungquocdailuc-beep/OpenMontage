@@ -34,7 +34,7 @@ def _pyscenedetect_cuts(path: str, threshold: float, fp: Fingerprint) -> list[in
         log.warning("Chưa cài PySceneDetect - chỉ dùng bộ dò diff nội bộ")
         return []
     try:
-        scenes = detect(path, ContentDetector(threshold=threshold, min_scene_len=3), show_progress=False)
+        scenes = detect(path, ContentDetector(threshold=threshold, min_scene_len=1), show_progress=False)
     except Exception as e:  # pragma: no cover
         log.warning("PySceneDetect lỗi (%s) - chỉ dùng bộ dò nội bộ", e)
         return []
@@ -47,7 +47,7 @@ def _pyscenedetect_cuts(path: str, threshold: float, fp: Fingerprint) -> list[in
 
 
 def detect_scenes(edit_path: str, fp: Fingerprint, threshold: float = 27.0,
-                  ratio: float = 4.0, min_len: int = 3) -> tuple[list[tuple[int, int]], dict]:
+                  ratio: float = 4.0, min_len: int = 1) -> tuple[list[tuple[int, int]], dict]:
     """Trả về danh sách cảnh [start, end) theo chỉ số khung + thông tin kiểm tra."""
     d = frame_diffs(fp)
     n = fp.n
@@ -69,7 +69,8 @@ def detect_scenes(edit_path: str, fp: Fingerprint, threshold: float = 27.0,
     for i in range(1, n):
         lo, hi = max(1, i - pad), min(n, i + pad + 1)
         local = np.median(d[lo:hi])
-        if d[i] > max(6.0, ratio * max(local, 0.5)) and d[i] >= d[max(1, i - 1):min(n, i + 2)].max():
+        # V2: chỉ so với khung TRƯỚC -> giữ được cảnh dài 1 khung (2 điểm cắt liền nhau)
+        if d[i] > max(6.0, ratio * max(local, 0.5)) and d[i] >= d[max(1, i - 1)]:
             own.add(i)
     for c in sorted(own - refined):
         suspicious.append({"frame": c, "reason": "PySceneDetect bỏ sót - bộ dò nội bộ phát hiện"})

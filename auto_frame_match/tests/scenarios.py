@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+
+import numpy as np
 from pathlib import Path
 
 from synth import CartoonSource, EditSeg, SourceSpec, build_edit
@@ -78,6 +80,31 @@ SCENARIOS = {
               EditSeg("S1", 400, 2.0),
               EditSeg(None, seconds=1.5, foreign_seed=555),
               EditSeg("S1", 520, 2.0, subtitle="Het")]),
+    # ===================== V2 =====================
+    # 8) dải tốc độ rộng: 1x, 0.5x, 0.25x, 2x, 3x, 5x
+    "v2_toc_do": dict(
+        sources=("S1",), fps=30.0, size=(960, 540), layout="fill",
+        segs=[EditSeg("S1", 40, 1.5), EditSeg("S1", 200, 2.0, speed=0.5), EditSeg("S1", 320, 2.0, speed=0.25),
+              EditSeg("S1", 420, 1.5, speed=2.0), EditSeg("S1", 560, 1.2, speed=3.0),
+              EditSeg("S1", 700, 0.8, speed=5.0)]),
+    # 9) speed ramp, đứng hình, khung nội suy, đảo thứ tự, cảnh 1-2 khung
+    "v2_ramp_freeze": dict(
+        sources=("S1",), fps=30.0, size=(960, 540), layout="fill",
+        segs=[EditSeg("S1", 600, 1.5), EditSeg("S1", 100, 3.0, speed_curve=[0.5, 1.0, 2.0, 3.0]),
+              EditSeg("S1", 400, 1.5, freeze=True), EditSeg("S1", 450, 2.0, speed=0.5, blend=True),
+              EditSeg("S1", 760, seconds=0, frames=2), EditSeg("S1", 30, 1.5),
+              EditSeg("S1", 880, seconds=0, frames=1), EditSeg("S1", 250, 1.5)]),
+    # 10) cảnh không có trong nguồn: sạch / có chữ chèn / có logo (giữa các cảnh khớp)
+    "v2_fallback": dict(
+        sources=("S1",), fps=30.0, size=(960, 540), layout="fill",
+        segs=[EditSeg("S1", 60, 1.5), EditSeg(None, seconds=1.0, foreign_seed=901),
+              EditSeg("S1", 300, 1.5), EditSeg(None, seconds=1.0, foreign_seed=902, overlay="text"),
+              EditSeg("S1", 500, 1.5), EditSeg(None, seconds=1.0, foreign_seed=903, overlay="logo"),
+              EditSeg("S1", 700, 1.5)]),
+    # 11) bản edit VFR (PTS không đều)
+    "v2_vfr": dict(
+        sources=("S1", "S2"), fps=60.0, size=(960, 540), layout="fill", vfr_drop=4,
+        segs=[EditSeg("S1", 100, 1.2), EditSeg("S2", 300, 1.5), EditSeg("S1", 600, 1.3)]),
 }
 
 
@@ -90,9 +117,20 @@ def build_scenario(name: str, root: Path, per_scenario_sources: bool = False):
     truth_path = edit.with_suffix(".truth.json")
     if not edit.exists() or not truth_path.exists():
         build_edit(edit, srcs, sc["segs"], fps=sc["fps"], size=sc["size"], layout=sc["layout"],
-                   watermark=sc.get("watermark", False))
+                   watermark=sc.get("watermark", False), vfr_drop=sc.get("vfr_drop", 0))
     truth = json.loads(truth_path.read_text())
     return srcs, paths, edit, truth
+
+
+def _same_crop_view(cs, f1: int, f2: int, crop) -> bool:
+    """Hai khung nguồn có giống hệt nhau TRONG VÙNG CROP hiển thị không (khung tạo lại từ bộ sinh)."""
+    if f1 >= cs.spec.n or f2 >= cs.spec.n:
+        return False
+    a, b = cs.frame(f1), cs.frame(f2)
+    h, w = a.shape[:2]
+    x, y, cw, ch = crop
+    sl = (slice(int(y * h), int((y + ch) * h)), slice(int(x * w), int((x + cw) * w)))
+    return float(np.abs(a[sl].astype(np.int16) - b[sl]).mean()) < 1.0
 
 
 def score_table(per_frame: list[dict], truth: dict, srcs: dict) -> dict:
@@ -109,24 +147,27 @@ def score_table(per_frame: list[dict], truth: dict, srcs: dict) -> dict:
         stats["total"] += 1
         if g["source_id"] is None:
             stats["foreign"] += 1
-            if row.get("source_id") and row.get("status") != "DO":
+            if row.get("source_id") and row.get("status") != "DO" and row.get("method", "match") in ("match", "sift", ""):
                 stats["false_match"] += 1
             continue
         if not row.get("source_id"):
             stats["missed"] += 1
             continue
         sid, f = row["source_id"], int(row["source_frame"])
+        draw_ok = [g["drawing"]] + ([g["drawing_alt"]] if g.get("drawing_alt") else [])
         same_draw = sid in srcs and f < srcs[sid].spec.n and \
-            list(map(str, srcs[sid].drawing_id(f))) == g["drawing"]
+            list(map(str, srcs[sid].drawing_id(f))) in draw_ok
         same_draw = same_draw or (sid != g["source_id"] and sid in srcs and f < srcs[sid].spec.n
-                                  and list(map(str, srcs[sid].drawing_id(f))) == g["drawing"])
-        if sid == g["source_id"] and f == g["source_frame"]:
+                                  and list(map(str, srcs[sid].drawing_id(f))) in draw_ok)
+        if sid == g["source_id"] and (f == g["source_frame"] or f in (g.get("interp") or [])):
             stats["exact"] += 1
             stats["visual"] += 1
         elif same_draw:
             stats["visual"] += 1
             if sid == g["source_id"] and abs(f - g["source_frame"]) == 1:
                 stats["off_by_one"] += 1
+        elif g.get("crop") and sid == g["source_id"] and _same_crop_view(srcs[sid], f, g["source_frame"], g["crop"]):
+            stats["visual"] += 1  # vùng crop hiển thị giống hệt (phần nhìn thấy không đổi giữa 2 khung)
         else:
             stats["wrong"] += 1
             stats.setdefault("wrong_list", []).append((row["edit_frame"], sid, f, g["source_id"], g["source_frame"], row.get("status"), row.get("similarity")))

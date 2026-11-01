@@ -86,10 +86,19 @@ def verify_output(out_path: str, plan, render_info: dict, cfg: AnalysisConfig, e
     exp_dur = plan.duration
     if abs(info.duration - exp_dur) > 1.5 / float(plan.fps):
         issues_global.append(f"Lệch thời lượng: {info.duration:.3f}s so với dự kiến {exp_dur:.3f}s")
-    if edit_fp is not None and all(s.get("render") for s in plan.segments):
+    if edit_fp is not None:
+        if n != edit_fp.n:  # bất biến V2: khung xuất = khung edit
+            issues_global.append(f"SỐ KHUNG KHÁC BẢN DOUYIN: {n} khung xuất vs {edit_fp.n} khung edit")
+        # VFR: khung xuất CFR theo FPS trung bình -> ghi độ lệch PTS từng khung (không giấu)
+        rel = edit_fp.pts - edit_fp.pts[0]
+        dev = np.abs(np.arange(edit_fp.n) / float(plan.fps) - rel)
+        vfr_dev_ms = float(dev.max() * 1000) if len(dev) else 0.0
+        if vfr_dev_ms > 1.0:
+            issues_global.append(f"Bản Douyin là VFR: thành phẩm CFR {plan.fps} fps, đủ {edit_fp.n} khung, "
+                                 f"lệch PTS từng khung tối đa {vfr_dev_ms:.1f} ms (tổng thời lượng giữ nguyên)")
         edit_dur = float(edit_fp.pts[-1] - edit_fp.pts[0]) + 1 / edit_fp.fps
-        if abs(exp_dur - edit_dur) > 1.5 / float(plan.fps):
-            issues_global.append(f"Lệch thời lượng so với bản Douyin: {exp_dur:.3f}s vs {edit_dur:.3f}s")
+        if abs(info.duration - edit_dur) > 1.5 / float(plan.fps):
+            issues_global.append(f"Lệch thời lượng so với bản Douyin: {info.duration:.3f}s vs {edit_dur:.3f}s")
     if not info.audio_streams:
         issues_global.append("Thành phẩm không có âm thanh")
 
@@ -100,14 +109,22 @@ def verify_output(out_path: str, plan, render_info: dict, cfg: AnalysisConfig, e
         if progress:
             progress(si / max(1, len(used)), f"QA đoạn {s['segment_id']}")
         o0, o1 = s["out_start"], min(s["out_end"], n)
-        res = {"segment_id": s["segment_id"], "source_id": s["source_id"], "out_start": o0, "out_end": o1,
-               "issues": [], "status": GREEN}
+        res = {"segment_id": s.get("segment_id"), "run_id": s.get("run_id"), "source_id": s.get("source_id") or "",
+               "origins": s.get("origins", []), "out_start": o0, "out_end": o1, "issues": [], "status": GREEN}
         if o1 <= o0:
             res["issues"].append("Thiếu toàn bộ khung của đoạn")
             res["status"] = RED
             seg_results.append(res)
             continue
-        if s.get("method") in ("interp", "freeze"):
+        if s.get("kind") == "edit":  # khung lấy từ bản Douyin: đúng vị trí, không phải anime gốc
+            if s.get("verified"):
+                res["issues"].append("Khung Douyin đã kiểm tra sạch (fallback) - không phải khung anime gốc")
+            else:
+                res["issues"].append("CHƯA XÁC MINH: khung Douyin dùng để giữ đủ thời lượng (xem thử)")
+                res["status"] = YELLOW
+            seg_results.append(res)
+            continue
+        if s.get("method") in ("interp", "freeze") and "UNVERIFIED" in s.get("origins", []):
             res["issues"].append("NỘI SUY/GIỮ KHUNG - không phải kết quả so khớp, không đối chiếu được")
             res["status"] = YELLOW
             seg_results.append(res)
@@ -127,11 +144,10 @@ def verify_output(out_path: str, plan, render_info: dict, cfg: AnalysisConfig, e
             # chuẩn đối chiếu = hình học DỰ KIẾN từ phân tích (không dùng cờ lật của bản dựng)
             geom = out_to_edit(g, crop_fit, g.flip)
             ref_fp = edit_fp
-            e_lo = edit_fp.frame_at_time(s["edit_t0"] + 1e-4)
-            e_hi = edit_fp.frame_at_time(s["edit_t1"] - 1e-4)
+            e_lo, e_hi = s["edit_f0"], s["edit_f1"] - 1
             # khung edit đang hiển thị tại thời điểm của khung xuất (kẹp trong phạm vi đoạn)
-            ref_idx = np.array([min(max(edit_fp.frame_at_time(float(plan.edit_time(s, k + 0.25))), e_lo), e_hi)
-                                for k in ks])
+            # V2: khung xuất k = khung edit k
+            ref_idx = np.clip(ks, e_lo, e_hi)
         else:
             geom = out_to_source(crop_fit, s["flip"])
             ref_fp = src_fps[s["source_id"]]
@@ -146,7 +162,7 @@ def verify_output(out_path: str, plan, render_info: dict, cfg: AnalysisConfig, e
         sel0, ver0 = _sims(canvas, outs, [ref_fp.thumbs[i] for i in ref_idx], cfg)
         # lệch khung: so với khung tham chiếu lân cận
         # Khi fps xuất khác fps bản Douyin, lượng tử hóa thời gian cho phép lệch tối đa 1 khung tham chiếu.
-        tol = 1 if (ref_mode == "douyin" and abs(float(plan.fps) - edit_fp.fps) > 1e-3) else 0
+        tol = 0  # V2: khung xuất trùng khung edit (cùng FPS) -> không có sai lệch lượng tử hóa
         sel_d, ver_d = {}, {}
         for d in (-2, -1, 1, 2):
             idx = np.clip(ref_idx + d, 0, ref_fp.n - 1)
@@ -217,24 +233,28 @@ def verify_output(out_path: str, plan, render_info: dict, cfg: AnalysisConfig, e
     if info.audio_streams:
         out_a = extract_audio_pcm(out_path, info.audio_streams[0]["index"], info.start_time, info.duration + 1, rate)
     for s, ri in zip(used, render_info.get("segments", [])):
-        if out_a is None or ri.get("audio_start") is None or s.get("method") in ("interp", "freeze"):
-            continue
+        if out_a is None or ri.get("audio_start") is None or s.get("method") in ("interp", "freeze") \
+                or s.get("kind") == "edit" or not s.get("linear", True):
+            continue  # khung Douyin / đứng hình: im lặng (AUDIO_UNRESOLVED); ramp: kiểm theo khúc khi dựng
         src = plan.sources[s["source_id"]]
         dur = (s["out_end"] - s["out_start"]) / float(plan.fps)
+        if dur < 0.3:  # quá ngắn để đo tương quan (đã kiểm bằng số mẫu khi ghép)
+            continue
         take = min(dur, 3.0)
         off = max(0.0, dur / 2 - take / 2)
-        o = out_a[int((s["out_start"] / float(plan.fps) + off) * rate):][: int(take * rate)]
+        o0 = float(plan.edit_time(s, s["out_start"])) - plan.t0
+        o = out_a[int((o0 + off) * rate):][: int(take * rate)]
         from .render import _atempo_chain
 
         ref = extract_audio_pcm(src["path"], ri["audio_stream"], ri["audio_start"] + off * s["speed"],
                                 take * s["speed"], rate, extra_filters=_atempo_chain(s["speed"]))
         lag, peak = _xcorr_lag(o, ref, rate)
-        a = {"segment_id": s["segment_id"], "lag_ms": round(lag, 2), "corr": round(peak, 3), "ok": True}
+        a = {"segment_id": s.get("segment_id"), "run_id": s.get("run_id"), "lag_ms": round(lag, 2), "corr": round(peak, 3), "ok": True}
         if abs(lag) > 1000 / float(plan.fps) / 2 or peak < 0.5:
             a["ok"] = False
         audio.append(a)
         for r in seg_results:
-            if r["segment_id"] == s["segment_id"] and not a["ok"]:
+            if r.get("run_id") == s.get("run_id") and not a["ok"]:
                 r["issues"].append(f"Lệch âm thanh {lag:.1f} ms (tương quan {peak:.2f})")
                 r["status"] = max(r["status"], YELLOW, key=_rank)
     if progress:

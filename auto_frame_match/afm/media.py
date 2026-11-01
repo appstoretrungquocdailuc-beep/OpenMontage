@@ -341,3 +341,27 @@ def extract_audio_pcm(path: str, stream_index: int, start: float, duration: floa
     ]
     p = run(cmd, check=False)
     return np.frombuffer(p.stdout, np.float32).copy()
+
+
+def decode_range(path: str, pts: np.ndarray, f0: int, f1: int, width: int,
+                 start_time: float = 0.0) -> list[np.ndarray]:
+    """Giải mã ĐÚNG các khung [f0, f1) (theo PTS gốc, -copyts + trim) thành ảnh xám rộng ``width``."""
+    f0, f1 = max(0, f0), min(len(pts), f1)
+    if f1 <= f0:
+        return []
+    half = 0.5 * float(np.median(np.diff(pts))) if len(pts) > 1 else 0.02
+    t0, t1 = float(pts[f0]), float(pts[f1 - 1])
+    p = run([ffmpeg_bin(), "-hide_banner", "-nostdin", "-loglevel", "error",
+             "-ss", f"{max(0.0, t0 - start_time - 3.0):.6f}", "-copyts", "-i", path, "-map", "0:v:0", "-an",
+             "-vf", f"trim=start={t0 - half:.6f}:end={t1 + half:.6f},scale={width}:-2:flags=area,format=gray",
+             "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"], check=False)
+    data = p.stdout
+    n = f1 - f0
+    if not data or len(data) % n:
+        h = len(data) // (width * max(1, n)) if data else 0
+    else:
+        h = len(data) // (width * n)
+    if h <= 0:
+        return []
+    k = len(data) // (width * h)
+    return [np.frombuffer(data[i * width * h:(i + 1) * width * h], np.uint8).reshape(h, width) for i in range(k)]

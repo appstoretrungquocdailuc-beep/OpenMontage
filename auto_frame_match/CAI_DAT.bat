@@ -20,7 +20,12 @@ if not exist ".venv\Scripts\python.exe" (
   %PY% -m venv .venv || (echo [LOI] Khong tao duoc .venv & pause & exit /b 1)
 )
 ".venv\Scripts\python.exe" -m pip install --upgrade pip
-".venv\Scripts\python.exe" -m pip install -r requirements.txt || (echo [LOI] Cai thu vien that bai & pause & exit /b 1)
+".venv\Scripts\python.exe" -m pip install -r requirements-lock.txt || (
+  echo [CANH BAO] Khong cai duoc bo phien ban da khoa, thu requirements.txt ...
+  ".venv\Scripts\python.exe" -m pip install -r requirements.txt || (echo [LOI] Cai thu vien that bai & pause & exit /b 1)
+)
+echo Tai mo hinh nhan dang chu (kiem tra Douyin fallback sach) ...
+".venv\Scripts\python.exe" tai_mo_hinh.py || echo [CANH BAO] Chua tai duoc mo hinh chu: fallback sach se chi o muc CHUA_CHAC
 echo.
 set "FF="
 if exist "bin\ffmpeg.exe" set "FF=bin\ffmpeg.exe"

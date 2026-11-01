@@ -11,7 +11,7 @@ import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-TOOL_VERSION = "1.1.0"
+TOOL_VERSION = "2.0.0"
 # Tăng khi thay đổi cách tính fingerprint -> cache cũ tự động bị bỏ qua.
 FINGERPRINT_VERSION = 6
 
@@ -40,16 +40,23 @@ class AnalysisConfig:
     # --- phát hiện cảnh ---
     scenedetect_threshold: float = 27.0
     own_cut_ratio: float = 4.0  # điểm cắt bổ sung khi diff > ratio * median cục bộ
-    min_scene_frames: int = 3
+    min_scene_frames: int = 1  # V2: giữ cảnh 1-2 khung (đoạn liền mạch được gộp lại sau so khớp)
 
     # --- so khớp chính xác ---
     block_grid: int = 6
     block_keep: float = 0.75  # giữ 75% block tốt nhất (loại phụ đề/watermark)
     canvas_area: int = 96 * 54
-    speed_min: float = 0.5
-    speed_max: float = 2.0
+    speed_min: float = 0.2  # V2: dải tốc độ rộng
+    speed_max: float = 6.0
+    speed_normal_max: float = 2.2  # tầng thường dò 0.5x-2.2x; ngoài dải mới mở cửa sổ rộng
     speed_step: float = 0.01
-    speed_prior: float = 0.1  # phạt khi speed khác 1.0 (chống trôi do giữ khung)
+    speed_prior: float = 0.02  # phạt theo quãng tám khi speed khác 1.0 (chống trôi do giữ khung)
+    allow_freeze: bool = True  # tốc độ 0 = đứng hình
+    per_frame_speed: bool = True  # V2: ánh xạ từng khung (DTW) cho speed ramp
+    dtw_change_penalty: float = 0.01
+    dtw_min_gain: float = 0.01
+    dtw_max_cells: int = 60_000_000
+    detect_interpolated_frames: bool = True  # khung trộn 2 khung nguồn (slow-motion nội suy)
     speed_min_frames: int = 12  # cảnh ngắn hơn -> không đủ bằng chứng để ước lượng tốc độ
     window_margin_frames: int = 36
 
@@ -63,6 +70,9 @@ class AnalysisConfig:
     ambiguity_margin: float = 0.015  # chênh lệch điểm giữa 2 nguồn ứng viên
     min_evidence_frames: int = 3  # không chấp nhận 1 khung giống làm bằng chứng
     static_texture_min: float = 2.0
+    speed_ambiguity_margin: float = 0.03  # V2: tốc độ khác 1.0 phải hơn 1.0 ít nhất mức này
+    static_view_max_diff: float = 1.5  # V2: vùng hiển thị "tĩnh" -> thời điểm nguồn không quan sát được
+    max_anisotropy: float = 1.18  # V2: tỉ lệ co giãn ngang/dọc tối đa (chặn hình học méo)
 
     # --- tầng 2: SIFT + RANSAC cho đoạn UNMATCHED ---
     sift_enable: bool = True
@@ -80,7 +90,10 @@ class AnalysisConfig:
     dp_lambda: float = 0.02
     dp_window: float = 0.03  # chỉ xét ứng viên có điểm cách ứng viên tốt nhất <= mức này
 
-    # --- nội suy đoạn ĐỎ từ đoạn kề (tùy chọn, mặc định TẮT) ---
+    # --- V2: khung Douyin sạch làm fallback khi cảnh không có trong anime gốc ---
+    clean_fallback: bool = True
+
+    # --- nội suy đoạn ĐỎ từ đoạn kề (tùy chọn, mặc định TẮT; khung luôn UNVERIFIED) ---
     interpolate_unmatched: bool = False
     interp_speed_min: float = 0.5
     interp_speed_max: float = 1.1
@@ -88,6 +101,9 @@ class AnalysisConfig:
     # --- xác minh độ phân giải cao ---
     hires_refine: bool = True
     hires_width: int = 640
+    hires_zoom_verify: bool = True  # V2: căn chỉnh lại ở 640px cho đoạn phóng to
+    hires_zoom_threshold: float = 0.5  # |sx| < 0.5 = phóng to >= 2x
+    hires_canvas_area: int = 96 * 54  # lưới so sánh khi xác minh 640px (lưới mịn hơn quá nhạy với khác biệt nội suy ảnh)
 
 
 @dataclass
@@ -98,12 +114,13 @@ class RenderConfig:
     x264_crf: int = 16
     preset_nvenc: str = "p7"
     preset_x264: str = "slow"
-    fps_mode: str = "auto"  # auto | edit | source
+    fps_mode: str = "edit"  # V2: luôn theo FPS bản edit (khung xuất k = khung edit k)
     crop_mode: str = "match_edit"  # match_edit | full_source
     audio_bitrate: str = "320k"
     audio_rate: int = 48000
     audio_lang: str = "jpn"
-    allow_unverified: bool = False
+    allow_unverified: bool = False  # = export_mode "preview" (giữ tương thích)
+    export_mode: str = "strict"  # strict | preview
 
 
 @dataclass

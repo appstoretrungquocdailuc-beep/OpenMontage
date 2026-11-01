@@ -432,6 +432,9 @@ class Alignment:
     ambiguous_frames: int  # độ rộng dải offset cho điểm gần như bằng nhau
     low_info: int  # số khung không đủ kết cấu
     sims_sel: np.ndarray | None = None  # điểm "mọi block" từng khung
+    frame_map: np.ndarray | None = None  # V2: khung nguồn từng khung edit khi tốc độ thay đổi (DTW)
+    local_speed: np.ndarray | None = None  # V2: tốc độ cục bộ từng khung
+    speed_alt: tuple | None = None  # V2: (tốc độ thay thế, chênh điểm sel) để phát hiện mơ hồ tốc độ
 
 
 def line_search(M: np.ndarray, j0: int, rel_t: np.ndarray, fps_s: float, cfg: AnalysisConfig,
@@ -455,25 +458,28 @@ def line_search(M: np.ndarray, j0: int, rel_t: np.ndarray, fps_s: float, cfg: An
         speeds = np.array([1.0])
     best = (-9.0, 0.0, 1.0)
     offs_coarse = np.arange(j0 - 2, j0 + m + 2, 1.0)
+    def prior(sp):  # phạt theo quãng tám (0.5x và 2x phạt như nhau); đứng hình phạt cố định
+        return cfg.speed_prior * (abs(np.log2(sp)) if sp > 0 else 2.0)
+
     for sp in speeds:
-        sc = eval_speed(sp, offs_coarse) - cfg.speed_prior * abs(sp - 1.0)
+        sc = eval_speed(sp, offs_coarse) - prior(sp)
         k = int(np.argmax(sc))
         if sc[k] > best[0]:
             best = (float(sc[k]), float(offs_coarse[k]), float(sp))
     # tinh chỉnh tốc độ quanh nghiệm thô
-    if len(speeds) > 1:
-        fine = np.arange(max(cfg.speed_min, best[2] - 0.03), min(cfg.speed_max, best[2] + 0.03) + 1e-9, 0.005)
+    if len(speeds) > 1 and best[2] > 0:
+        fine = best[2] * np.arange(0.97, 1.0301, 0.005)
         for sp in fine:
             offs = np.arange(best[1] - 3, best[1] + 3.01, 0.25)
-            sc = eval_speed(sp, offs) - cfg.speed_prior * abs(sp - 1.0)
+            sc = eval_speed(sp, offs) - prior(sp)
             k = int(np.argmax(sc))
             if sc[k] > best[0]:
                 best = (float(sc[k]), float(offs[k]), float(sp))
     # ưu tiên tốc độ "tròn" mà người dựng hay dùng nếu điểm gần như bằng nghiệm tự do
-    if len(speeds) > 1 and abs(best[2] - 1.0) > 1e-6:
-        free_raw = best[0] + cfg.speed_prior * abs(best[2] - 1.0)
-        for csp in sorted(COMMON_SPEEDS, key=lambda v: abs(v - best[2])):
-            if abs(csp - best[2]) > 0.08:
+    if len(speeds) > 1 and abs(best[2] - 1.0) > 1e-6 and best[2] > 0:
+        free_raw = best[0] + prior(best[2])
+        for csp in sorted(COMMON_SPEEDS, key=lambda v: abs(np.log2(v / best[2]))):
+            if abs(np.log2(csp / best[2])) > 0.08:
                 continue
             offs = np.arange(best[1] - 4, best[1] + 4.01, 0.25)
             sc = eval_speed(csp, offs)
@@ -503,11 +509,80 @@ def line_search(M: np.ndarray, j0: int, rel_t: np.ndarray, fps_s: float, cfg: An
     return Alignment(a, sp, frames, sims, best_alt, score, ambiguous, int((~info).sum()), sims_sel)
 
 
-COMMON_SPEEDS = (0.5, 0.75, 0.8, 0.9, 1.0, 1.1, 1.2, 1.25, 1.3, 1.5, 1.75, 2.0)
+COMMON_SPEEDS = (0.25, 0.3333, 0.4, 0.5, 0.6667, 0.75, 0.8, 0.9, 1.0, 1.1, 1.2, 1.25, 1.3, 1.5, 1.75, 2.0,
+                 2.5, 3.0, 4.0, 5.0, 6.0)
+DTW_SPEEDS = np.array([0.0, 0.25, 0.3333, 0.5, 0.6667, 0.75, 0.8, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0])
 
 
-def speed_grid(cfg: AnalysisConfig) -> np.ndarray:
-    return np.round(np.arange(cfg.speed_min, cfg.speed_max + 1e-9, 0.02), 3)
+def speed_grid(cfg: AnalysisConfig, lo: float | None = None, hi: float | None = None) -> np.ndarray:
+    """Lưới tốc độ cách đều theo log (mật độ tương đối ~2%) + 0 (đứng hình)."""
+    lo = cfg.speed_min if lo is None else lo
+    hi = cfg.speed_max if hi is None else hi
+    n = int(np.ceil(np.log(hi / lo) / np.log(1.02))) + 1
+    g = np.round(np.geomspace(lo, hi, n), 4)
+    return np.concatenate([[0.0], g]) if cfg.allow_freeze else g
+
+
+def dtw_align(Msel: np.ndarray, Mver: np.ndarray, j0: int, rel_t: np.ndarray, fps_s: float, n_src: int,
+              cfg: AnalysisConfig, allow_freeze: bool = True) -> Alignment | None:
+    """Căn chỉnh TỪNG KHUNG khi tốc độ thay đổi (speed ramp, đứng hình, nhanh/chậm xen kẽ).
+
+    Trạng thái = (vị trí nguồn theo 1/4 khung, lớp tốc độ). Mỗi khung edit tiến
+    speed * fps_nguồn * dt; đổi lớp tốc độ tối đa 2 bậc/khung và bị phạt (đường thời gian trơn).
+    """
+    n, m = Msel.shape
+    Q = m * 4
+    K = len(DTW_SPEEDS)
+    if n < 2 or n * K * Q > cfg.dtw_max_cells:
+        return None
+    qidx = np.minimum((np.arange(Q) + 2) // 4, m - 1)  # floor(q/4 + 0.5)
+    emis = np.nan_to_num(Msel, nan=0.0)[:, qidx].astype(np.float32)  # (n, Q)
+    lam = cfg.dtw_change_penalty
+    NEG = np.float32(-1e9)
+    best = np.repeat(emis[0][None, :], K, axis=0)  # (K, Q)
+    if not allow_freeze:  # cảnh có chuyển động: cấm lớp tốc độ 0 (đứng hình) - phạt rất nặng
+        emis_pen = np.zeros(K, np.float32)
+        emis_pen[DTW_SPEEDS == 0] = 10.0
+    else:
+        emis_pen = np.zeros(K, np.float32)
+    best -= cfg.speed_prior * np.where(DTW_SPEEDS > 0, np.abs(np.log2(np.maximum(DTW_SPEEDS, 1e-9))), 2.0)[:, None]
+    bp = np.zeros((n, K, Q), np.int8)
+    shifts = np.zeros((n, K), np.int32)
+    for i in range(1, n):
+        step = fps_s * float(rel_t[i] - rel_t[i - 1])
+        new = np.full((K, Q), NEG, np.float32)
+        for k in range(K):
+            lo, hi = max(0, k - 2), min(K, k + 3)
+            cand = best[lo:hi] - lam * np.abs(np.arange(lo, hi) - k)[:, None]
+            arg = np.argmax(cand, axis=0)
+            val = cand[arg, np.arange(Q)]
+            sh = int(round(DTW_SPEEDS[k] * step * 4))
+            shifts[i, k] = sh
+            if sh < Q:
+                new[k, sh:] = val[:Q - sh]
+                bp[i, k, sh:] = (arg + lo)[:Q - sh]
+        best = new + emis[i][None, :] - emis_pen[:, None]
+    k, q = np.unravel_index(int(np.argmax(best)), best.shape)
+    qs = np.zeros(n, np.int64)
+    ks = np.zeros(n, np.int64)
+    for i in range(n - 1, -1, -1):
+        qs[i], ks[i] = q, k
+        if i > 0:
+            kp = int(bp[i, k, q])
+            q -= shifts[i, k]
+            k = kp
+    frames = np.clip(j0 + (qs + 2) // 4, 0, n_src - 1)
+    cols = np.clip(frames - j0, 0, m - 1)
+    rows = np.arange(n)
+    sims = Mver[rows, cols].astype(np.float64)
+    sel = Msel[rows, cols].astype(np.float64)
+    valid = sims[np.isfinite(sims)]
+    score = float(np.median(valid)) if len(valid) else -1.0
+    local = DTW_SPEEDS[ks]
+    best_alt = np.nanmax(np.where(np.isnan(Mver), -1, Mver), axis=1)
+    sp = float(np.median(local))
+    return Alignment(float(j0 + qs[0] / 4.0), sp, frames, sims, best_alt, score, 0,
+                     int((~np.isfinite(Msel[:, 0])).sum()), sel, frames.copy(), local.astype(np.float64))
 
 
 def align_scene(edit_fp: Fingerprint, src_fp: Fingerprint, s: int, e: int, g: Geometry,
@@ -518,17 +593,64 @@ def align_scene(edit_fp: Fingerprint, src_fp: Fingerprint, s: int, e: int, g: Ge
     rel_t = edit_fp.pts[s:e] - edit_fp.pts[s]
     dur = float(rel_t[-1]) + 1.0 / max(edit_fp.fps, 1)
     margin = cfg.window_margin_frames
-    j0 = int(max(0, np.floor(a_hint - margin - n * 0.1)))
-    j1 = int(min(src_fp.n, np.ceil(a_hint + dur * src_fp.fps * cfg.speed_max + margin)))
-    if j1 - j0 < 1:
-        return None, {}
     E, Estd = canvas.blocks([edit_fp.thumbs[i] for i in range(s, e)], "edit")
-    S, Sstd = canvas.blocks([src_fp.thumbs[j] for j in range(j0, j1)], "source")
-    M, Mver = block_sims(E, Estd, S, Sstd, cfg, "both")
-    # luôn dò tốc độ (phim hoạt hình giữ khung -> tốc độ 1.0 vẫn có thể cho điểm khá cao)
-    al = line_search(M, j0, rel_t, src_fp.fps, cfg, src_fp.n,
-                     speeds=speed_grid(cfg) if n >= cfg.speed_min_frames else None, Mver=Mver)
-    return al, {"j0": j0, "j1": j1, "matrix_shape": M.shape}
+
+    def run(smax, speeds):
+        j0 = int(max(0, np.floor(a_hint - margin - n * 0.1)))
+        j1 = int(min(src_fp.n, np.ceil(a_hint + dur * src_fp.fps * smax + margin)))
+        if j1 - j0 < 1:
+            return None, None, None, j0
+        S, Sstd = canvas.blocks([src_fp.thumbs[j] for j in range(j0, j1)], "source")
+        M, Mver = block_sims(E, Estd, S, Sstd, cfg, "both")
+        al = line_search(M, j0, rel_t, src_fp.fps, cfg, src_fp.n, speeds=speeds, Mver=Mver)
+        return al, M, Mver, j0
+
+    def ok_ratio(al):
+        v = al.sims[np.isfinite(al.sims)] if al is not None else np.zeros(0)
+        return float((v >= cfg.frame_ok).mean()) if len(v) else 0.0
+
+    # bản edit có chuyển động thì KHÔNG thể là đứng hình (chặn khớp "đóng băng" giả)
+    # (so với khung ĐẦU, không phải khung liền trước: phim hoạt hình giữ hình 2-3 khung nên chênh lệch
+    #  liền kề thường = 0 ngay cả khi cảnh đang chuyển động)
+    first = edit_fp.thumbs[s].astype(np.int16)
+    em = [float(np.abs(edit_fp.thumbs[i].astype(np.int16) - first).mean()) for i in range(s + 1, e)]
+    edit_static = (max(em) if em else 0.0) < 1.5
+
+    def grid(lo, hi):
+        g = speed_grid(cfg, lo, hi)
+        return g if edit_static else g[g > 0]
+
+    # tầng thường: 0.5x-2x (cửa sổ nhỏ, nhanh); luôn dò tốc độ vì phim hoạt hình giữ khung
+    small = n >= cfg.speed_min_frames
+    al, M, Mver, j0 = run(cfg.speed_normal_max, grid(0.5, cfg.speed_normal_max) if small else None)
+    # V2: tốc độ ngoài 0.5x-2x, đứng hình -> dải rộng 0-6x
+    need_wide = small and (al is None or ok_ratio(al) < 0.98 or al.speed <= 0.52
+                           or al.speed >= cfg.speed_normal_max * 0.95)
+    if need_wide:
+        al2, M2, Mver2, j02 = run(cfg.speed_max, grid(cfg.speed_min, cfg.speed_max))
+        if al2 is not None and (al is None or _sel_mean(al2) > _sel_mean(al) + 0.002):
+            al, M, Mver, j0 = al2, M2, Mver2, j02
+    # V2: ánh xạ từng khung (speed ramp) khi đường thẳng chưa giải thích hết cảnh
+    # (luôn thử: khung giữ hình của anime khiến đường thẳng sai vẫn đạt ngưỡng từng khung)
+    # DTW chỉ TINH CHỈNH một cảnh đã khớp (đường thẳng đạt ngưỡng), không được tạo khớp từ cảnh lạ
+    if cfg.per_frame_speed and al is not None and n >= cfg.speed_min_frames and al.score >= cfg.scene_match \
+            and ok_ratio(al) >= cfg.match_ok_ratio:
+        d = dtw_align(M, Mver, j0, rel_t, src_fp.fps, src_fp.n, cfg, allow_freeze=edit_static)
+        if d is not None and _sel_mean(d) > _sel_mean(al) + cfg.dtw_min_gain and ok_ratio(d) >= ok_ratio(al):
+            d.ambiguous_frames = al.ambiguous_frames
+            al = d
+    # V2: mơ hồ tốc độ - giả thuyết 1.0x (cùng cửa sổ) khớp gần ngang tốc độ đã chọn?
+    if al is not None and M is not None and n >= cfg.speed_min_frames and abs(al.speed - 1.0) > 0.05:
+        one = line_search(M, j0, rel_t, src_fp.fps, cfg, src_fp.n, speeds=np.array([1.0]), Mver=Mver)
+        if one is not None:
+            al.speed_alt = (1.0, _sel_mean(al) - _sel_mean(one))
+    return al, {"j0": j0, "matrix_shape": None if M is None else M.shape}
+
+
+def _sel_mean(al: Alignment) -> float:
+    v = al.sims_sel if al.sims_sel is not None else al.sims
+    v = np.where(np.isfinite(v), v, -0.3)
+    return float(v.mean()) if len(v) else -9.0
 
 
 def pair_score(edit_img, src_img, g: Geometry, esize, ssize, cfg: AnalysisConfig, region=None) -> float:

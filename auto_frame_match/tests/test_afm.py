@@ -13,6 +13,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 HERE = Path(__file__).resolve().parent
@@ -63,7 +64,8 @@ def _frames_by_gt(res, truth):
 # ---------------------------------------------------------------------------- nhận đúng frame & nguồn
 
 @pytest.mark.parametrize("name", ["mot_nguon", "hai_nguon_fps_phude", "ba_nguon_bien_doi",
-                                  "doc_letterbox", "doc_crop", "lap_va_ngoai_nguon"])
+                                  "doc_letterbox", "doc_crop", "lap_va_ngoai_nguon",
+                                  "v2_toc_do", "v2_ramp_freeze", "v2_fallback", "v2_vfr"])
 def test_bang_cat_dung_tung_khung(root, name):
     srcs, paths, edit, truth, res = run_analysis(root, name)
     st = score_table(res["doc"]["frames"], truth, srcs)
@@ -81,8 +83,11 @@ def test_bang_cat_dung_tung_khung(root, name):
     for row, g in _frames_by_gt(res, truth):
         if g["source_id"] is None:
             assert row["status"] == RED and not row["source_id"]
-        if row["status"] == GREEN:  # XANH thì phải đúng tuyệt đối
-            assert row["source_id"] == g["source_id"] and row["source_frame"] == g["source_frame"]
+        if row["status"] == GREEN and row.get("source_id"):  # XANH: đúng nguồn + đúng hình (khung giữ hình
+            # giống hệt nhau thì chỉ số có thể lệch trong cùng nhóm giữ hình - không phân biệt được bằng pixel)
+            sid, f = row["source_id"], int(row["source_frame"])
+            ok = [g["drawing"]] + ([g["drawing_alt"]] if g.get("drawing_alt") else [])
+            assert sid == g["source_id"] and list(map(str, srcs[sid].drawing_id(f))) in ok, (row, g)
 
 
 def test_mot_nguon_xac_minh_100(root):
@@ -168,39 +173,42 @@ def test_dung_2k_xac_minh_va_qa(root):
 
 
 def test_ban_nhap_khong_dung_doan_do(root):
-    """Còn cảnh ĐỎ: không xuất bản 'đã xác minh'; bản nháp bỏ đoạn ĐỎ (không thay bằng màn trắng)."""
+    """Còn cảnh ĐỎ: STRICT không xuất; PREVIEW giữ ĐỦ khung (đoạn ĐỎ lấy khung Douyin, không bỏ, không màn trắng)."""
     srcs, paths, edit, truth = build_scenario("lap_va_ngoai_nguon", root, per_scenario_sources=True)
     out = root / "full_lap"
     cfg = _cfg(root)
     res = run_mode_a(str(edit), [str(paths[s]) for s in sorted(paths)], out, cfg)
     assert res["verified"] is False and res["render"] is None
     assert not (out / "THANH_PHAM_2K.mp4").exists()
-    cfg.render.allow_unverified = True
+    cfg.render.export_mode = "preview"
     res = run_mode_a(str(edit), [str(paths[s]) for s in sorted(paths)], out, cfg)
     assert res["verified"] is False
     assert (out / "THANH_PHAM_2K_CHUA_XAC_MINH.mp4").exists()
-    assert res["qa"]["status"] == GREEN  # các đoạn đã dựng khớp bản Douyin
-    n_red = sum(1 for f in truth["frames"] if f["source_id"] is None)
-    assert res["qa"]["frames"] < len(truth["frames"]) - n_red + 5
+    assert res["qa"]["frames"] == len(truth["frames"])  # V2: KHÔNG mất khung nào
+    assert not any("SỐ KHUNG" in i or "Lệch thời lượng" in i for i in res["qa"]["global_issues"])
+    assert all(s["status"] == GREEN for s in res["qa"]["segments"] if "SOURCE_RAW" in s.get("origins", []))
 
 
 def test_qa_bat_loi_cat_sai(root):
     """Cố ý làm sai bảng (lệch khung, lật sai) -> QA phải báo ĐỎ."""
     from afm.qa import verify_output
     from afm.render import RenderPlan, prepare_sources, render
-    from afm.pipeline import _plan_segments_from_analysis, _sources_for_render
+    from afm.pipeline import _sources_for_render
 
     srcs, paths, edit, truth, res = run_analysis(root, "mot_nguon")
-    segs, _ = _plan_segments_from_analysis(res["segments"], res["edit_fp"], False)
-    segs[1]["a"] += 40  # nhầm cảnh (lệch 40 khung)
-    segs[2]["flip"] = not segs[2]["flip"]  # sai lật gương
+    runs = [dict(r) for r in res["runs"]]
+    runs[1]["frames"] = runs[1]["frames"] + 40  # nhầm cảnh (lệch 40 khung)
+    runs[1]["linear"] = False
+    runs[2]["flip"] = not runs[2]["flip"]  # sai lật gương
     sources = _sources_for_render(res["manifest"], res["src_fps"])
     prepare_sources(sources)
-    plan = RenderPlan(segs, sources, dict(res["doc"]["edit"]), _cfg(root).render)
+    em = dict(res["doc"]["edit"])
+    em["_pts"] = list(res["edit_fp"].pts)
+    plan = RenderPlan(runs, sources, em, _cfg(root).render)
     out = root / "qa_sai.mp4"
     rinfo = render(plan, out, root / "qa_sai_work")
     qa = verify_output(str(out), plan, rinfo, _cfg(root).analysis, res["edit_fp"], res["src_fps"])
-    st = {s["segment_id"]: s for s in qa["segments"]}
+    st = {s["run_id"]: s for s in qa["segments"]}
     assert st[1]["status"] == GREEN and st[4]["status"] == GREEN
     assert st[2]["status"] == RED
     assert st[3]["status"] == RED
@@ -300,6 +308,8 @@ def test_noi_suy_giu_du_thoi_luong(root):
     srcs, paths, edit, truth = build_scenario("zoom_manh_noi_suy", root, per_scenario_sources=True)
     cfg = _cfg(root)
     cfg.analysis.interpolate_unmatched = True
+    cfg.analysis.clean_fallback = False  # ép đoạn ĐỎ đi qua nhánh nội suy cũ
+    cfg.render.export_mode = "preview"
     out = root / "full_noi_suy"
     r = run_mode_a(str(edit), [str(paths["S1"])], out, cfg)
     doc = json.loads((out / "BANG_CAT_AUTO.json").read_text("utf-8"))
@@ -310,3 +320,143 @@ def test_noi_suy_giu_du_thoi_luong(root):
     edit_dur = len(truth["frames"]) / truth["fps"]
     assert abs(r["qa"]["duration"] - edit_dur) <= 1.0 / truth["fps"] + 1e-3, (r["qa"]["duration"], edit_dur)
     assert r["qa"]["status"] != RED  # các đoạn so khớp đều khớp; đoạn nội suy chỉ là VÀNG
+
+
+# ---------------------------------------------------------------------------- V2
+
+
+def _timeline_csv(out):
+    import csv
+
+    with open(out / "FRAME_TIMELINE_EXACT.csv", encoding="utf-8-sig") as f:
+        return list(csv.DictReader(f))
+
+
+def test_v2_toc_do_rong(root):
+    """0.25x, 0.5x, 2x, 3x, 5x: tìm đúng tốc độ, không gán nhầm cảnh."""
+    srcs, paths, edit, truth, res = run_analysis(root, "v2_toc_do")
+    st = score_table(res["doc"]["frames"], truth, srcs)
+    assert st["wrong"] == 0 and st["visual"] == st["total"]
+    speeds = sorted(round(float(s["speed"]), 2) for s in res["doc"]["segments"] if s["source_id"] != "UNMATCHED")
+    for want in (0.25, 0.5, 2.0, 3.0, 5.0):
+        assert any(abs(v - want) / want < 0.05 for v in speeds), (want, speeds)
+
+
+def test_v2_ramp_freeze_noi_suy_canh_ngan(root):
+    """Speed ramp, đứng hình, khung nội suy, đảo thứ tự, cảnh 1-2 khung: đúng từng khung, không bỏ cảnh ngắn."""
+    srcs, paths, edit, truth, res = run_analysis(root, "v2_ramp_freeze")
+    st = score_table(res["doc"]["frames"], truth, srcs)
+    assert st["wrong"] == 0 and st["green_wrong"] == 0 and st["visual"] == st["total"]
+    frames = res["doc"]["frames"]
+    # cảnh 1 khung (S1 880) phải còn nguyên, đúng nguồn
+    one = [f for f, g in zip(frames, truth["frames"]) if g["source_frame"] == 880]
+    assert len(one) == 1 and one[0]["source_frame"] == 880
+    # đứng hình: mọi khung cùng 1 khung nguồn
+    fr = [f["source_frame"] for f, g in zip(frames, truth["frames"]) if g["seg"] == 2]
+    assert len(set(fr)) == 1
+    out = Path(res["out_dir"])
+    sp = (out / "SPEED_RAMP_REPORT.csv").read_text("utf-8-sig")
+    assert "ramp" in sp and "dong_hinh" in sp
+
+
+def test_v2_fallback_strict_preview(root):
+    """Cảnh không có nguồn: sạch -> DOUYIN_CLEAN_FALLBACK; có chữ/logo -> UNVERIFIED. STRICT không xuất,
+    PREVIEW đủ khung, đúng vị trí."""
+    srcs, paths, edit, truth = build_scenario("v2_fallback", root, per_scenario_sources=True)
+    out = root / "full_v2_fb"
+    shutil.rmtree(out, ignore_errors=True)  # không để file của lần chạy trước làm sai kết quả
+    cfg = _cfg(root)
+    r = run_mode_a(str(edit), [str(paths["S1"])], out, cfg)
+    assert r["render"] is None and not list(out.glob("THANH_PHAM*.mp4"))
+    tl = r["timeline"]
+    assert tl["DOUYIN_CLEAN_FALLBACK"] == 30 and tl["UNVERIFIED"] == 60 and tl["frames_total"] == len(truth["frames"])
+    rows = _timeline_csv(out)
+    org = {int(x["edit_frame"]): x["origin"] for x in rows}
+    for g in truth["frames"]:
+        i = g["edit_frame"]
+        if g["source_id"] is None and g.get("overlay") is None:
+            assert org[i] == "DOUYIN_CLEAN_FALLBACK", i
+        elif g["source_id"] is None:
+            assert org[i] == "UNVERIFIED", i  # có chữ/logo -> KHÔNG tự dùng
+        else:
+            assert org[i] == "SOURCE_RAW", i
+    cfg.render.export_mode = "preview"
+    r = run_mode_a(str(edit), [str(paths["S1"])], out, cfg)
+    q = r["qa"]
+    assert q["frames"] == len(truth["frames"]) and not q["global_issues"]
+    assert abs(q["duration"] - len(truth["frames"]) / truth["fps"]) < 1e-3
+    assert (out / "THANH_PHAM_2K_CHUA_XAC_MINH.mp4").exists()
+
+
+def test_v2_vfr_khong_lech_tich_luy(root):
+    srcs, paths, edit, truth = build_scenario("v2_vfr", root, per_scenario_sources=True)
+    cfg = _cfg(root)
+    r = run_mode_a(str(edit), [str(paths[s]) for s in sorted(paths)], root / "full_v2_vfr", cfg)
+    q = r["qa"]
+    assert q["frames"] == len(truth["frames"])
+    p = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(edit)],
+                       capture_output=True, text=True)
+    assert abs(q["duration"] - float(p.stdout)) < 2.0 / 45
+    assert any("VFR" in i for i in q["global_issues"])  # báo rõ độ lệch PTS từng khung, không giấu
+
+
+def test_v2_am_thanh_ramp_va_dong_hinh(root):
+    """Speed ramp: có tiếng theo từng khúc; đứng hình: im lặng + AUDIO_UNRESOLVED (không bịa tiếng)."""
+    from afm.media import extract_audio_pcm
+
+    srcs, paths, edit, truth = build_scenario("v2_ramp_freeze", root, per_scenario_sources=True)
+    cfg = _cfg(root)
+    cfg.render.export_mode = "preview"
+    out = root / "full_v2_ramp"
+    r = run_mode_a(str(edit), [str(paths["S1"])], out, cfg)
+    segs = r["render"]["segments"]
+    fz = [s for s in segs if s.get("audio_unresolved")]
+    assert fz, "đoạn đứng hình phải được đánh dấu AUDIO_UNRESOLVED"
+    mp4 = next(out.glob("THANH_PHAM*.mp4"))
+    rate = 16000
+    a = extract_audio_pcm(str(mp4), 1, 0.0, 30.0, rate)
+    fps = truth["fps"]
+    ramp = next(s for s in segs if s.get("pieces"))
+    x = a[int(ramp["out_start"] / fps * rate): int(ramp["out_end"] / fps * rate)]
+    assert np.abs(x).mean() > 0.01  # khúc ramp có tiếng
+    frz = fz[0]
+    y = a[int(frz["out_start"] / fps * rate) + 400: int(frz["out_end"] / fps * rate) - 400]
+    assert np.abs(y).max() < 1e-3  # đứng hình: im lặng
+
+
+def test_v2_che_do_b_giu_ramp(root):
+    """Chế độ B đọc JSON V2: giữ ánh xạ từng khung (ramp), đủ khung; STRICT từ chối khi còn khung chưa duyệt."""
+    srcs, paths, edit, truth = build_scenario("v2_ramp_freeze", root, per_scenario_sources=True)
+    tbl = root / "full_v2_ramp" / "BANG_CAT_AUTO.json"
+    if not tbl.exists():
+        cfg = _cfg(root)
+        cfg.render.export_mode = "preview"
+        run_mode_a(str(edit), [str(paths["S1"])], root / "full_v2_ramp", cfg)
+    cfg = _cfg(root)
+    with pytest.raises(RuntimeError, match="STRICT"):
+        run_mode_b(str(tbl), [str(paths["S1"])], root / "modeb_v2_strict", cfg)
+    cfg.render.export_mode = "preview"
+    r = run_mode_b(str(tbl), [str(paths["S1"])], root / "modeb_v2", cfg)
+    assert r["qa"]["frames"] == len(truth["frames"]) and r["qa"]["status"] == GREEN
+
+
+def test_v2_loi_gpu_tu_chuyen_cpu(root, monkeypatch):
+    """Giả lập GPU báo có nhưng giải mã CUDA lỗi -> renderer tự dựng lại bằng CPU, vẫn đủ khung."""
+    import afm.media as media
+
+    monkeypatch.setattr(media, "cuda_decode_available", lambda: True)
+    srcs, paths, edit, truth = build_scenario("mot_nguon", root, per_scenario_sources=True)
+    cfg = _cfg(root)
+    cfg.render.nvenc_cq = 19  # đổi khóa cache -> buộc dựng lại
+    r = run_mode_a(str(edit), [str(paths["S1"])], root / "full_gpu_loi", cfg)
+    assert r["qa"]["frames"] == len(truth["frames"]) and r["verified"]
+
+
+def test_v2_nguon_hong_khong_im_lang(root):
+    """Bản dựng (Video2X) thiếu khung -> báo lỗi rõ ràng, không âm thầm bỏ khung."""
+    srcs, paths, edit, truth = build_scenario("mot_nguon", root, per_scenario_sources=True)
+    bad = root / "S1_cut.mp4"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(paths["S1"]), "-t", "20", "-c", "copy", str(bad)],
+                   check=True)
+    with pytest.raises(RuntimeError, match="khung"):
+        run_mode_a(str(edit), [{"path": str(paths["S1"]), "render_path": str(bad)}], root / "full_hong", _cfg(root))
