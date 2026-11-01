@@ -193,7 +193,7 @@ def _render_segment_video(plan: RenderPlan, s: dict, out_file: Path, cancel, pro
     t_lo = rpts[f_lo]
     t_hi = rpts[f_hi]
     half = 0.5 / float(src.get("render_fps") or src["fps"])
-    vf = [f"trim=start={t_lo - half:.6f}:end={t_hi + half:.6f}",
+    vf = [f"trim=start={t_lo - half * 1.4:.6f}:end={t_hi + half * 1.4:.6f}",
           f"crop={W}:{H}:{X}:{Y}"]
     if s["flip"]:
         vf.append("hflip")
@@ -222,6 +222,11 @@ def _render_segment_video(plan: RenderPlan, s: dict, out_file: Path, cancel, pro
         while cur_idx < idx:
             buf = pd.stdout.read(fsize)
             if len(buf) < fsize:
+                # decoder hết khung sớm 1-3 khung ở rìa run (trim/seek lệch): lặp khung cuối
+                if cur_idx >= 0 and idx - cur_idx <= 3:
+                    log.warning("Run %s: thiếu %d khung cuối nguồn, lặp khung cuối",
+                                s.get("run_id", s.get("segment_id")), idx - cur_idx)
+                    return cache[cur_idx]
                 raise RuntimeError(f"Thiếu khung nguồn khi dựng run {s.get('run_id', s.get('segment_id'))} "
                                    f"(cần khung {f_lo + idx}, chỉ đọc được {f_lo + cur_idx})")
             cur_idx += 1
