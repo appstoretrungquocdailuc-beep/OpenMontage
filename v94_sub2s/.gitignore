@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+yt_720p_gui_config.json
+chiadeu_theme.json
+urls.txt
+benchmark_config.json
+perf_report/telemetry_2*.jsonl
+_temp_yt480p/

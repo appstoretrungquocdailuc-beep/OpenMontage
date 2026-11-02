@@ -1,0 +1,20 @@
+{
+  "_comment": "Copy thành benchmark_config.json rồi chạy: python bench_v93.py live --config benchmark_config.json",
+  "_groups": "Nên có đủ nhóm: Shorts 1-5MiB, nhỏ 5-20MiB, trung bình 20-80MiB, lớn >80MiB, audio nhỏ và audio >8MiB, video mới đăng và video cũ",
+  "url": [
+    "https://www.youtube.com/shorts/XXXXXXXXXXX",
+    "https://www.youtube.com/watch?v=YYYYYYYYYYY"
+  ],
+  "urls": null,
+  "reps": 3,
+  "gap": 5.0,
+  "versions": "v93,v94",
+  "engine": "aria2c",
+  "cutsec": "0",
+  "workers_video": "0",
+  "no_warmup": false,
+  "env": {
+    "V94_FIRST_WAVE_RACE_MAX": "4",
+    "V94_RANGE_ENGINE": "v94"
+  }
+}

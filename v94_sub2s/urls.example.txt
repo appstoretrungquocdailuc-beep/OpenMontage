@@ -1,0 +1,5 @@
+# Mỗi dòng 1 URL công khai. Dòng bắt đầu bằng # bị bỏ qua.
+# Shorts 1-5MiB (mới đăng)
+https://www.youtube.com/shorts/XXXXXXXXXXX
+# Video 20-80MiB
+https://www.youtube.com/watch?v=YYYYYYYYYYY
