@@ -157,7 +157,7 @@ def _v94_env(name, default):
         return default
 
 
-V94_VERSION = "V9.4-SUB2S"
+V94_VERSION = "V9.4.1-SUB2S"   # bản V9.4 + bản vá sau log live đầu tiên (V9.4.1)
 # Range: kiểm tra Content-Range start/end khớp đúng request (V9.3 chỉ đọc tổng).
 V94_STRICT_CONTENT_RANGE = _v94_env("STRICT_CONTENT_RANGE", True)
 # Range: size thật ≠ ước tính → co/giãn tại chỗ, không vứt dữ liệu và tải lại (V9.3 = restart).
@@ -172,8 +172,11 @@ V94_DIRECT_1GET_DEADLINE_SEC = _v94_env("DIRECT_1GET_DEADLINE_SEC", 12.0)
 # 403/410/429 trên signed URL: không thử lại cùng URL bằng aria2 (vô ích + tăng tải).
 V94_NO_ARIA2_ON_AUTH_FAIL = _v94_env("NO_ARIA2_ON_AUTH_FAIL", True)
 # FIRST-WAVE-RACE: số request đầu được bắn kép (host chính + replica mn) mỗi file.
-# V9.3 = không giới hạn (mọi segment đợt đầu → 2 socket). 0 = tắt race, -1 = không giới hạn.
-V94_FIRST_WAVE_RACE_MAX = _v94_env("FIRST_WAVE_RACE_MAX", 4)
+# -1 = không giới hạn = V9.3 (mặc định từ V9.4.1); 0 = tắt race; N>0 = tối đa N request kép/file.
+# V9.4.0 đặt trần 4 (chống "bão socket") nhưng bench 2 host (perf_report/race_*): khi host chính 302 + chậm
+# và replica nhanh (đúng như log live 17:09: alt-win=3) trần 4 làm Shorts 2.88MB chậm hơn 140ms và video
+# 24MB chậm hơn 20%; khi replica chậm, trần chỉ bớt socket, KHÔNG nhanh hơn. → mặc định trở về V9.3.
+V94_FIRST_WAVE_RACE_MAX = _v94_env("FIRST_WAVE_RACE_MAX", -1)
 # Hedge thread pool (V9.3 = 192). Thread tạo lười nên chỉ là trần.
 V94_HEDGE_POOL_MAX = _v94_env("HEDGE_POOL_MAX", 192)
 # Ghi đè số worker Range (0 = heuristic V9.3). Dùng cho thí nghiệm 4/6/8/12/16/24/32/40.
@@ -200,6 +203,63 @@ V94_JA_INFER_GUARD = _v94_env("JA_INFER_GUARD", True)
 V94_FASTEST_VALID_480P = _v94_env("FASTEST_VALID_480P", False)
 # Telemetry JSONL (perf_report/telemetry_*.jsonl). Ghi bởi thread nền, không chặn hot path.
 V94_TELEMETRY = _v94_env("TELEMETRY", True)
+
+# ---------------------------------------------------------------------------------------------
+# V9.4.1 — từ log live đầu tiên trên Windows (Shorts M1sbvQq1DAk: HOT_READY 2.394s, MUX 0.602s
+# trong khi ffmpeg concat + ffprobe của bước <60s chỉ 0.11s ⇒ lần spawn ffmpeg.exe ĐẦU TIÊN sau
+# thời gian rảnh là "nguội"). Mọi cờ dưới đây: đặt về giá trị trong ngoặc = hành vi V9.4 trước đó.
+# ---------------------------------------------------------------------------------------------
+# Làm nóng ffmpeg.exe/ffprobe.exe bằng 1 lần remux THẬT (mẫu 12KB nhúng sẵn, không chạm file job)
+# chạy nền song song lúc video đang tải; mux thật không bao giờ chờ nó. (0 = tắt)
+V94_FF_PREWARM = _v94_env("FF_PREWARM", True)
+V94_FF_PREWARM_IDLE_SEC = _v94_env("FF_PREWARM_IDLE_SEC", 3.0)    # chỉ làm nóng nếu ffmpeg rảnh >= N giây
+V94_FF_WARMUP_START = _v94_env("FF_WARMUP_START", True)           # làm nóng 2 lần lúc bấm START + dòng FF BASELINE
+V94_FF_KEEPWARM_SEC = _v94_env("FF_KEEPWARM_SEC", 0.0)            # >0: giữ nóng định kỳ khi rảnh (mặc định tắt)
+V94_PREWARM_INNERTUBE = _v94_env("PREWARM_INNERTUBE", True)       # import bảng client Innertube lúc START
+# Đo tách pha lệnh mux (pre-read input, spawn, mở input, copy, thoát, thời gian kernel trên Windows).
+# 0 = subprocess.run như cũ; 1 = đo; 2 = đo + -benchmark. Lệnh/đầu ra mux KHÔNG đổi.
+V94_MUX_DIAG = _v94_env("MUX_DIAG", 1)
+V94_MUX_PREREAD = _v94_env("MUX_PREREAD", True)                   # đọc trước 64KiB mỗi input (quy thời gian quét AV)
+V94_GIL_PROBE = _v94_env("GIL_PROBE", False)                      # chỉ để chẩn đoán: đo GIL/GC stall trong lúc mux
+# Xác thực chặt file OUTPUT của mux (time= cuối, video:/audio: kB, không có dòng lỗi) trước DONE.
+V94_VALIDATE_MUX_STRICT = _v94_env("VALIDATE_MUX_STRICT", True)
+V94_FFPROBE_TIMEOUT = _v94_env("FFPROBE_TIMEOUT", 20.0)           # ffprobe thời lượng có timeout (0 = như V9.3)
+# Khi người dùng tự đặt trần V94_FIRST_WAVE_RACE_MAX>0: file nhỏ (<= N segment đợt đầu) vẫn race TẤT CẢ như V9.3.
+V94_RACE_ALL_IF_WORKERS_LE = _v94_env("RACE_ALL_IF_WORKERS_LE", 8)
+# Chỉ cấm replica mn 10 phút khi lỗi CHẮC CHẮN (403/404/410/429/401, từ chối kết nối, DNS) và job còn chạy;
+# timeout muộn của request thua cuộc không được tắt race cho các job sau. (0 = luật cũ)
+V94_ALT_BAN_STRICT = _v94_env("ALT_BAN_STRICT", True)
+# Số worker cho video <= 4MiB (0 = heuristic cũ = 6). A/B trong app: "6,11" xen kẽ theo job, ghi vào log/telemetry.
+V94_VIDEO_SMALL_WORKERS = _v94_env("VIDEO_SMALL_WORKERS", 0)
+V94_VIDEO_SMALL_WORKERS_AB = _v94_env("VIDEO_SMALL_WORKERS_AB", "")
+# check.xlsx: ghi bằng os.replace (nguyên tử, có retry) thay vì shutil.move = copy đè trên Windows. (0 = shutil.move)
+V94_EXCEL_ATOMIC_REPLACE = _v94_env("EXCEL_ATOMIC_REPLACE", True)
+# Chỉ ghi DONE vào dòng vẫn chứa đúng video id của job (dòng bị chèn/xoá/sắp xếp → tìm lại / không ghi). (0 = theo vị trí)
+V94_STATUS_VERIFY_URL = _v94_env("STATUS_VERIFY_URL", True)
+# Suy luận [SINGLE-TRACK-JA] chặt hơn: audioTrack.id/displayName, track trùng, bỏ microformat.title. (0 = V9.4)
+V94_JA_INFER_STRICT = _v94_env("JA_INFER_STRICT", True)
+
+# V9.4.1: A/B số worker video nhỏ theo job ("6,11" → job lẻ 6, job chẵn 11) + mốc phát hiện gần nhất.
+_V94_AB_LOCK = threading.Lock()
+_V94_AB_COUNTER = [0]
+_V94_LAST_WAKE = {"lag_ms": None}
+
+
+def _v94_ab_arms():
+    try:
+        arms = [int(x) for x in str(V94_VIDEO_SMALL_WORKERS_AB or "").replace(";", ",").split(",") if x.strip()]
+        arms = [a for a in arms if a > 0]
+        return arms if len(arms) >= 2 else []
+    except Exception:
+        return []
+
+
+def _v94_ab_next() -> int:
+    with _V94_AB_LOCK:
+        n = _V94_AB_COUNTER[0]
+        _V94_AB_COUNTER[0] += 1
+        return n
+
 
 # Trạng thái job đang tải (keepalive nhường đường).
 _V94_ACTIVE_JOBS = [0]
@@ -689,13 +749,62 @@ def _pick_native_ja_audio(formats: list, data: dict):
             str(micro.get("ownerChannelName") or ""),
         ])
         single_logical_track = len(track_ids) <= 1
+        refuse = ""
         # V9.4 guard: player khai báo rõ defaultAudioLanguage KHÁC tiếng Nhật → không suy luận.
         if V94_JA_INFER_GUARD and default_lang and not _looks_japanese_lang(default_lang):
             explicit_non_ja = True
+            refuse = f"default_lang:{default_lang}"
+        kana_source = ""
+        asr_langs = []
+        if V94_JA_INFER_STRICT:
+            # V9.4.1 (đã kiểm chứng bằng probe): Innertube thường chỉ ghi ngôn ngữ trong audioTrack.id ("en.4")
+            # và displayName ("English original" / "英語（オリジナル）"), không có languageCode.
+            for f in audio_rows:
+                tr = f.get("audioTrack") or {}
+                tid = str(tr.get("id") or "").strip()
+                pref = tid.split(".", 1)[0].strip().lower() if tid else ""
+                if pref and not _looks_japanese_lang(pref):
+                    explicit_non_ja = True
+                    refuse = refuse or f"track_id:{pref}"
+                dn = str(tr.get("displayName") or "").strip()
+                if dn and not _looks_japanese_lang(dn.lower()):
+                    explicit_non_ja = True
+                    refuse = refuse or f"track_name:{dn[:24]}"
+            # Cùng itag (cùng isDrc) xuất hiện 2 lần = có >= 2 track logic dù thiếu metadata → không đoán.
+            keys = [(str(f.get("itag") or ""), bool(f.get("isDrc"))) for f in audio_rows]
+            if len(keys) != len(set(keys)):
+                single_logical_track = False
+                refuse = refuse or "duplicate_tracks"
+            # microformat.title có thể là dict {"simpleText": tiêu đề DỊCH theo hl=ja} → str() làm lọt kana.
+            for src_name, txt in (("title", details.get("title")), ("author", details.get("author")),
+                                  ("owner", micro.get("ownerChannelName"))):
+                if _has_japanese_kana(str(txt or "")):
+                    kana_source = src_name
+                    break
+            jp_text = " ".join(str(x or "") for x in (details.get("title"), details.get("author"),
+                                                       micro.get("ownerChannelName")))
+            try:
+                for tr_ in (((data.get("captions") or {}).get("playerCaptionsTracklistRenderer") or {})
+                            .get("captionTracks") or []):
+                    if str(tr_.get("kind") or "") == "asr":
+                        asr_langs.append(str(tr_.get("languageCode") or "?"))
+            except Exception:
+                pass
+        if not single_logical_track:
+            refuse = refuse or "multi_track"
         if single_logical_track and not explicit_non_ja and _has_japanese_kana(jp_text):
             audios = list(audio_rows)
             for f in audios:
                 f["_v85_inferred_single_ja"] = True
+                f["_v94_infer"] = {"kana_source": kana_source or "legacy", "asr_lang": ",".join(asr_langs) or "-",
+                                   "track_keys": len(audio_rows)}
+        elif not refuse:
+            refuse = "no_kana"
+        if not audios and refuse:
+            try:
+                data["_v94_ja_refuse"] = refuse
+            except Exception:
+                pass
 
     if not audios:
         return None
@@ -909,6 +1018,8 @@ def _fast_player_request_480(video_id: str, client_key: str):
             "audio_inferred_single_ja": bool((ja or {}).get("_v85_inferred_single_ja")) if ja else False,
             "audio_mime": str((ja or {}).get("mimeType") or "") if ja else "",
             "video_mime": str((v or {}).get("mimeType") or "") if v else "",
+            "audio_infer": (ja or {}).get("_v94_infer") if ja else None,
+            "audio_refuse_reason": "" if ja else str(data.get("_v94_ja_refuse") or ""),
             "duration_sec": _native_duration_sec(v, details),
             "source": f"NATIVE_{client_key.upper()}{suffix}",
             "resolver_ms": (time.perf_counter() - t_req) * 1000.0,
@@ -1249,6 +1360,10 @@ def _prewarm_fast_youtube_connection():
 def _fast_keepalive_worker():
     visitor_tick = 0
     while not _FAST_KEEPALIVE_STOP.is_set():
+        if (float(V94_FF_KEEPWARM_SEC or 0) > 0 and _v94_jobs_active() == 0 and FFMPEG_PATH
+                and _v94_ff_idle_s(FFMPEG_PATH) >= float(V94_FF_KEEPWARM_SEC)):
+            # V9.4.1 (mặc định tắt): giữ ffmpeg.exe "nóng" khi rảnh lâu.
+            _v94_ff_prewarm("KEEPWARM")
         if V94_KEEPALIVE_YIELD and _v94_jobs_active() > 0:
             # V9.4: đang có job tải → connection đã nóng sẵn nhờ chính job; không tranh băng thông.
             _FAST_KEEPALIVE_STOP.wait(2.0)
@@ -1547,27 +1662,77 @@ def ensure_dir(p):
 _V94_EXCEL_WRITE_LOCK = threading.Lock()
 
 
-def write_status_to_excel(excel_path: str, url_index: int, status_col_name: str, new_status: str, logger):
+def write_status_to_excel(excel_path: str, url_index: int, status_col_name: str, new_status: str, logger,
+                          expected_url: str = None, url_col_name: str = None, stats: dict = None) -> bool:
     """V9.4: tuần tự hoá load→sửa→save trong tiến trình. V9.3 cho 3–4 job ghi song song nên
-    2 job cùng load bản cũ → job save sau đè mất DONE của job trước (tái hiện ở test GUI 4 job)."""
+    2 job cùng load bản cũ → job save sau đè mất DONE của job trước (tái hiện ở test GUI 4 job).
+    V9.4.1: trả True/False; (tuỳ chọn) kiểm tra dòng đích vẫn chứa video id của job; os.replace nguyên tử."""
+    _t = time.perf_counter()
     with _V94_EXCEL_WRITE_LOCK:
-        return _write_status_to_excel_locked(excel_path, url_index, status_col_name, new_status, logger)
+        if isinstance(stats, dict):
+            stats["done_lock_wait_ms"] = round((time.perf_counter() - _t) * 1000.0, 1)
+        return _write_status_to_excel_locked(excel_path, url_index, status_col_name, new_status, logger,
+                                             expected_url=expected_url, url_col_name=url_col_name, stats=stats)
 
 
-def _write_status_to_excel_locked(excel_path: str, url_index: int, status_col_name: str, new_status: str, logger):
+_V94_YT_ID_IN_CELL = re.compile(
+    r"(?:youtube\.com/(?:shorts/|embed/|live/|watch\?(?:[^\s\"']*?&)?v=)|youtu\.be/)([A-Za-z0-9_-]{11})")
+_V94_VERIFY_SKIP_LOGGED = [False]
+
+
+def _v94_find_url_col(header, url_col_name):
+    try:
+        if url_col_name and url_col_name in header:
+            return header.index(url_col_name) + 1
+        for i, h in enumerate(header):
+            if str(h or "").strip().upper() == "URL":
+                return i + 1
+    except Exception:
+        pass
+    return None
+
+
+def _write_status_to_excel_locked(excel_path: str, url_index: int, status_col_name: str, new_status: str, logger,
+                                  expected_url: str = None, url_col_name: str = None, stats: dict = None) -> bool:
+    st = stats if isinstance(stats, dict) else {}
     try:
         if not load_workbook:
-            logger("⚠️ Thiếu 'openpyxl', không ghi STATUS được."); return
+            logger("⚠️ Thiếu 'openpyxl', không ghi STATUS được."); return False
+        _t = time.perf_counter()
         wb = load_workbook(excel_path)
+        st["done_load_ms"] = round((time.perf_counter() - _t) * 1000.0, 1)
         ws = wb.worksheets[0]
         header = [c.value for c in ws[1]]
         try:
             col_idx = header.index(status_col_name) + 1
         except ValueError:
-            logger(f"⚠️ Không thấy cột '{status_col_name}'."); return
+            logger(f"⚠️ Không thấy cột '{status_col_name}'."); return False
         row = url_index + 2
+        # V9.4.1: DONE chỉ vào dòng VẪN chứa đúng video id của job (scanner/người dùng có thể chèn, xoá,
+        # sắp xếp dòng trong ~3s job chạy → ghi theo vị trí sẽ đánh DONE nhầm một URL khác chưa có file).
+        if V94_STATUS_VERIFY_URL and expected_url:
+            vid = _extract_youtube_video_id(expected_url)
+            ucol = _v94_find_url_col(header, url_col_name)
+            if vid and ucol:
+                cell = str(ws.cell(row=row, column=ucol).value or "") if row <= ws.max_row else ""
+                if vid not in cell:
+                    if _V94_YT_ID_IN_CELL.search(cell) or row > ws.max_row:
+                        matches = [r for r in range(2, ws.max_row + 1)
+                                   if vid in str(ws.cell(row=r, column=ucol).value or "")]
+                        if len(matches) == 1:
+                            logger(f"    -> STATUS row moved {row}→{matches[0]} (dòng Excel đã đổi vị trí)")
+                            st["status_row_moved"] = f"{row}->{matches[0]}"
+                            row = matches[0]
+                        else:
+                            logger(f"    ⚠️ STATUS row mismatch: dòng {row} không còn chứa {vid} "
+                                   f"({len(matches)} dòng khớp) → KHÔNG ghi DONE")
+                            st["status_row_mismatch"] = len(matches)
+                            return False
+                    elif not _V94_VERIFY_SKIP_LOGGED[0]:
+                        _V94_VERIFY_SKIP_LOGGED[0] = True
+                        logger("    ℹ️ STATUS verify skipped: ô URL không chứa video id (công thức/ô trống) → ghi theo vị trí")
         if row > ws.max_row:
-            logger(f"⚠️ Dòng {row} ngoài phạm vi."); return
+            logger(f"⚠️ Dòng {row} ngoài phạm vi."); return False
         ws.cell(row=row, column=col_idx).value = new_status
         temp_path = excel_path + ".tmp"
         
@@ -1575,11 +1740,40 @@ def _write_status_to_excel_locked(excel_path: str, url_index: int, status_col_na
         QTimer.singleShot(0, loop.quit)
         loop.exec()
         
+        _t = time.perf_counter()
         wb.save(temp_path)
-        shutil.move(temp_path, excel_path)
+        st["done_save_ms"] = round((time.perf_counter() - _t) * 1000.0, 1)
+        _t = time.perf_counter()
+        if V94_EXCEL_ATOMIC_REPLACE:
+            # os.replace = đổi tên nguyên tử (MoveFileEx REPLACE_EXISTING). shutil.move trên Windows khi đích đã
+            # tồn tại sẽ COPY đè từng byte → người đọc khác (realtime/scanner/job khác) có thể thấy zip dở dang.
+            _done = False
+            _tries = 0
+            for _ in range(10):
+                try:
+                    os.replace(temp_path, excel_path)
+                    _done = True
+                    break
+                except OSError:
+                    _tries += 1
+                    time.sleep(0.03)
+            st["replace_retries"] = _tries
+            if not _done:
+                st["replace_fallback"] = True
+                shutil.move(temp_path, excel_path)
+        else:
+            shutil.move(temp_path, excel_path)
+        st["done_replace_ms"] = round((time.perf_counter() - _t) * 1000.0, 1)
+        try:
+            st["xlsx_bytes"] = os.path.getsize(excel_path)
+            st["n_sheets"] = len(wb.worksheets)
+        except OSError:
+            pass
         logger(f"    -> STATUS='{new_status}' @ dòng {row}")
+        return True
     except Exception as e:
         logger(f"❌ Lỗi ghi Excel: {e}")
+        return False
 
 # ================== REALTIME WAKE-UP FAST PATH ================== #
 # Scanner V34 ghi Excel xong mới append trigger_wakeup.txt. Downloader vẫn đọc
@@ -1619,10 +1813,12 @@ def _v94_wake_span(reason, sig):
             if _sg:
                 d = (now_ns - int(_sg[0])) / 1e6
                 lag = d if lag is None else min(lag, d)
+        _V94_LAST_WAKE["lag_ms"] = round(lag, 2) if lag is not None else None
         TELEM.span("-", "trigger_detected", reason=reason,
                    lag_ms=round(lag, 2) if lag is not None else None)
+        return _V94_LAST_WAKE["lag_ms"]
     except Exception:
-        pass
+        return None
 
 
 def _rt_wait_for_wakeup(stop_event, trigger_paths, excel_path, trigger_sig, excel_sig):
@@ -1758,19 +1954,28 @@ def read_excel_cell_value(excel_path: str, url_index: int, col_name: str, logger
         real_col_name = col_names[col_name.upper()]
         if url_index < 0 or url_index >= len(df): return ""
         return str(df.iloc[url_index][real_col_name]).strip()
-    except Exception:
+    except Exception as _e:
+        # V9.4.1: không còn im lặng — lỗi đọc (file đang bị ghi dở) làm đổi tên/đích MOVE; ghi span để đo.
+        TELEM.span("-", "excel_cell_read_error", column=str(col_name), error=type(_e).__name__)
         return ""
 
 
 def _ffprobe_duration_seconds(ffprobe_path: str, file_path: Path) -> float:
+    # V9.4.1: dùng đúng ffprobe_path được truyền (V9.3 bỏ qua tham số này), có timeout (V9.3 có thể treo
+    # vĩnh viễn và giữ 1 slot Max Threads). Cùng argv, cùng cờ console, cùng cách parse.
+    exe = ffprobe_path or FFPROBE_PATH
+    _to = float(V94_FFPROBE_TIMEOUT or 0)
     try:
-        r = subprocess.run([FFPROBE_PATH,"-v","error","-show_entries","format=duration",
+        r = subprocess.run([exe,"-v","error","-show_entries","format=duration",
                             "-of","default=nw=1:nk=1",str(file_path)],
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                           timeout=(_to if _to > 0 else None))
         val = (r.stdout or "").strip()
         return float(val) if val else 0.0
     except Exception:
         return 0.0
+    finally:
+        _v94_ff_mark_exit(exe)
 
 
 def _ffprobe_av_info(file_path: Path) -> dict:
@@ -1798,6 +2003,7 @@ def _ffprobe_av_info(file_path: Path) -> dict:
             timeout=20,
             creationflags=0x08000000 if os.name == "nt" else 0,
         )
+        _v94_ff_mark_exit(FFPROBE_PATH)
         data = json.loads(r.stdout or "{}")
         try:
             info["format_duration"] = float((data.get("format") or {}).get("duration") or 0.0)
@@ -1837,7 +2043,7 @@ def _even_dim(value: int, fallback: int) -> int:
 SHORT_MIN_TARGET_SEC = 60.20
 
 def prepend_tail_to_front_fast(main_video: Path, output_path: Path, duration: float, logger,
-                               target_sec: float = SHORT_MIN_TARGET_SEC) -> float:
+                               target_sec: float = SHORT_MIN_TARGET_SEC, stats: dict = None) -> float:
     """<60s: lấy đoạn CUỐI của chính video đưa lên ĐẦU, ưu tiên stream-copy."""
     t0 = time.perf_counter()
     try:
@@ -1893,6 +2099,7 @@ def prepend_tail_to_front_fast(main_video: Path, output_path: Path, duration: fl
             cmd += ["-movflags", "+faststart"]
         cmd.append(str(output_path))
 
+        _t_pp = time.perf_counter()
         r = subprocess.run(
             cmd,
             stdout=subprocess.DEVNULL,
@@ -1902,13 +2109,19 @@ def prepend_tail_to_front_fast(main_video: Path, output_path: Path, duration: fl
             errors="replace",
             creationflags=create_no_window,
         )
+        _v94_ff_mark_exit(FFMPEG_PATH)
+        if isinstance(stats, dict):
+            stats["pp_prepend_ffmpeg_ms"] = round((time.perf_counter() - _t_pp) * 1000.0, 1)
         try:
             concat_list.unlink()
         except OSError:
             pass
 
         if r.returncode == 0 and output_path.is_file() and output_path.stat().st_size > 0:
+            _t_pp = time.perf_counter()
             out_info = _ffprobe_av_info(output_path)
+            if isinstance(stats, dict):
+                stats["pp_prepend_probe_ms"] = round((time.perf_counter() - _t_pp) * 1000.0, 1)
             out_vdur = out_info.get("video_duration") or out_info.get("format_duration") or 0.0
             if out_info.get("has_video") and out_info.get("has_audio") and out_vdur >= 60.0:
                 logger(
@@ -1977,6 +2190,7 @@ def prepend_tail_to_front_fast(main_video: Path, output_path: Path, duration: fl
                 errors="replace",
                 creationflags=create_no_window,
             )
+            _v94_ff_mark_exit(FFMPEG_PATH)
             if r2.returncode == 0 and output_path.is_file():
                 out_info = _ffprobe_av_info(output_path)
                 out_vdur = out_info.get("video_duration") or out_info.get("format_duration") or 0.0
@@ -2095,6 +2309,7 @@ def split_video_copy_parallel(input_path: Path, out_dir: Path, part_seconds: int
                     failures.append(idx + 1)
                 if done % 2 == 0 or done == len(cmds):
                     logger(f"    -> {done}/{len(cmds)}")
+        _v94_ff_mark_exit(FFMPEG_PATH)
 
         if failures:
             logger(f"❌ Cắt lỗi ở part: {failures}")
@@ -2284,13 +2499,18 @@ def _range_progress_end(path: Path):
         _RANGE_PROGRESS.pop(_range_progress_key(path), None)
 
 
-def _range_worker_count(total_bytes: int, media_kind: str = "video") -> int:
+def _range_worker_count(total_bytes: int, media_kind: str = "video", small_video_workers: int = 0) -> int:
     """V8.6 fan-out: avoid over-fanout on tiny Shorts; use measured 6/8-worker sweet spots."""
     # V9.4: ghi đè cố định cho thí nghiệm sweep (bench_v93.py --workers ...). 0 = heuristic V9.3.
     _ov = V94_RANGE_WORKERS_AUDIO if media_kind == "audio" else V94_RANGE_WORKERS_VIDEO
     if int(_ov or 0) > 0:
         return max(1, min(int(V94_RANGE_MAX_WORKERS), int(_ov)))
     mb = max(0.0, float(total_bytes or 0) / 1048576.0)
+    # V9.4.1: số worker riêng cho video <= 4MiB (A/B "6,11"); 0 = giữ heuristic cũ (6). Video lớn và audio
+    # không đổi. Lý do: luật "<=4MiB → 6" đo ở V8.6, TRƯỚC khi V9.1 dùng chung SSLContext (bỏ 30-100ms CPU
+    # mỗi kết nối TLS), nên kết luận "nhiều worker chậm hơn" có thể không còn đúng — phải A/B lại live.
+    if media_kind != "audio" and mb <= 4 and int(small_video_workers or 0) > 0:
+        return max(1, min(int(V94_RANGE_MAX_WORKERS), int(small_video_workers)))
     if media_kind == "audio":
         # V9.3: log 21:04 — audio 11.4MB/10 worker mất 3.12s (≈3Mbps/kết nối, GVS giới hạn
         # tốc độ mỗi kết nối audio) trong khi video 129MB xong ở 2.33s → audio thành nút cổ chai.
@@ -2458,7 +2678,8 @@ def _gvs_alt_url(url: str) -> str:
 
 
 class _RangeSeg:
-    __slots__ = ("pos", "end", "last_t", "retries", "taken", "t_start", "got", "h", "first", "gen")
+    __slots__ = ("pos", "end", "last_t", "retries", "taken", "t_start", "got", "h", "first", "gen",
+                 "kind", "hmode")
 
     def __init__(self, pos: int, end: int, retries: int = 0):
         self.pos = int(pos)
@@ -2471,6 +2692,8 @@ class _RangeSeg:
         self.h = 0          # 0 = host chính, 1 = replica mn phụ
         self.first = False  # thuộc đợt request đầu tiên (chưa biết host nào nhanh)
         self.gen = 0        # số lần đoạn này đã bị giành lại (backoff chống livelock)
+        self.kind = "first" # V9.4.1 telemetry: first/split/takeover/retry/ext (engine V9.3 bỏ qua)
+        self.hmode = ""     # V9.4.1 telemetry: ""/race/hedge
 
     def eta(self, now: float) -> float:
         rem = self.end - self.pos + 1
@@ -2999,8 +3222,10 @@ def _v94_parse_content_range(resp):
     return None
 
 
-def _v94_range_request(pool, url: str, start: int, end: int, read_timeout: float, follow: bool):
-    """Như _range_request V9.3 nhưng lỗi mang status + total (416) + Retry-After (429)."""
+def _v94_range_request(pool, url: str, start: int, end: int, read_timeout: float, follow: bool,
+                       trace: dict = None):
+    """Như _range_request V9.3 nhưng lỗi mang status + total (416) + Retry-After (429).
+    V9.4.1: trace (tuỳ chọn) nhận t_30x (thời điểm nhận redirect đầu tiên) để tách RTT redirect / edge."""
     current = str(url)
     for hop in range(DIRECT_MAX_REDIRECTS + 1):
         resp = pool.request(
@@ -3017,6 +3242,8 @@ def _v94_range_request(pool, url: str, start: int, end: int, read_timeout: float
         )
         status = int(getattr(resp, "status", 0) or 0)
         if follow and status in (301, 302, 303, 307, 308):
+            if isinstance(trace, dict) and "t_30x" not in trace:
+                trace["t_30x"] = time.perf_counter()
             loc = str((getattr(resp, "headers", {}) or {}).get("Location") or "").strip()
             _range_close_resp(resp, drain=True)
             if not loc or hop >= DIRECT_MAX_REDIRECTS:
@@ -3038,6 +3265,33 @@ def _v94_range_request(pool, url: str, start: int, end: int, read_timeout: float
             raise V94RangeHTTPError(status, cr_total, retry_after)
         return resp, current, hop
     raise OSError("too_many_redirects")
+
+
+def _v94_alt_err_definitive(e) -> bool:
+    """Lỗi CHẮC CHẮN replica mn không dùng được: 401/403/404/410/429, bị từ chối kết nối, DNS hỏng.
+    Timeout đọc/kết nối hay lỗi giao thức chỉ là 'chậm/đứt', không đủ để cấm replica 10 phút."""
+    try:
+        if isinstance(e, V94RangeHTTPError):
+            return int(e.status) in (401, 403, 404, 410, 429)
+        if urllib3 is not None:
+            exc = urllib3.exceptions
+            nce = getattr(exc, "NewConnectionError", None)
+            nre = getattr(exc, "NameResolutionError", None)
+            # NewConnectionError là lớp con của ConnectTimeoutError → phải xét trước; nhưng timeout kết nối
+            # thuần (không phải từ chối/DNS) vẫn coi là không chắc chắn.
+            if nre is not None and isinstance(e, nre):
+                return True
+            if nce is not None and isinstance(e, nce):
+                txt = str(e).lower()
+                return not ("timed out" in txt or "timeout" in txt)
+            mre = getattr(exc, "MaxRetryError", None)
+            if mre is not None and isinstance(e, mre):
+                return _v94_alt_err_definitive(getattr(e, "reason", None))
+        if isinstance(e, ConnectionRefusedError):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _v94_pool_new_conns(pool) -> int:
@@ -3083,8 +3337,10 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
     conns0 = _v94_pool_new_conns(pool)
     read_timeout = 1.5 if is_audio else 3.0
     min_part_bytes = RANGE_AUDIO_MIN_PART_BYTES if is_audio else RANGE_MIN_PART_BYTES
+    # V9.4.1: số worker riêng cho video <= 4MiB (A/B theo job qua info["small_video_workers"]).
+    svw = 0 if is_audio else int(info.get("small_video_workers") or V94_VIDEO_SMALL_WORKERS or 0)
     if size_known:
-        workers = _range_worker_count(total0, media_kind)
+        workers = _range_worker_count(total0, media_kind, svw)
         workers = max(1, min(workers, max(1, total0 // min_part_bytes)))
     else:
         # Size chưa biết: chia khoảng đoán [0, guess) cho vài request song song ngay t=0 (đoạn vượt
@@ -3102,6 +3358,7 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
         s_ = e_ + 1
     workers = len(segs)
 
+    _t_pa = time.perf_counter()
     try:
         fh = open(temp_file, "w+b")
         fh.truncate(total0)
@@ -3109,6 +3366,7 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
         logger(f"    [RANGE-TURBO] ⚠️ create file: {e}")
         info["fail_reason"] = "create_file"
         return False
+    prealloc_ms = round((time.perf_counter() - _t_pa) * 1000.0, 2)   # Windows: _chsize ghi 0 trước GET đầu
 
     lock = threading.Lock()
     pending = list(segs)
@@ -3119,8 +3377,15 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
              "ttfb_ema": None, "alt": "", "alt_ok": None, "host_ttfb": [None, None],
              "host_req": [0, 0], "hedges": 0, "alt_wins": 0, "hedging": 0, "races": 0,
              "resized": None, "status": {}, "lock_wait_ns": 0, "writes": 0, "workers_live": 0,
-             "workers_peak": 0, "first_byte": None, "bad_cr": 0}
-    race_max = int(V94_FIRST_WAVE_RACE_MAX)
+             "workers_peak": 0, "first_byte": None, "bad_cr": 0,
+             # V9.4.1 telemetry
+             "splits": 0, "takeovers": 0, "losers": [], "loser_pending": 0, "inflight": 0, "conc_peak": 0,
+             "conn_ids": set(), "req_seq": 0, "late_ttfb": [], "body_rates": [], "bans": 0}
+    # V9.4.1: file nhỏ (<= V94_RACE_ALL_IF_WORKERS_LE segment đợt đầu) race TẤT CẢ như V9.3; file lớn giữ trần.
+    # Log live: video 6 worker chỉ race 4 → 2 segment còn lại phải chờ host chính + 302 (+~150ms trong mock).
+    _rm = int(V94_FIRST_WAVE_RACE_MAX)
+    _le = int(V94_RACE_ALL_IF_WORKERS_LE or 0)
+    race_max = -1 if (_rm != 0 and _le > 0 and workers <= _le) else _rm
     if (RANGE_MN_RACE and (workers >= 4 or not size_known) and time.time() >= _MN_RACE_BAD_UNTIL[0]):
         state["alt"] = _gvs_alt_url(url)
     finished = threading.Event()
@@ -3168,7 +3433,7 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
         if rt > old:
             fh.truncate(rt)
             ext = rt - old
-            target = _range_worker_count(rt, media_kind)
+            target = _range_worker_count(rt, media_kind, svw)
             target = max(1, min(target, max(1, rt // min_part_bytes), max_workers_cap))
             n_new = max(1, min(target, ext // min_part_bytes or 1))
             step = (ext + n_new - 1) // n_new
@@ -3178,6 +3443,7 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
                 q = min(rt - 1, p + step - 1)
                 ns = _RangeSeg(p, q)
                 ns.first = state["host_ttfb"][0] is None
+                ns.kind = "ext"
                 ext_segs.append(ns)
                 p = q + 1
             # Phần nới thêm lên ĐẦU hàng đợi + worker MỚI cho riêng nó ngay lúc này, không chờ worker
@@ -3228,9 +3494,11 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
                 mid = best.pos + keep
                 new = _RangeSeg(mid, best.end)
                 new.h = _pick_host_locked(initial=False)
+                new.kind = "split"
                 best.end = mid - 1
                 active.add(new)
                 state["steals"] += 1
+                state["splits"] += 1
                 return new
             for x in sorted(active, key=lambda y: -y.eta(now)):
                 if x.pos > x.end or x.taken:
@@ -3247,15 +3515,53 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
                     new = _RangeSeg(x.pos, x.end)
                     new.h = _pick_host_locked(initial=False)
                     new.gen = x.gen + 1
+                    new.kind = "takeover"
                     x.taken = True
                     x.end = x.pos - 1
                     active.add(new)
                     state["steals"] += 1
+                    state["takeovers"] += 1
                     return new
             return None
 
-    def _req(u, start, end):
-        return _v94_range_request(pool, u, start, end, read_timeout, True)
+    def _req(u, start, end, trace=None):
+        with lock:
+            state["inflight"] += 1
+            state["conc_peak"] = max(state["conc_peak"], state["inflight"] + len(open_resps))
+        try:
+            return _v94_range_request(pool, u, start, end, read_timeout, True, trace=trace)
+        finally:
+            with lock:
+                state["inflight"] -= 1
+
+    def _arm_ban_locked(reason, after_end):
+        """Cấm replica mn toàn tiến trình 10 phút — luôn có log + span (V9.3 im lặng)."""
+        if state["alt_ok"] is not True:
+            state["alt_ok"] = False
+        if _MN_RACE_BAD_UNTIL[0] > time.time() + 590.0:
+            return
+        _MN_RACE_BAD_UNTIL[0] = time.time() + 600.0
+        state["bans"] += 1
+        try:
+            logger(f"    [RANGE-TURBO] ⛔ mn-race OFF 600s | reason={reason} kind={media_kind} after_end={after_end}")
+        except Exception:
+            pass
+        TELEM.span(job, "mn_race_ban", reason=str(reason), kind=media_kind, after_end=bool(after_end))
+
+    def _alt_failed_locked(e, during_race_wait):
+        """Replica mn lỗi. Luật cũ (V94_ALT_BAN_STRICT=0): mọi lỗi → cấm 10 phút. Luật mới: chỉ lỗi chắc chắn
+        mới cấm; lỗi chậm/timeout chỉ tắt alt trong job đang chạy, và không làm gì nếu job đã xong."""
+        after_end = finished.is_set()
+        reason = (f"HTTP_{e.status}" if isinstance(e, V94RangeHTTPError) else type(e).__name__)
+        if not V94_ALT_BAN_STRICT:
+            if state["alt_ok"] is not True:
+                _arm_ban_locked(reason, after_end)
+            return
+        if _v94_alt_err_definitive(e):
+            if state["alt_ok"] is not True:
+                _arm_ban_locked(reason, after_end)
+        elif not after_end and state["alt_ok"] is not True:
+            state["alt_ok"] = False
 
     def _open_hedged(seg: _RangeSeg, start: int, end: int):
         with lock:
@@ -3271,21 +3577,25 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
             if race_now:
                 state["races"] += 1
                 delay = 0.0
+                seg.hmode = "race"
             state["host_req"][first_h] += 1
             if state["host_req"][0] + state["host_req"][1] == 1:
+                info["first_get_ns"] = time.perf_counter_ns()
                 TELEM.span(job, "gvs_request_begin", kind=media_kind, workers=workers,
-                           size_known=size_known, expected=int(expected_bytes or 0))
+                           size_known=size_known, expected=int(expected_bytes or 0), race_max=race_max)
         other_h = 1 - first_h
+        traces = {first_h: {}}
         if not urls[other_h]:
-            resp, got_url, hops = _req(urls[first_h], start, end)
+            resp, got_url, hops = _req(urls[first_h], start, end, traces[first_h])
             seg.h = first_h
-            return resp, got_url, hops, urls[first_h]
-        f_first = _HEDGE_EXEC.submit(_req, urls[first_h], start, end)
+            return resp, got_url, hops, urls[first_h], traces[first_h]
+        t_sub = time.perf_counter()
+        f_first = _HEDGE_EXEC.submit(_req, urls[first_h], start, end, traces[first_h])
         futs = {f_first: first_h}
         done, _ = wait([f_first], timeout=delay) if delay > 0 else (set(), None)
         if done and f_first.exception() is None:
             seg.h = first_h
-            return (*f_first.result(), urls[first_h])
+            return (*f_first.result(), urls[first_h], traces[first_h])
 
         def _try_budget():
             if race_now:
@@ -3308,10 +3618,13 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
         while not _try_budget():
             if f_first.done() or finished.is_set() or state["alt_ok"] is False:
                 seg.h = first_h
-                return (*f_first.result(), urls[first_h])
+                return (*f_first.result(), urls[first_h], traces[first_h])
             wait([f_first], timeout=0.05)
+        if not race_now:
+            seg.hmode = "hedge"
         try:
-            futs[_HEDGE_EXEC.submit(_req, urls[other_h], start, end)] = other_h
+            traces[other_h] = {}
+            futs[_HEDGE_EXEC.submit(_req, urls[other_h], start, end, traces[other_h])] = other_h
             pending_f = set(futs)
             winner = None
             errors = {}
@@ -3330,20 +3643,23 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
                 state["hedging"] -= 1
 
         def _loser_done(ff, lh):
-            if ff.exception() is None:
+            e = ff.exception()
+            if e is None:
                 _range_close_resp(ff.result()[0], drain=False)
-            elif lh == 1:
-                with lock:
-                    if state["alt_ok"] is not True:
-                        state["alt_ok"] = False
-                        _MN_RACE_BAD_UNTIL[0] = time.time() + 600.0
+            with lock:
+                state["loser_pending"] -= 1
+                state["losers"].append(("alt" if lh == 1 else "main",
+                                        round((time.perf_counter() - t_sub) * 1000.0, 1),
+                                        "ok" if e is None else f"err:{type(e).__name__}"))
+                if e is not None and lh == 1:
+                    _alt_failed_locked(e, during_race_wait=False)
+        with lock:
+            state["loser_pending"] += len(pending_f)
         for f in pending_f:
             f.add_done_callback(lambda ff, lh=futs[f]: _loser_done(ff, lh))
         if 1 in errors:
             with lock:
-                if state["alt_ok"] is not True:
-                    state["alt_ok"] = False
-                    _MN_RACE_BAD_UNTIL[0] = time.time() + 600.0
+                _alt_failed_locked(errors[1], during_race_wait=True)
         if winner is None:
             raise errors.get(0) or errors.get(1) or OSError("hedge_no_winner")
         h = futs[winner]
@@ -3352,7 +3668,7 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
             with lock:
                 state["alt_wins"] += 1
         resp, got_url, hops = winner.result()
-        return resp, got_url, hops, urls[h]
+        return resp, got_url, hops, urls[h], traces.get(h) or {}
 
     def _validate_header_locked(resp, start, req_end):
         """Content-Range phải đúng byte đã xin. Trả None nếu ok, chuỗi lỗi nếu sai."""
@@ -3383,15 +3699,26 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
 
     def _run_seg(seg: _RangeSeg):
         resp = None
+        _rq = {"t_issue": seg.t_start, "t_hdr": None, "trace": {}, "outcome": "done", "reused": None,
+               "start": seg.pos, "req_end": seg.end}
         try:
             with lock:
                 start, end = seg.pos, seg.end
             if start > end:
+                _rq["outcome"] = "empty"
                 return
             req_end = end
-            resp, got_url, hops, cur_url = _open_hedged(seg, start, end)
+            _rq["start"], _rq["req_end"] = start, req_end
+            resp, got_url, hops, cur_url, _rq["trace"] = _open_hedged(seg, start, end)
+            _rq["t_hdr"] = time.perf_counter()
             with lock:
                 open_resps.add(resp)
+                try:
+                    _cid = id(getattr(resp, "connection", None) or resp)
+                    _rq["reused"] = _cid in state["conn_ids"]
+                    state["conn_ids"].add(_cid)
+                except Exception:
+                    pass
                 if state["closed"]:
                     raise OSError("closed_late")      # except-path đóng resp, không tính lỗi
                 _cnt_status_locked(206)
@@ -3445,9 +3772,19 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
             with lock:
                 clean = seg.pos == req_end + 1
                 open_resps.discard(resp)
+                if state["closed"] and seg.pos <= seg.end:
+                    _rq["outcome"] = "closed"
+                elif seg.taken:
+                    _rq["outcome"] = "taken"
+                elif seg.end < req_end:
+                    _rq["outcome"] = "victim"
             _range_close_resp(resp, drain=clean)
             resp = None
         except Exception as e:
+            _st_e = getattr(e, "status", None)
+            _rq["outcome"] = (f"error:HTTP_{_st_e}" if _st_e is not None else f"error:{type(e).__name__}")
+            if str(e) == "closed_late":
+                _rq["outcome"] = "closed"
             if resp is not None:
                 with lock:
                     open_resps.discard(resp)
@@ -3472,10 +3809,11 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
                 elif (seg.h == 1 and seg.got == 0 and seg.pos <= seg.end and not seg.taken
                         and not str(e).startswith(("bad_content_range", "inconsistent_total", "size_mismatch"))):
                     if state["alt_ok"] is not True:
-                        state["alt_ok"] = False
-                        _MN_RACE_BAD_UNTIL[0] = time.time() + 600.0
+                        # hành vi V9.3/V9.4 giữ nguyên (alt được chọn làm host chính cho đoạn này mà lỗi), có log
+                        _arm_ban_locked(f"in_job:{_rq['outcome']}", finished.is_set())
                     retry = _RangeSeg(seg.pos, seg.end, seg.retries)
                     retry.h = 0
+                    retry.kind = "retry"
                     seg.end = seg.pos - 1
                     pending.insert(0, retry)
                 elif seg.pos <= seg.end and not seg.taken:
@@ -3488,16 +3826,37 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
                         state["error"] = e
                     else:
                         retry = _RangeSeg(seg.pos, seg.end, seg.retries + 1)
+                        retry.kind = "retry"
                         seg.end = seg.pos - 1
                         pending.insert(0, retry)
                         state["retries"] += 1
                 elif str(e).startswith(("bad_content_range", "inconsistent_total", "size_mismatch")):
                     state["error"] = e
         finally:
+            _t_end = time.perf_counter()
             with lock:
                 active.discard(seg)
                 if state["error"] is not None or _all_done_locked():
                     finished.set()
+                if _rq["outcome"] != "empty":
+                    state["req_seq"] += 1
+                    _seq = state["req_seq"]
+                    _th = _rq["t_hdr"]
+                    if _th is not None:
+                        if seg.kind != "first":
+                            state["late_ttfb"].append(_th - _rq["t_issue"])
+                        if seg.got >= 128 * 1024 and _t_end > _th:
+                            state["body_rates"].append(seg.got * 8.0 / 1e6 / (_t_end - _th))
+            if _rq["outcome"] != "empty":
+                _t30 = (_rq["trace"] or {}).get("t_30x")
+                TELEM.span(job, "gvs_req", seq=_seq, kind=media_kind, req=seg.kind, mode=seg.hmode,
+                           host=("alt" if seg.h == 1 else "main"), start=int(_rq["start"]),
+                           len=int(_rq["req_end"]) - int(_rq["start"]) + 1,
+                           t_issue_ms=round((_rq["t_issue"] - t0) * 1000.0, 1),
+                           t_30x_ms=(round((_t30 - t0) * 1000.0, 1) if _t30 else None),
+                           t_hdr_ms=(round((_th - t0) * 1000.0, 1) if _th else None),
+                           t_end_ms=round((_t_end - t0) * 1000.0, 1), bytes=int(seg.got),
+                           end=_rq["outcome"], conn_reused=_rq["reused"])
 
     def _worker():
         try:
@@ -3567,17 +3926,36 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
         alt_info = ""
         if state["alt"]:
             _a, _b = state["host_ttfb"]
+            with lock:
+                _lo = list(state["losers"])
+                _lp = int(state["loser_pending"])
+            _lok = sum(1 for x in _lo if x[2] == "ok")
             alt_info = (f" | hedge={state['hedges']} race={state['races']} alt-win={state['alt_wins']}"
                         f" ({'OK' if state['alt_ok'] else ('FAIL' if state['alt_ok'] is False else '-')})"
                         f" main={(_a or 0):.2f}s/{state['host_req'][0]}req"
-                        f" alt={(_b or 0):.2f}s/{state['host_req'][1]}req")
+                        + (f" alt={_b:.2f}s/{state['host_req'][1]}req" if _b is not None
+                           else f" alt=n/a/{state['host_req'][1]}req")
+                        + f" alt_lost={_lok}/{len(_lo) - _lok}/{_lp}")
         rz = state["resized"]
+        # V9.4.1: số đo trung thực hơn (giữ nguyên mọi trường cũ ở trên, chỉ thêm phía sau)
+        _fb = state["first_byte"] or 0.0
+        _xfer = (total * 8.0 / 1e6 / max(1e-3, elapsed - _fb)) if _fb else 0.0
+        _br = sorted(state["body_rates"])
+        _lt = sorted(state["late_ttfb"])
+        _p = lambda arr, q: arr[min(len(arr) - 1, int(q * (len(arr) - 1) + 0.5))] if arr else None
+        _ltp50, _ltp90 = _p(_lt, 0.5), _p(_lt, 0.9)
+        extra = (f" | xfer≈{_xfer:.0f}Mbps"
+                 + (f" conn_p50≈{_p(_br, 0.5):.1f}Mbps" if _br else "")
+                 + (f" ttfb_late={_ltp50:.2f}/{_ltp90:.2f}s" if _lt else "")
+                 + f" hedge_real={state['hedges'] - state['races']} gets={state['host_req'][0] + state['host_req'][1]}"
+                 + f" conc_peak={state['conc_peak']} splits={state['splits']} takeovers={state['takeovers']}"
+                 + f" prealloc={prealloc_ms:.0f}ms" + (f" ab={svw}" if svw else ""))
         logger(
             f"    [RANGE-TURBO] ✅ HOÀN TẤT {media_kind.upper()} | {total/1048576:.2f}MB | "
             f"{elapsed:.3f}s | ≈{total*8.0/1e6/elapsed:.0f}Mbps | workers={workers}→{state['workers_peak']} | "
             f"steal={state['steals']} | retry={state['retries']} | ttfb={(state['ttfb'] or 0):.2f}s"
             + (f" | redirect=x{state['hops']}" if state['hops'] else "")
-            + (f" | resize {rz[0]}→{rz[1]} (giữ dữ liệu)" if rz else "") + alt_info
+            + (f" | resize {rz[0]}→{rz[1]} (giữ dữ liệu)" if rz else "") + alt_info + extra
         )
         ok = True
         return True
@@ -3619,7 +3997,21 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
             "lock_wait_ms": round(state["lock_wait_ns"] / 1e6, 3), "writes": state["writes"],
             "resized": list(state["resized"]) if state["resized"] else None,
             "new_conns": (_v94_pool_new_conns(pool) - conns0) if conns0 >= 0 else -1,
+            "new_conns_scope": "process",
             "fail_reason": fr, "retry_after": float(state.get("retry_after") or 0.0),
+            # V9.4.1
+            "prealloc_ms": prealloc_ms, "splits": state["splits"], "takeovers": state["takeovers"],
+            "hedge_real": state["hedges"] - state["races"], "conc_peak": state["conc_peak"],
+            "race_max": race_max, "small_video_workers": svw,
+            "losers_ok": sum(1 for x in state["losers"] if x[2] == "ok"),
+            "losers_err": sum(1 for x in state["losers"] if x[2] != "ok"),
+            "losers_pending": int(state["loser_pending"]), "mn_bans": state["bans"],
+            "xfer_mbps": (round(state["done"] * 8.0 / 1e6 / max(1e-3, elapsed_ms / 1000.0 - (state["first_byte"] or 0)), 1)
+                          if state["first_byte"] else None),
+            "conn_p50_mbps": (round(sorted(state["body_rates"])[len(state["body_rates"]) // 2], 2)
+                              if state["body_rates"] else None),
+            "ttfb_late_p50_ms": (round(sorted(state["late_ttfb"])[len(state["late_ttfb"]) // 2] * 1000.0, 1)
+                                 if state["late_ttfb"] else None),
         })
         TELEM.span(job, f"{media_kind}_download_complete", **{k: v for k, v in info.items()
                                                                 if k not in ("job", "cancel", "pool")})
@@ -3725,6 +4117,623 @@ def download_smart_audio(url: str, temp_dir: Path, filename: str, logger,
     return False
 
 
+# ================== V9.4.1 FFMPEG WARM-UP + MUX DIAGNOSTICS ================== #
+# Log live 17:09:51 (M1sbvQq1DAk): MUX COPY 0.602s trong khi ffmpeg concat + ffprobe ngay sau đó chỉ
+# 0.11s, và offline cùng lệnh ~110ms ⇒ phần dư nằm ở lần spawn ffmpeg.exe ĐẦU TIÊN sau một quãng rảnh
+# (nạp image/DLL, kiểm tra AV khi tạo process) hoặc AV quét file vừa ghi lúc mở. Hai việc:
+#  1) làm nóng: 1 lần remux THẬT trên mẫu tí hon nhúng sẵn (cùng demuxer/muxer với 135/139/244/251),
+#     chạy nền ngay khi media bắt đầu tải → mux thật (chạy sau ~1.5s) gặp ffmpeg đã nóng;
+#  2) đo tách pha để log live sau phân biệt được: spawn / mở input / copy / thoát / quét AV / GIL.
+_V94_FF_WARM_SAMPLES = {
+    # H.264 Main CABAC, DASH fMP4 (ftyp/moov/sidx/moof/mdat) 64x64 0.3s — như itag 135 (4040 B)
+    "v.mp4": (
+        "AAAAIGZ0eXBpc281AAACAGlzbzVpc282bXA0MWRhc2gAAALnbW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAAAAAAAQAAAQAA"
+        "AAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAA"
+        "Ael0cmFrAAAAXHRraGQAAAADAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAA"
+        "AAAAAAAAAAAAAABAAAAAAEAAAABAAAAAAAGFbWRpYQAAACBtZGhkAAAAAAAAAAAAAAAAAAA8AAAAAABVxAAAAAAALWhkbHIAAAAA"
+        "AAAAAHZpZGUAAAAAAAAAAAAAAABWaWRlb0hhbmRsZXIAAAABMG1pbmYAAAAUdm1oZAAAAAEAAAAAAAAAAAAAACRkaW5mAAAAHGRy"
+        "ZWYAAAAAAAAAAQAAAAx1cmwgAAAAAQAAAPBzdGJsAAAApHN0c2QAAAAAAAAAAQAAAJRhdmMxAAAAAAAAAAEAAAAAAAAAAAAAAAAA"
+        "AAAAAEAAQABIAAAASAAAAAAAAAABFUxhdmM2MC4zMS4xMDIgbGlieDI2NAAAAAAAAAAAAAAAGP//AAAALmF2Y0MBTUAK/+EAF2dN"
+        "QArsohNgIgAAAwACAAADAHgeJEssAQAEaO+PyAAAABBwYXNwAAAAAQAAAAEAAAAQc3R0cwAAAAAAAAAAAAAAEHN0c2MAAAAAAAAA"
+        "AAAAABRzdHN6AAAAAAAAAAAAAAAAAAAAEHN0Y28AAAAAAAAAAAAAAChtdmV4AAAAIHRyZXgAAAAAAAAAAQAAAAEAAAAAAAAAAAAA"
+        "AAAAAABidWR0YQAAAFptZXRhAAAAAAAAACFoZGxyAAAAAAAAAABtZGlyYXBwbAAAAAAAAAAAAAAAAC1pbHN0AAAAJal0b28AAAAd"
+        "ZGF0YQAAAAEAAAAATGF2ZjYwLjE2LjEwMAAAADRzaWR4AQAAAAAAAAEAADwAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAyNAAASAIAA"
+        "AAAAAACwbW9vZgAAABBtZmhkAAAAAAAAAAEAAACYdHJhZgAAABx0ZmhkAAIAOAAAAAEAAAIAAAAGwgEBAAAAAAAUdGZkdAEAAAAA"
+        "AAAAAAAAAAAAAGB0cnVuAAAKBQAAAAkAAAC4AgAAAAAABsIAAAQAAAAA6wAACAAAAAB3AAACAAAAAGcAAAIAAAABOAAACAAAAACV"
+        "AAACAAAAAHQAAAIAAAAAmAAABgAAAABxAAACAAAAC91tZGF0AAACqwYF//+n3EXpvebZSLeWLNgg2SPu73gyNjQgLSBjb3JlIDE2"
+        "NCByMzEwOCAzMWUxOWY5IC0gSC4yNjQvTVBFRy00IEFWQyBjb2RlYyAtIENvcHlsZWZ0IDIwMDMtMjAyMyAtIGh0dHA6Ly93d3cu"
+        "dmlkZW9sYW4ub3JnL3gyNjQuaHRtbCAtIG9wdGlvbnM6IGNhYmFjPTEgcmVmPTEgZGVibG9jaz0xOjA6MCBhbmFseXNlPTB4MTow"
+        "eDExMSBtZT1oZXggc3VibWU9MiBwc3k9MSBwc3lfcmQ9MS4wMDowLjAwIG1peGVkX3JlZj0wIG1lX3JhbmdlPTE2IGNocm9tYV9t"
+        "ZT0xIHRyZWxsaXM9MCA4eDhkY3Q9MCBjcW09MCBkZWFkem9uZT0yMSwxMSBmYXN0X3Bza2lwPTEgY2hyb21hX3FwX29mZnNldD0w"
+        "IHRocmVhZHM9MiBsb29rYWhlYWRfdGhyZWFkcz0xIHNsaWNlZF90aHJlYWRzPTAgbnI9MCBkZWNpbWF0ZT0xIGludGVybGFjZWQ9"
+        "MCBibHVyYXlfY29tcGF0PTAgY29uc3RyYWluZWRfaW50cmE9MCBiZnJhbWVzPTIgYl9weXJhbWlkPTIgYl9hZGFwdD0xIGJfYmlh"
+        "cz0wIGRpcmVjdD0xIHdlaWdodGI9MSBvcGVuX2dvcD0wIHdlaWdodHA9MSBrZXlpbnQ9MzAga2V5aW50X21pbj0zIHNjZW5lY3V0"
+        "PTQwIGludHJhX3JlZnJlc2g9MCByY19sb29rYWhlYWQ9MTAgcmM9Y3JmIG1idHJlZT0xIGNyZj0yMy4wIHFjb21wPTAuNjAgcXBt"
+        "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"
+    ),
+    # AAC-LC, DASH m4a (ftyp/moov/sidx/moof/mdat) 0.32s — như itag 139/140 (2149 B)
+    "a.m4a": (
+        "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"
+    ),
+    # VP9 profile 0 webm 64x64 0.3s — như itag 244 (4638 B)
+    "v.webm": (
+        "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"
+    ),
+    # Opus webm 0.31s — như itag 249-251 (1900 B)
+    "a.webm": (
+        "GkXfo59ChoEBQveBAULygQRC84EIQoKEd2VibUKHgQRChYECGFOAZwEAAAAAAAc8EU2bdLpNu4tTq4QVSalmU6yBoU27i1OrhBZU"
+        "rmtTrIHYTbuMU6uEElTDZ1OsggFCTbuMU6uEHFO7a1Osggcm7AEAAAAAAABZAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVSalmsirXsYMPQkBNgI1M"
+        "YXZmNjAuMTYuMTAwV0GNTGF2ZjYwLjE2LjEwMESJiEBzQAAAAAAAFlSua+WuAQAAAAAAAFzXgQFzxYhYHG229qxjzpyBACK1nIN1"
+        "bmSIgQCGhkFfT1BVU1aqg2MuoFa7hATEtACDgQLhkZ+BAbWIQOdwAAAAAABiZIEQY6KTT3B1c0hlYWQBATgBgLsAAAAAABJUw2f9"
+        "c3OgY8CAZ8iaRaOHRU5DT0RFUkSHjUxhdmY2MC4xNi4xMDBzc9djwItjxYhYHG229qxjzmfIokWjh0VOQ09ERVJEh5VMYXZjNjAu"
+        "MzEuMTAyIGxpYm9wdXNnyKFFo4hEVVJBVElPTkSHkzAwOjAwOjAwLjMwODAwMDAwMAAfQ7Z1RVzngQCj94EAAIB4gXvGEXb0dQAA"
+        "B47Kadu7zEjcFr2b01gneJO8N0Rezy2XAGmAEYAsAzirRWH9ibd+DRe/IKUrteorXtOnSNEY8gtcAU9foZYhrt7gUwDWZWU/H6bL"
+        "uXe/l2LBEs+Nwn39AID/+saItt4QuE/GI2vqh8kFo82BABWAeJ4eoef8lU1OqhgKyl0HZEQ0lEU+ZmbKRO0fDURr80/MpVVFQZ60"
+        "8/wTOGV57ZnwG3+9PJJz1e6P66t2MqX0oQw1vqu7YZm/vaPRgQApgHiZwl91nPxLOkWrWn59ezd8ArRKYfCJJ4fOUPvjwwTLr5lk"
+        "fBcaM43rrroZm9vh1xm1yKF51hyzaOUrJZgMXL1kCBG7FNC7CA35/9sFo9OBAD2AeJnCX3Mt0i3t13/Ecp7k6ydXoxbzs7YsA/xJ"
+        "GYN4ZJ1BTGoW/IDqE8YDSb+lGUaRRozGHj2G2W5XqJVVkDid8wOIcZCDb4CKlkW5ZMO2TaPVgQBRgHiZwl9zLdIxM797NIpxD3fV"
+        "1RvaeKRHu4yFU74h1l+fLro4+i0yvKHXzrAbCEQoIcuAQK/ECNyW/baVltrzrmwrBMQjuBJFUflfm7DGhu0IDKPTgQBlgHiZwl91"
+        "nPxLU0FJppVDIfB1HQjOF/iwzranzObdc3Jo2Ct6jBxC/G/c/T70U3Wi59geCBTwGJMAF0wPfb3/V/111OKgseWFwTRi5pRkz02j"
+        "1YEAeYB4mcJfcy3SLe9enoPkrmnTmaD1cKKob4dMwfv6RS2ZptWaNHXNnS7qIbtKbAPVBeZ33RDJSwD9mM+d9R+gTshm0sgm4oo0"
+        "OoQw9k6pCcgGnASj0IEAjYB4mcJfcy3SMzpFf7Ipz3GaynVpDtyJqsIvjQVHS8zKnVVWrKYKCmsJkaspIUlJ7zYRJM99VSj9qpbY"
+        "p0U0muIV7qxFCBG6jwNxCThMo9CBAKGAeJnCX3Mt0i3t138zgkRp6ed3D/g5Klq7SYKxfJ2jUbstFs0A1oTjlOC4xVgsDD90obxY"
+        "O3wPywbpFejN/su5qRGnSlrWATDtnLBvBaPSgQC1gGiZwl9zLdIxM7KdKzfs+hJPC/MUcxAuWe/o8rLysHAUZ1kP8j++XplnZtOr"
+        "hBl0Pib4zikUZuRazl+mHqHahhhxJkf7vFwY5t1CDsOkBKPOgQDJgGiZwl91nPxJC16hiikx2xa2O6yaMmXANYuh7gRvs1d/apCk"
+        "JBxKLdrzg0/AltqT42EHTvBQHPd/m6EL9ClVZS+aiVfPb6w+lDeNo9mBAN2AaJnCX3Mt0jFKL9A4a9UHHAsNvRKYJwCsZ80faz9N"
+        "+VNssEajPFGqk4PVeJJTL1/Bp94LHCzmAxM8jSQi4XvHsG73mbw7nirICLoJPZNj0OsiSINpRKPRgQDxgGiZwl91nPxLOk2XONiY"
+        "h6taNDdv3SBwDjrnebBxmkKZAphnfyV7vO8lwQj6+M+qd/G5roIAQ49w2OTmjs/BP0QV9e5rOj8U5Dluf94Fo82BAQWAaJnCX3Wc"
+        "/ElKN7B4DboalB+wJ3+nltEZfRLb+zbYyUoOXoGnjMqUw5BtoBp28nv5oSte3XnIMbW1f33XRHlF5dbOpeRBqRbljaPUgQEZgGiZ"
+        "wl9zKSBrCR2wkup1cKrGbbhN0fATC3+RZYjjGMoB76PhT0NWM0WoW+Mu32CfHLqixwGS9uHCc/EqL2bJsJS3wOucIa0r1jD/h0aI"
+        "QM8EoMmhwIEBLQBoBYqXOi7/6TuV53b92i+9R5Pp+lsyIDpxcVzeO50CeqsUdjHOIqJReHLbKnAqeNmkBctejkjRW1jyNtx1ooQA"
+        "zf5gHFO7a5G7j7OBALeK94EB8YIBxPCBAw=="
+    ),
+}
+
+_V94_FF_LOCK = threading.Lock()
+_V94_FF_STATE = {"last_exit": {}, "seq": 0, "prewarm_running": False, "prewarm_count": 0,
+                 "assets_dir": None, "assets_err": "", "err_logged": False, "baseline": {}, "mux_running": 0}
+_V94_FF_MARKS = (("in0", b"Input #0"), ("in1", b"Input #1"), ("out0", b"Output #0"),
+                 ("final", b"muxing overhead"))
+_V94_EPOCH_DIFF_100NS = 116444736000000000   # 1601-01-01 → 1970-01-01 (đơn vị 100ns)
+_V94_MUX_DIAG = {}                            # str(output_file) → dict đo pha của lần mux đó
+
+
+def _v94_ff_key(exe) -> str:
+    try:
+        b = os.path.basename(str(exe or "")).lower()
+        return b[:-4] if b.endswith(".exe") else b
+    except Exception:
+        return "?"
+
+
+def _v94_ff_mark_exit(exe):
+    """Ghi thời điểm 1 process ffmpeg/ffprobe vừa thoát (để biết đã 'rảnh' bao lâu)."""
+    try:
+        with _V94_FF_LOCK:
+            _V94_FF_STATE["last_exit"][_v94_ff_key(exe)] = time.perf_counter()
+    except Exception:
+        pass
+
+
+def _v94_ff_idle_s(exe) -> float:
+    """Số giây từ lần thoát gần nhất của exe này; -1 = chưa chạy lần nào trong phiên."""
+    with _V94_FF_LOCK:
+        t = _V94_FF_STATE["last_exit"].get(_v94_ff_key(exe))
+    return -1.0 if t is None else max(0.0, time.perf_counter() - t)
+
+
+def _v94_ff_next_seq() -> int:
+    with _V94_FF_LOCK:
+        _V94_FF_STATE["seq"] += 1
+        return _V94_FF_STATE["seq"]
+
+
+def _v94_preread(path, nbytes=65536) -> float:
+    """Mở + đọc 64KiB như ffmpeg sẽ làm. Nếu AV quét-khi-mở thì thời gian chờ nằm ở đây (và được đo)."""
+    t = time.perf_counter()
+    try:
+        with open(path, "rb") as fh:
+            fh.read(nbytes)
+    except OSError:
+        return -1.0
+    return round((time.perf_counter() - t) * 1000.0, 2)
+
+
+def _v94_win_proc_times(handle):
+    """Windows: thời điểm tạo/thoát process, CPU kernel+user, byte đọc/ghi (GetProcessTimes/IoCounters)."""
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    ft = [wintypes.FILETIME() for _ in range(4)]
+    if not k32.GetProcessTimes(wintypes.HANDLE(int(handle)), *[ctypes.byref(x) for x in ft]):
+        return None
+    v = [(x.dwHighDateTime << 32) | x.dwLowDateTime for x in ft]
+
+    class _IO(ctypes.Structure):
+        _fields_ = [(n, ctypes.c_ulonglong) for n in ("ro", "wo", "oo", "rb", "wb", "ob")]
+    io = _IO()
+    k32.GetProcessIoCounters(wintypes.HANDLE(int(handle)), ctypes.byref(io))
+    return {"create_ns": (v[0] - _V94_EPOCH_DIFF_100NS) * 100, "exit_ns": (v[1] - _V94_EPOCH_DIFF_100NS) * 100,
+            "cpu_ms": (v[2] + v[3]) / 1e4, "read_mb": io.rb / 1048576.0, "write_mb": io.wb / 1048576.0}
+
+
+def _v94_sys_busy_sample():
+    try:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+            i, k, u = wintypes.FILETIME(), wintypes.FILETIME(), wintypes.FILETIME()
+            ctypes.windll.kernel32.GetSystemTimes(ctypes.byref(i), ctypes.byref(k), ctypes.byref(u))
+            f = lambda x: (x.dwHighDateTime << 32) | x.dwLowDateTime
+            return f(i), f(k) + f(u)          # thời gian kernel trên Windows đã gồm idle
+        with open("/proc/stat") as fh:
+            p = [int(x) for x in fh.readline().split()[1:]]
+        return p[3] + p[4], sum(p)
+    except Exception:
+        return None
+
+
+class _V94GilProbe:
+    """Chỉ dùng khi V94_GIL_PROBE=1: đo độ trễ tối đa của 1 thread ngủ 5ms (GIL bị giữ) + thời gian GC gen2."""
+
+    def __init__(self):
+        self.max_late_ms = 0.0
+        self.gc_ms = 0.0
+        self._stop = threading.Event()
+        self._gc_t0 = None
+
+    def _gc_cb(self, phase, info):
+        try:
+            if info.get("generation") != 2:
+                return
+            if phase == "start":
+                self._gc_t0 = time.perf_counter()
+            elif self._gc_t0 is not None:
+                self.gc_ms += (time.perf_counter() - self._gc_t0) * 1000.0
+                self._gc_t0 = None
+        except Exception:
+            pass
+
+    def _loop(self):
+        while not self._stop.is_set():
+            t = time.perf_counter()
+            time.sleep(0.005)
+            late = (time.perf_counter() - t - 0.005) * 1000.0
+            if late > self.max_late_ms:
+                self.max_late_ms = late
+
+    def start(self):
+        import gc
+        gc.callbacks.append(self._gc_cb)
+        threading.Thread(target=self._loop, name="V94GilProbe", daemon=True).start()
+
+    def stop(self):
+        import gc
+        self._stop.set()
+        try:
+            gc.callbacks.remove(self._gc_cb)
+        except ValueError:
+            pass
+
+
+def _v94_ff_run(cmd, timeout=120.0, inputs=(), preread=False, marks=_V94_FF_MARKS, low_priority=False):
+    """Chạy ffmpeg/ffprobe y như subprocess.run(cmd, stdout=DEVNULL, stderr=PIPE, text=True,
+    encoding='utf-8', errors='replace', creationflags=CREATE_NO_WINDOW, timeout=...) — cùng lệnh, cùng
+    cờ, cùng text stderr — nhưng thêm dấu thời gian từng pha. Trả (CompletedProcess, diag dict)."""
+    exe = cmd[0]
+    d = {"seq": _v94_ff_next_seq(), "exe": _v94_ff_key(exe), "idle_s": round(_v94_ff_idle_s(exe), 1)}
+    if preread:
+        for k, pth in zip(("pre_v_ms", "pre_a_ms", "pre_x_ms"), inputs):
+            d[k] = _v94_preread(pth)
+    gp = None
+    if V94_GIL_PROBE:
+        try:
+            gp = _V94GilProbe()
+            gp.start()
+        except Exception:
+            gp = None
+    s0 = _v94_sys_busy_sample()
+    wall0_ns = time.time_ns()
+    t0 = time.perf_counter()
+    _cf = 0x08000000 if os.name == "nt" else 0
+    if low_priority and os.name == "nt":
+        _cf |= 0x00004000          # BELOW_NORMAL_PRIORITY_CLASS: làm nóng không tranh CPU với mux thật
+    p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, creationflags=_cf)
+    t_popen = time.perf_counter()
+    if low_priority and os.name != "nt":
+        try:
+            os.setpriority(os.PRIO_PROCESS, p.pid, 10)
+        except Exception:
+            pass
+    got = {}
+    chunks = []
+
+    def _reader():
+        try:
+            for raw in iter(p.stderr.readline, b""):
+                now = time.perf_counter()
+                chunks.append(raw)
+                for k, m in marks:
+                    if k not in got and m in raw:
+                        got[k] = now
+        except Exception:
+            pass
+        got["eof"] = time.perf_counter()
+
+    th = threading.Thread(target=_reader, name="V94FFStderr", daemon=True)
+    th.start()
+    # Chờ EOF của stderr (ffmpeg đóng stderr khi thoát) thay vì Popen.wait(timeout): trên POSIX wait(timeout)
+    # thăm dò bằng sleep tăng dần tới 50ms → cộng thêm ~35-45ms vào mux (đo bằng bench pipeline).
+    _deadline = time.perf_counter() + float(timeout)
+    th.join(max(0.0, float(timeout)))
+    try:
+        if th.is_alive():
+            raise subprocess.TimeoutExpired(cmd, timeout)
+        rc = p.wait(max(0.05, _deadline - time.perf_counter()))
+    except subprocess.TimeoutExpired:
+        try:
+            p.kill()
+        except Exception:
+            pass
+        p.wait()
+        th.join(2.0)
+        _v94_ff_mark_exit(exe)
+        if gp:
+            gp.stop()
+        raise
+    try:
+        p.stderr.close()
+    except Exception:
+        pass
+    t_end = time.perf_counter()
+    _v94_ff_mark_exit(exe)
+    if gp:
+        gp.stop()
+        d["gil_max_ms"] = round(gp.max_late_ms, 1)
+        d["gc2_ms"] = round(gp.gc_ms, 1)
+    s1 = _v94_sys_busy_sample()
+
+    def _ms(a, b):
+        return round((a - b) * 1000.0, 1) if (a is not None and b is not None) else None
+    d.update({"wall_ms": _ms(t_end, t0), "popen_ms": _ms(t_popen, t0),
+              "start_in0_ms": _ms(got.get("in0"), t0), "in0_in1_ms": _ms(got.get("in1"), got.get("in0")),
+              "in1_out0_ms": _ms(got.get("out0"), got.get("in1") or got.get("in0")),
+              "copy_ms": _ms(got.get("final"), got.get("out0")), "exit_ms": _ms(got.get("eof"), got.get("final"))})
+    if s0 and s1 and s1[1] > s0[1]:
+        d["sys_busy_pct"] = round(100.0 * (1.0 - (s1[0] - s0[0]) / float(s1[1] - s0[1])), 1)
+    if os.name == "nt":
+        try:
+            w = _v94_win_proc_times(p._handle)
+            if w:
+                d["create_lag_ms"] = round((w["create_ns"] - wall0_ns) / 1e6, 1)
+                d["life_ms"] = round((w["exit_ns"] - w["create_ns"]) / 1e6, 1)
+                d["cpu_ms"] = round(w["cpu_ms"], 1)
+                d["exit_to_ret_ms"] = round((wall0_ns + (t_end - t0) * 1e9 - w["exit_ns"]) / 1e6, 1)
+                d["read_mb"] = round(w["read_mb"], 2)
+                d["write_mb"] = round(w["write_mb"], 2)
+        except Exception:
+            pass
+    text = b"".join(chunks).decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
+    m = re.search(r"bench:\s*utime=([\d.]+)s\s+stime=([\d.]+)s\s+rtime=([\d.]+)s", text)
+    if m:
+        d["ff_rtime_ms"] = round(float(m.group(3)) * 1000.0, 1)
+    return subprocess.CompletedProcess(cmd, rc, None, text), d
+
+
+def _v94_fmt_ff_diag(d) -> str:
+    """Phần đuôi gắn vào dòng MUX COPY (giữ nguyên tiền tố 'MUX COPY 480P+JA: X.XXXs')."""
+    if not d:
+        return ""
+    keys = (("seq", "seq"), ("idle", "idle_s"), ("popen", "popen_ms"), ("→in0", "start_in0_ms"),
+            ("→in1", "in0_in1_ms"), ("→out", "in1_out0_ms"), ("copy", "copy_ms"), ("exit", "exit_ms"),
+            ("life", "life_ms"), ("cpu", "cpu_ms"), ("lag", "create_lag_ms"), ("ret", "exit_to_ret_ms"),
+            ("rtime", "ff_rtime_ms"), ("sys%", "sys_busy_pct"), ("gil", "gil_max_ms"), ("gc", "gc2_ms"))
+    parts = []
+    if d.get("pre_v_ms") is not None or d.get("pre_a_ms") is not None:
+        parts.append(f"pre={d.get('pre_v_ms')}/{d.get('pre_a_ms')}")
+    for lab, k in keys:
+        if d.get(k) is not None:
+            parts.append(f"{lab}={d.get(k)}")
+    return " | " + " ".join(parts)
+
+
+def _v94_ff_warm_assets():
+    """Ghi 4 mẫu tí hon (1 lần/tiến trình) vào %TEMP%\\v94_ffwarm — KHÔNG nằm trong _temp_yt480p."""
+    with _V94_FF_LOCK:
+        if _V94_FF_STATE["assets_dir"]:
+            return _V94_FF_STATE["assets_dir"]
+    try:
+        import base64
+        import tempfile
+        d = os.path.join(tempfile.gettempdir(), "v94_ffwarm")
+        os.makedirs(d, exist_ok=True)
+        for name, b64 in _V94_FF_WARM_SAMPLES.items():
+            raw = base64.b64decode(b64)
+            pth = os.path.join(d, name)
+            if not (os.path.isfile(pth) and os.path.getsize(pth) == len(raw)):
+                tmp = pth + f".{os.getpid()}.tmp"
+                with open(tmp, "wb") as fh:
+                    fh.write(raw)
+                os.replace(tmp, pth)
+        with _V94_FF_LOCK:
+            _V94_FF_STATE["assets_dir"] = d
+        return d
+    except Exception as e:
+        with _V94_FF_LOCK:
+            _V94_FF_STATE["assets_err"] = f"{type(e).__name__}: {e}"
+        return None
+
+
+def _v94_ff_prewarm(reason, job="-", logger=None):
+    """1 lần remux thật (2 output: H.264+AAC và VP9+Opus) + 1 ffprobe trên mẫu tí hon. Không bao giờ raise,
+    không chạm file của job; nếu đang có 1 prewarm khác chạy thì bỏ qua. Trả dict số đo hoặc None."""
+    if not FFMPEG_PATH:
+        return None
+    with _V94_FF_LOCK:
+        if _V94_FF_STATE["prewarm_running"]:
+            return None
+        _V94_FF_STATE["prewarm_running"] = True
+    res = {"reason": str(reason), "job": str(job)}
+    try:
+        res["idle_s"] = round(_v94_ff_idle_s(FFMPEG_PATH), 1)
+        d = _v94_ff_warm_assets()
+        w1 = None
+        if d:
+            v, a, vw, aw = [os.path.join(d, n) for n in ("v.mp4", "a.m4a", "v.webm", "a.webm")]
+            w1 = os.path.join(d, f"w1_{os.getpid()}.mp4")
+            w2 = os.path.join(d, f"w2_{os.getpid()}.mp4")
+            cmd = [FFMPEG_PATH, "-y", "-loglevel", "info", "-nostats", "-hide_banner",
+                   "-i", v, "-i", a, "-i", vw, "-i", aw,
+                   "-map", "0:v:0", "-map", "1:a:0", "-c", "copy", "-shortest", w1,
+                   "-map", "2:v:0", "-map", "3:a:0", "-c", "copy", "-shortest", w2]
+        else:
+            cmd = [FFMPEG_PATH, "-hide_banner", "-version"]
+        t = time.perf_counter()
+        _low = str(reason).upper().startswith(("JOB", "KEEP"))   # START chạy ưu tiên thường để đo baseline
+        r, dg = _v94_ff_run(cmd, timeout=10.0, low_priority=_low)
+        res["ffmpeg_ms"] = round((time.perf_counter() - t) * 1000.0, 1)
+        res["ffmpeg_rc"] = r.returncode
+        res["ffmpeg_popen_ms"] = dg.get("popen_ms")
+        res["ffmpeg_life_ms"] = dg.get("life_ms")
+        with _V94_FF_LOCK:
+            _mux_busy = _V94_FF_STATE["mux_running"] > 0
+        if FFPROBE_PATH and _low and _mux_busy:
+            res["ffprobe_ms"] = "skip(mux)"        # mux thật đã bắt đầu → không tranh tài nguyên với nó
+        elif FFPROBE_PATH:
+            if w1 and os.path.isfile(w1):
+                pcmd = [FFPROBE_PATH, "-v", "error", "-show_entries", "format=duration",
+                        "-of", "default=nw=1:nk=1", w1]
+            else:
+                pcmd = [FFPROBE_PATH, "-hide_banner", "-version"]
+            t = time.perf_counter()
+            r2, dg2 = _v94_ff_run(pcmd, timeout=10.0, marks=(), low_priority=_low)
+            res["ffprobe_ms"] = round((time.perf_counter() - t) * 1000.0, 1)
+            res["ffprobe_rc"] = r2.returncode
+        with _V94_FF_LOCK:
+            _V94_FF_STATE["prewarm_count"] += 1
+        if logger:
+            logger(f"    🔥 FF PREWARM [{job}] ffmpeg={res.get('ffmpeg_ms')}ms ffprobe={res.get('ffprobe_ms', '-')}ms "
+                   f"idle={res['idle_s']}s ({reason})" + ("" if r.returncode == 0 else f" rc={r.returncode}"))
+        TELEM.span(job, "ff_prewarm", **res)
+        return res
+    except Exception as e:
+        res["error"] = f"{type(e).__name__}: {e}"
+        log_it = False
+        with _V94_FF_LOCK:
+            if not _V94_FF_STATE["err_logged"]:
+                _V94_FF_STATE["err_logged"] = True
+                log_it = True
+        if logger and log_it:
+            logger(f"    ⚠️ FF PREWARM lỗi (bỏ qua, không ảnh hưởng job): {res['error'][:160]}")
+        TELEM.span(job, "ff_prewarm", **res)
+        return res
+    finally:
+        with _V94_FF_LOCK:
+            _V94_FF_STATE["prewarm_running"] = False
+
+
+def _v94_drive_info(path) -> str:
+    """Loại ổ (FIXED/REMOVABLE/REMOTE/...) + cờ OneDrive cho 1 thư mục; chỉ để log chẩn đoán."""
+    try:
+        p = os.path.abspath(str(path))
+        kind = "?"
+        if os.name == "nt":
+            import ctypes
+            root = os.path.splitdrive(p)[0] + "\\"
+            kind = {0: "UNKNOWN", 1: "NOROOT", 2: "REMOVABLE", 3: "FIXED", 4: "REMOTE", 5: "CDROM",
+                    6: "RAMDISK"}.get(int(ctypes.windll.kernel32.GetDriveTypeW(root)), "?")
+        od = [os.environ.get(k) for k in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial")]
+        under_od = any(x and os.path.normcase(p).startswith(os.path.normcase(os.path.abspath(x))) for x in od)
+        return kind + ("+OneDrive" if under_od else "")
+    except Exception:
+        return "?"
+
+
+def _v94_exe_info(exe) -> str:
+    try:
+        st = os.stat(exe)
+        s = f"{os.path.basename(exe)} {st.st_size/1048576:.0f}MB"
+        attrs = getattr(st, "st_file_attributes", 0) or 0
+        if attrs & 0x400000:
+            s += " RECALL_ON_DATA_ACCESS"     # file OneDrive "online-only": mỗi lần chạy có thể phải tải về
+        if attrs & 0x1000:
+            s += " OFFLINE"
+        return s
+    except Exception:
+        return f"{os.path.basename(str(exe or '?'))} ?"
+
+
+def _v94_start_baseline(logger, out_dir=None, temp_dir=None):
+    """Chạy nền lúc bấm START: import bảng client Innertube, làm nóng ffmpeg 2 lần (lần 1 = chi phí nguội,
+    lần 2 = nóng), rồi in 1 dòng FF BASELINE để log live sau có mốc so sánh."""
+    parts = []
+    try:
+        if V94_PREWARM_INNERTUBE:
+            t = time.perf_counter()
+            _get_innertube_client("visionos")
+            _get_innertube_client("web_embedded")
+            parts.append(f"innertube_import={(time.perf_counter()-t)*1000:.0f}ms")
+    except Exception:
+        pass
+    if not (V94_FF_WARMUP_START and FFMPEG_PATH):
+        if parts and logger:
+            logger("🔥 FF BASELINE | " + " | ".join(parts))
+        return
+    try:
+        r1 = _v94_ff_prewarm("START#1") or {}
+        r2 = _v94_ff_prewarm("START#2") or {}
+        ver = "?"
+        try:
+            rv = subprocess.run([FFMPEG_PATH, "-hide_banner", "-version"], stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
+                                timeout=10, creationflags=0x08000000 if os.name == "nt" else 0)
+            _v94_ff_mark_exit(FFMPEG_PATH)
+            ver = ((rv.stdout or "").strip().splitlines() or ["?"])[0].split(" Copyright")[0][:60]
+        except Exception:
+            pass
+        with _V94_FF_LOCK:
+            _V94_FF_STATE["baseline"] = {"cold": r1, "warm": r2, "version": ver}
+        parts += [
+            f"{ver}",
+            f"cold ffmpeg={r1.get('ffmpeg_ms', '-')}ms ffprobe={r1.get('ffprobe_ms', '-')}ms",
+            f"warm ffmpeg={r2.get('ffmpeg_ms', '-')}ms ffprobe={r2.get('ffprobe_ms', '-')}ms",
+            f"exe: {_v94_exe_info(FFMPEG_PATH)}, {_v94_exe_info(FFPROBE_PATH) if FFPROBE_PATH else 'ffprobe ?'}",
+            f"ổ: ffmpeg={_v94_drive_info(os.path.dirname(FFMPEG_PATH))}"
+            + (f" temp={_v94_drive_info(temp_dir)}" if temp_dir else "")
+            + (f" out={_v94_drive_info(out_dir)}" if out_dir else ""),
+        ]
+        if r1.get("error") or r2.get("error"):
+            parts.append(f"lỗi={str(r1.get('error') or r2.get('error'))[:80]}")
+        if logger:
+            logger("🔥 FF BASELINE | " + " | ".join(parts))
+        TELEM.span("-", "ff_baseline", cold=r1, warm=r2, version=ver,
+                   ffmpeg_drive=_v94_drive_info(os.path.dirname(FFMPEG_PATH)))
+    except Exception as e:
+        if logger:
+            logger(f"⚠️ FF BASELINE lỗi (bỏ qua): {type(e).__name__}: {e}")
+
+
 _V94_MUX_INFO = {}
 
 
@@ -3753,9 +4762,46 @@ def _v94_parse_mux_log(text: str) -> dict:
             info["video_duration"] = durs[0]
             info["audio_duration"] = durs[1] if len(durs) > 1 else 0.0
             info["format_duration"] = min(x for x in durs[:2] if x > 0) if any(x > 0 for x in durs[:2]) else 0.0
+        # V9.4.1: các dòng "Duration:" là của INPUT (header) — file input bị cắt cụt vẫn khai đủ thời lượng.
+        # Sự thật về OUTPUT nằm ở báo cáo cuối của ffmpeg (có cả khi -nostats): "time=" cuối cùng và
+        # "video:NkB audio:NkB" (ffmpeg >= 7 in KiB). Kèm đếm dòng báo lỗi đọc input.
+        t = re.findall(r"time=\s*(-?\d+):(\d+):([\d.]+)", text)
+        if t:
+            h, mnt, sec = t[-1]
+            info["out_time"] = int(h) * 3600 + int(mnt) * 60 + float(sec)
+        k = re.findall(r"video:\s*(\d+)\s*(?:kB|KiB)\s+audio:\s*(\d+)\s*(?:kB|KiB)", text)
+        if k:
+            info["out_video_kb"], info["out_audio_kb"] = int(k[-1][0]), int(k[-1][1])
+        info["bad_lines"] = sum(1 for ln in text.splitlines()
+                                if ("Invalid NAL" in ln or "partial file" in ln
+                                    or "error while decoding" in ln.lower() or "corrupt" in ln.lower()))
     except Exception:
         pass
     return info
+
+
+def _v94_strict_mux_check(info: dict):
+    """(ok, reason) cho file OUTPUT của mux dựa trên báo cáo cuối của ffmpeg. Thiếu dữ liệu → (None, lý do)
+    để caller rơi về ffprobe. Dung sai cho -shortest: max(0.3s, 1% của input ngắn nhất)."""
+    try:
+        ins = [x for x in (info.get("video_duration"), info.get("audio_duration")) if x and x > 0]
+        if not ins:
+            return None, "no_input_duration"
+        min_in = min(ins)
+        tol = max(0.3, 0.01 * min_in)
+        if info.get("out_time") is None:
+            return None, "no_out_time"
+        if info.get("out_video_kb") is None or info.get("out_audio_kb") is None:
+            return None, "no_stream_sizes"
+        if int(info.get("bad_lines") or 0) > 0:
+            return False, f"bad_lines={info.get('bad_lines')}"
+        if not (int(info["out_video_kb"]) > 0 and int(info["out_audio_kb"]) > 0):
+            return False, f"empty_stream v={info['out_video_kb']}kB a={info['out_audio_kb']}kB"
+        if float(info["out_time"]) < min_in - tol:
+            return False, f"short_output {float(info['out_time']):.2f}s<{min_in:.2f}s"
+        return True, "OK"
+    except Exception as e:
+        return None, f"check_error:{type(e).__name__}"
 
 
 def mux_480_stream_copy(video_file: Path, audio_file: Path, output_file: Path, logger) -> bool:
@@ -3770,6 +4816,7 @@ def mux_480_stream_copy(video_file: Path, audio_file: Path, output_file: Path, l
         pass
     t0 = time.perf_counter()
     _mux_log = (V94_VALIDATE_MODE == "mux_log")
+    _diag_level = int(V94_MUX_DIAG or 0)
     cmd = [
         FFMPEG_PATH, "-y", "-loglevel", ("info" if _mux_log else "error"), "-nostats", "-hide_banner",
         "-i", str(video_file), "-i", str(audio_file),
@@ -3777,15 +4824,28 @@ def mux_480_stream_copy(video_file: Path, audio_file: Path, output_file: Path, l
         "-c", "copy", "-shortest",
         str(output_file),
     ]
+    if _diag_level >= 2:
+        cmd.insert(cmd.index("-hide_banner") + 1, "-benchmark")
+    _dg = None
+    with _V94_FF_LOCK:
+        _V94_FF_STATE["mux_running"] += 1
     try:
-        r = subprocess.run(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-            text=True, encoding="utf-8", errors="replace",
-            creationflags=0x08000000 if os.name == "nt" else 0,
-            timeout=120,
-        )
+        if _diag_level > 0:
+            # V9.4.1: cùng lệnh/cờ/timeout/text, chỉ thêm dấu thời gian từng pha (xem _v94_ff_run).
+            r, _dg = _v94_ff_run(cmd, timeout=120, inputs=(video_file, audio_file),
+                                 preread=bool(V94_MUX_PREREAD))
+        else:
+            r = subprocess.run(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace",
+                creationflags=0x08000000 if os.name == "nt" else 0,
+                timeout=120,
+            )
+            _v94_ff_mark_exit(FFMPEG_PATH)
+        if _dg is not None:
+            _V94_MUX_DIAG[str(output_file)] = _dg
         if r.returncode == 0 and output_file.is_file() and output_file.stat().st_size > 256 * 1024:
-            logger(f"    ⚡ MUX COPY 480P+JA: {time.perf_counter()-t0:.3f}s | không re-encode")
+            logger(f"    ⚡ MUX COPY 480P+JA: {time.perf_counter()-t0:.3f}s | không re-encode" + _v94_fmt_ff_diag(_dg))
             if _mux_log:
                 _V94_MUX_INFO[str(output_file)] = _v94_parse_mux_log(r.stderr or "")
             return True
@@ -3795,6 +4855,9 @@ def mux_480_stream_copy(video_file: Path, audio_file: Path, output_file: Path, l
         logger(f"    ❌ MUX lỗi: {_err[-300:]}")
     except Exception as e:
         logger(f"    ❌ MUX exception: {type(e).__name__}: {e}")
+    finally:
+        with _V94_FF_LOCK:
+            _V94_FF_STATE["mux_running"] = max(0, _V94_FF_STATE["mux_running"] - 1)
     return False
 
 # ================== ARIA2 PERSISTENT RPC TURBO ================== #
@@ -4101,7 +5164,7 @@ def _windows_file_exclusive_ready(file_path: Path) -> bool:
         return False
 
 
-def _move_file_fast_retry(src: Path, dst: Path, logger, timeout_sec: float = 8.0) -> bool:
+def _move_file_fast_retry(src: Path, dst: Path, logger, timeout_sec: float = 8.0, stats: dict = None) -> bool:
     """Move nhanh nhưng retry khi Windows/IDM vừa mới nhả handle; luôn có log nếu lỗi."""
     deadline = time.monotonic() + max(0.5, float(timeout_sec))
     last_err = None
@@ -4113,6 +5176,8 @@ def _move_file_fast_retry(src: Path, dst: Path, logger, timeout_sec: float = 8.0
             return True
         except (PermissionError, OSError) as e:
             last_err = e
+            if isinstance(stats, dict):
+                stats["retries"] = int(stats.get("retries", 0)) + 1
             time.sleep(0.05)
     logger(f"❌ MOVE sau IDM thất bại: {last_err}")
     return False
@@ -4313,7 +5378,15 @@ class Worker(threading.Thread):
         V8.8: audio_file != None → final_mp4 là video-only (webm/mp4), chỉ dùng cho nhánh >300s
         (DIRECT-CUT, không MUX)."""
         try:
-            duration = float(duration_hint or 0.0) or _ffprobe_duration_seconds(FFPROBE_PATH, final_mp4)
+            _kp = self._v94_kpi()
+            if float(duration_hint or 0.0) > 0:
+                duration = float(duration_hint)
+                _kp["duration_source"] = "hint"
+            else:
+                _t_pp = time.perf_counter()
+                duration = _ffprobe_duration_seconds(FFPROBE_PATH, final_mp4)
+                _kp["pp_probe_ms"] = round((time.perf_counter() - _t_pp) * 1000.0, 1)
+                _kp["duration_source"] = "ffprobe"
             if duration <= 0:
                 self.log(f"❌ Không đọc được thời lượng: {final_mp4.name}")
                 return False
@@ -4322,6 +5395,7 @@ class Worker(threading.Thread):
             # Nếu Excel trống, dùng title YouTube ĐÃ CÓ SẴN trong base_name,
             # tuyệt đối không gọi lại yt-dlp / không chạm engine tải.
             original_title = ""
+            _t_xl = time.perf_counter()
             if url_index is not None and self.excel_path:
                 original_title = read_original_title_from_excel(
                     self.excel_path, url_index, self.log
@@ -4345,6 +5419,7 @@ class Worker(threading.Thread):
                 link_video_goc = read_excel_cell_value(
                     self.excel_path, url_index, "LINK VIDEO GỐC", self.log
                 )
+            _kp["pp_excel_ms"] = round((time.perf_counter() - _t_xl) * 1000.0, 1)
 
             target_move_dir = (
                 final_move_base / link_video_goc
@@ -4367,7 +5442,13 @@ class Worker(threading.Thread):
                 if dest.exists():
                     dest = target_move_dir / f"{source_folder.name}_{int(time.time())}"
 
+                _t_mv = time.perf_counter()
+                try:
+                    _kp["same_volume"] = bool(os.stat(str(source_folder)).st_dev == os.stat(str(target_move_dir)).st_dev)
+                except OSError:
+                    pass
                 shutil.move(str(source_folder), str(dest))
+                _kp["pp_move_ms"] = round((time.perf_counter() - _t_mv) * 1000.0, 1)
                 self.log(f"📦 MOVE CẢ FOLDER: {source_folder.name} → {dest}")
                 return dest
 
@@ -4402,7 +5483,7 @@ class Worker(threading.Thread):
 
                 concat_output = package_dir / f"{smart_name}{final_mp4.suffix or '.mp4'}"
                 new_duration = prepend_tail_to_front_fast(
-                    final_mp4, concat_output, duration, self.log
+                    final_mp4, concat_output, duration, self.log, stats=_kp
                 )
 
                 if new_duration < 60.0:
@@ -4487,7 +5568,22 @@ class Worker(threading.Thread):
         vid = _extract_youtube_video_id(url) or "UNKNOWN"
         self._v94 = {"job": vid, "t0_ns": time.perf_counter_ns(), "cpu0": time.process_time(),
                      "video": {}, "audio": {}, "kpi": {}, "fail": ""}
-        TELEM.span(vid, "worker_start", url=url, row=(url_index + 2) if url_index is not None else None)
+        _t0n = self._v94["t0_ns"]
+        _sub = getattr(self, "_v94_submit_ns", None)
+        _wk = getattr(self, "_v94_wake_ns", None)
+        if _sub:
+            self._v94["kpi"]["queue_ms"] = round((_t0n - _sub) / 1e6, 2)      # chờ slot Max Threads
+        if _wk:
+            self._v94["kpi"]["detect_ms"] = round((_t0n - _wk) / 1e6, 2)      # phát hiện → worker chạy
+        if getattr(self, "_v94_wake_lag_ms", None) is not None:
+            self._v94["kpi"]["wake_lag_ms"] = self._v94_wake_lag_ms         # mtime trigger → phát hiện
+        _arms = _v94_ab_arms()
+        if _arms:
+            _arm = _arms[_v94_ab_next() % len(_arms)]
+            self._v94["video"]["small_video_workers"] = _arm
+            self._v94["kpi"]["ab_small_workers"] = _arm
+        TELEM.span(vid, "worker_start", url=url, row=(url_index + 2) if url_index is not None else None,
+                   queue_ms=self._v94["kpi"].get("queue_ms"), detect_ms=self._v94["kpi"].get("detect_ms"))
         _v94_job_enter()
         ok_holder = {"ok": False}
         _orig_emit = self.signals.url_finished.emit
@@ -4518,7 +5614,32 @@ class Worker(threading.Thread):
                     summary["rss_mb"] = round(psutil.Process().memory_info().rss / 1048576.0, 1)
                 except Exception:
                     pass
+                # V9.4.1: KPI3 = phát hiện (trigger/Excel) → GET media đầu tiên; first_get = worker nhận URL → GET đầu.
+                _fg = [x for x in (self._v94["video"].get("first_get_ns"), self._v94["audio"].get("first_get_ns")) if x]
+                if _fg:
+                    k["first_get_ms"] = round((min(_fg) - self._v94["t0_ns"]) / 1e6, 2)
+                    if _wk:
+                        k["kpi3_ms"] = round((min(_fg) - _wk) / 1e6, 2)
+                summary["first_get_ms"] = k.get("first_get_ms")
+                summary["kpi3_ms"] = k.get("kpi3_ms")
                 TELEM.span(vid, "job_summary", **summary)
+                _post_keys = (("rename", "pp_rename_ms"), ("probe", "pp_probe_ms"), ("excel", "pp_excel_ms"),
+                              ("prepend_ff", "pp_prepend_ffmpeg_ms"), ("prepend_probe", "pp_prepend_probe_ms"),
+                              ("move", "pp_move_ms"), ("done_lock", "done_lock_wait_ms"), ("done_load", "done_load_ms"),
+                              ("done_save", "done_save_ms"), ("done_replace", "done_replace_ms"))
+                _post = [f"{lab}={k[key]}" for lab, key in _post_keys if k.get(key) is not None]
+                if _post:
+                    self.log(
+                        "📮 POST: " + " ".join(_post)
+                        + (f" | dur_src={k['duration_source']}" if k.get("duration_source") else "")
+                        + (f" | same_vol={k['same_volume']}" if "same_volume" in k else "")
+                        + (f" | rename_retry={k['rename_retries']}" if k.get("rename_retries") else "")
+                        + (f" | replace_retry={k['replace_retries']}" if k.get("replace_retries") else "")
+                        + (" | replace_FALLBACK" if k.get("replace_fallback") else "")
+                        + (f" | xlsx={int(k['xlsx_bytes'])//1024}KB" if k.get("xlsx_bytes") else "")
+                        + (" | STATUS-WRITE-FAIL" if k.get("status_write_ok") is False else "")
+                    )
+                _f = lambda key: k.get(key, "-")
                 self.log(
                     f"📊 V9.4 KPI [{vid}] resolve_v={k.get('resolve_video_ms','-')}ms "
                     f"resolve_a={k.get('resolve_audio_ms','-')}ms | video={k.get('video_ms','-')}ms "
@@ -4526,6 +5647,12 @@ class Worker(threading.Thread):
                     f"mux={k.get('mux_ms','-')}ms | HOT_READY={k.get('hot_ready_ms','-')}ms | "
                     f"TOTAL={k.get('pipeline_total_ms','-')}ms | ok={ok_holder['ok']}"
                     + (f" | fail={summary['fail_reason']}" if not ok_holder["ok"] else "")
+                    + f" | KPI1={_f('media_ready_ms')} v_end={_f('video_done_at_ms')} a_end={_f('audio_done_at_ms')}"
+                    + f" KPI3={_f('kpi3_ms')} first_get={_f('first_get_ms')} queue={_f('queue_ms')} detect={_f('detect_ms')}"
+                    + f" valid={_f('file_validated_ms')} post={_f('postprocess_ms')} done={_f('status_done_ms')}"
+                    + (f" prewarm={k['prewarm']}" if k.get("prewarm") else "")
+                    + (f" ab={k['ab_small_workers']}" if k.get("ab_small_workers") else "")
+                    + f" [{V94_VERSION}]"
                 )
             except Exception:
                 pass
@@ -4538,6 +5665,36 @@ class Worker(threading.Thread):
                 self._v94["kpi"][key] = ms
             if ev:
                 TELEM.span(self._v94["job"], ev, at_ms=ms, **fields)
+        except Exception:
+            pass
+
+    def _v94_kpi(self) -> dict:
+        st = getattr(self, "_v94", None)
+        return st["kpi"] if isinstance(st, dict) and isinstance(st.get("kpi"), dict) else {}
+
+    def _v94_maybe_prewarm(self, vid):
+        """V9.4.1: ngay khi media đầu tiên bắt đầu tải, nếu ffmpeg đã rảnh >= V94_FF_PREWARM_IDLE_SEC giây
+        (hoặc chưa chạy lần nào), làm nóng ffmpeg/ffprobe ở thread nền. Job KHÔNG bao giờ chờ nó."""
+        try:
+            if not (V94_FF_PREWARM and FFMPEG_PATH):
+                return
+            st = getattr(self, "_v94", None)
+            if not isinstance(st, dict) or st.get("ff_prewarm_started"):
+                return
+            idle = _v94_ff_idle_s(FFMPEG_PATH)
+            if 0 <= idle < float(V94_FF_PREWARM_IDLE_SEC or 0):
+                st["kpi"]["prewarm"] = f"skip(idle={idle:.1f}s)"
+                return
+            st["ff_prewarm_started"] = True
+
+            def _run():
+                res = _v94_ff_prewarm("JOB", job=st.get("job", vid), logger=self.log)
+                if res is None:
+                    st["kpi"]["prewarm"] = "busy"
+                else:
+                    st["kpi"]["prewarm"] = f"{res.get('ffmpeg_ms', '-')}/{res.get('ffprobe_ms', '-')}ms"
+                    st["kpi"]["prewarm_idle_s"] = res.get("idle_s")
+            threading.Thread(target=_run, name="V94FFPrewarm", daemon=True).start()
         except Exception:
             pass
 
@@ -4611,6 +5768,11 @@ class Worker(threading.Thread):
                 audio_candidates.append(data)
 
             vid = str(data.get("id") or video_id_hint or int(time.time()))
+            if (not aurl and audio_future is None and data.get("audio_refuse_reason")
+                    and not self._v94.get("ja_refuse_logged")):
+                self._v94["ja_refuse_logged"] = True
+                self._v94["kpi"]["ja_refuse"] = str(data.get("audio_refuse_reason"))
+                self.log(f"    ℹ️ JA-INFER từ chối [{vid}] ({data.get('audio_refuse_reason')}) → chờ nguồn xác nhận tiếng Nhật")
             if video_future is None and vurl:
                 self._v94_mark("resolve_video_ms", "resolve_first_video_url",
                                itag=str(data.get("video_format_id") or ""), source=str(data.get("source") or ""),
@@ -4672,6 +5834,7 @@ class Worker(threading.Thread):
                     return False
                 _t_vsub = time.perf_counter_ns()
                 video_future = _submit_media_dedicated(_video_job)
+                self._v94_maybe_prewarm(vid)
                 video_future.add_done_callback(lambda _f, _t=_t_vsub: self._v94["kpi"].__setitem__(
                     "video_job_ms", round((time.perf_counter_ns() - _t) / 1e6, 2)))
 
@@ -4679,13 +5842,17 @@ class Worker(threading.Thread):
                 self._v94_mark("resolve_audio_ms", "resolve_first_ja_audio_url",
                                itag=str(data.get("audio_format_id") or ""), source=str(data.get("source") or ""),
                                clen=int(data.get("audio_content_length") or 0),
-                               inferred=bool(data.get("audio_inferred_single_ja")))
+                               inferred=bool(data.get("audio_inferred_single_ja")),
+                               infer=data.get("audio_infer"))
                 # V9.4: đuôi file đúng codec thật (V9.3 luôn .m4a kể cả khi là opus/webm).
                 audio_file = self.temp_dir / f"{vid}_ja_audio{_v94_audio_ext(data)}"
                 audio_data_used = data
                 self.log(
                     f"⚡ JA AUDIO READY [{vid}] [{data.get('source')}] {time.perf_counter()-resolve_started:.3f}s | "
-                    f"fmt={data.get('audio_format_id') or '?'}" + (" [SINGLE-TRACK-JA]" if data.get('audio_inferred_single_ja') else "") + " → START AUDIO SONG SONG"
+                    f"fmt={data.get('audio_format_id') or '?'}" + (" [SINGLE-TRACK-JA]" if data.get('audio_inferred_single_ja') else "")
+                    + (f" (kana={(data.get('audio_infer') or {}).get('kana_source', '?')} asr={(data.get('audio_infer') or {}).get('asr_lang', '-')})"
+                       if data.get('audio_inferred_single_ja') and data.get('audio_infer') else "")
+                    + " → START AUDIO SONG SONG"
                 )
                 def _audio_job(d=data, path=audio_file):
                     self.log(f"    🚀 MEDIA THREAD START AUDIO [{vid}] | {path.name}")
@@ -4727,6 +5894,7 @@ class Worker(threading.Thread):
                     return False
                 _t_asub = time.perf_counter_ns()
                 audio_future = _submit_media_dedicated(_audio_job)
+                self._v94_maybe_prewarm(vid)
                 audio_future.add_done_callback(lambda _f, _t=_t_asub: self._v94["kpi"].__setitem__(
                     "audio_job_ms", round((time.perf_counter_ns() - _t) / 1e6, 2)))
 
@@ -4881,6 +6049,7 @@ class Worker(threading.Thread):
                     MIN_BYTES_AUDIO, int(alt.get("audio_content_length") or 0)
                 )
 
+        t_media_done = time.perf_counter()
         try:
             self._v94["kpi"]["media_max_ms"] = round(max(float(self._v94["kpi"].get("video_ms") or 0),
                                                          float(self._v94["kpi"].get("audio_ms") or 0)), 2)
@@ -4938,12 +6107,15 @@ class Worker(threading.Thread):
                         pass
             self._v94_mark("postprocess_ms", "postprocess_complete", ok=bool(success))
             if success and url_index is not None and self.excel_path and self.status_col_name:
-                write_status_to_excel(self.excel_path, url_index, self.status_col_name, "DONE", self.log)
-                self._v94_mark("status_done_ms", "status_done")
-            self._v94["kpi"]["pipeline_total_ms"] = round((time.perf_counter() - t_total_start) * 1000.0, 2)
+                if write_status_to_excel(self.excel_path, url_index, self.status_col_name, "DONE", self.log,
+                                         expected_url=url, url_col_name=self.url_col_name, stats=self._v94["kpi"]):
+                    self._v94_mark("status_done_ms", "status_done")
+                else:
+                    self._v94["kpi"]["status_write_ok"] = False
+            self._v94["kpi"]["pipeline_total_ms"] = round((time.perf_counter_ns() - self._v94["t0_ns"]) / 1e6, 2)
             self.log(
                 f"⏱️ PIPELINE TOTAL: {time.perf_counter()-t_total_start:.3f}s | "
-                f"hot480={hot_ready:.3f}s | media-wait={time.perf_counter()-t_media_wait:.3f}s"
+                f"hot480={hot_ready:.3f}s | media-wait={t_media_done-t_media_wait:.3f}s"
             )
             self.log(f"=== [END] {url} (Thành công: {success}) ===")
             self._v94_emit(url, url_index, success)
@@ -4953,6 +6125,10 @@ class Worker(threading.Thread):
         _t_mux = time.perf_counter_ns()
         _mux_ok = mux_480_stream_copy(video_file, audio_file, combined_file, self.log)
         self._v94["kpi"]["mux_ms"] = round((time.perf_counter_ns() - _t_mux) / 1e6, 2)
+        _mdg = _V94_MUX_DIAG.pop(str(combined_file), None)
+        if _mdg:
+            self._v94["kpi"]["mux_diag"] = _mdg
+            TELEM.span(self._v94["job"], "mux_diag", **_mdg)
         self._v94_mark("mux_end_ms", "mux_end", ok=bool(_mux_ok))
         if not _mux_ok:
             self._v94["fail"] = "mux_fail"
@@ -4963,37 +6139,91 @@ class Worker(threading.Thread):
         self._v94_mark("hot_ready_ms", "hot_ready", path="mux")
         if V94_VALIDATE_MUX:
             # V9.4: KHÔNG đi tiếp/ghi DONE nếu file không có đủ video + audio đọc được.
+            # V9.4.1: xác thực file OUTPUT (báo cáo cuối của ffmpeg), không chỉ header của input.
             _t_val = time.perf_counter_ns()
             _vinfo = _V94_MUX_INFO.pop(str(combined_file), None) if V94_VALIDATE_MODE == "mux_log" else None
-            if not (_vinfo and _vinfo.get("has_video") and _vinfo.get("has_audio")
-                    and float(_vinfo.get("format_duration") or 0) > 0):
-                _vinfo = _ffprobe_av_info(combined_file)      # fallback chắc chắn
+            _mi = _vinfo if isinstance(_vinfo, dict) else {}
+            _ins = [x for x in (_mi.get("video_duration"), _mi.get("audio_duration")) if x and x > 0]
+            if _ins:
+                _expected = min(_ins)
+                _tol = max(0.3, 0.01 * _expected)
+            else:   # thời lượng từ resolver có thể là số nguyên làm tròn → dung sai rộng hơn
+                _expected = float((video_data_used or {}).get("duration_sec") or 0.0)
+                _tol = max(1.05, 0.02 * _expected)
+            _strict = "off"
+            _fail_why = ""
+            _use_log = bool(_vinfo and _vinfo.get("has_video") and _vinfo.get("has_audio")
+                            and float(_vinfo.get("format_duration") or 0) > 0)
+            if V94_VALIDATE_MUX_STRICT and _use_log:
+                _ok_s, _why_s = _v94_strict_mux_check(_vinfo)
+                if _ok_s is True:
+                    _strict = "OK"
+                else:
+                    _use_log = False
+                    _strict = ("FALLBACK" if _ok_s is None else "FAIL") + f"({_why_s})"
+            if _use_log:
+                _valid = True
+            else:
+                _pinfo = _ffprobe_av_info(combined_file)      # fallback chắc chắn
+                _pinfo["source"] = "ffprobe"
+                for _k in ("out_time", "out_video_kb", "out_audio_kb"):
+                    if _k in _mi:
+                        _pinfo[_k] = _mi[_k]
+                _valid = bool(_pinfo.get("has_video") and _pinfo.get("has_audio")
+                              and float(_pinfo.get("format_duration") or 0) > 0)
+                if not _valid:
+                    _fail_why = f"ffprobe video={_pinfo.get('has_video')} audio={_pinfo.get('has_audio')}"
+                elif V94_VALIDATE_MUX_STRICT and _expected > 0:
+                    _vd = float(_pinfo.get("video_duration") or _pinfo.get("format_duration") or 0)
+                    _ad = float(_pinfo.get("audio_duration") or 0)
+                    if _vd < _expected - _tol or (0 < _ad < _expected - _tol):
+                        _valid = False
+                        _fail_why = f"ffprobe_short v={_vd:.2f}s a={_ad:.2f}s < {_expected:.2f}s"
+                _vinfo = _pinfo
             self._v94["kpi"]["validate_ms"] = round((time.perf_counter_ns() - _t_val) / 1e6, 2)
-            _valid = bool(_vinfo.get("has_video") and _vinfo.get("has_audio")
-                          and float(_vinfo.get("format_duration") or 0) > 0)
             self._v94_mark("file_validated_ms", "file_validated", ok=_valid,
                            w=_vinfo.get("width"), h=_vinfo.get("height"),
-                           vdur=_vinfo.get("video_duration"), adur=_vinfo.get("audio_duration"))
+                           vdur=_vinfo.get("video_duration"), adur=_vinfo.get("audio_duration"),
+                           out_time=_vinfo.get("out_time"), out_video_kb=_vinfo.get("out_video_kb"),
+                           out_audio_kb=_vinfo.get("out_audio_kb"), strict=_strict, source=_vinfo.get("source"))
             if _valid:
                 _short = min(int(_vinfo.get("width") or 0), int(_vinfo.get("height") or 0))
                 if _short and not (300 <= _short <= 490):
                     self.log(f"    ⚠️ VALIDATE: cạnh ngắn {_short}px khác dải 480p thường gặp (kiểm tra itag)")
+                _out_t = _vinfo.get("out_time")
                 self.log(f"    ✅ VALIDATE {'mux-log' if _vinfo.get('source') == 'mux_log' else 'ffprobe'}: "
                          f"{_vinfo.get('width')}x{_vinfo.get('height')} | "
-                         f"v={float(_vinfo.get('video_duration') or 0):.2f}s a={float(_vinfo.get('audio_duration') or 0):.2f}s")
+                         f"v={float(_vinfo.get('video_duration') or 0):.2f}s a={float(_vinfo.get('audio_duration') or 0):.2f}s"
+                         + (f" | out={float(_out_t):.2f}s" if _out_t is not None else "")
+                         + f" | strict={_strict}")
             else:
-                self._v94["fail"] = "validate_fail"
-                self.log(f"    ❌ VALIDATE ffprobe thất bại (video={_vinfo.get('has_video')} audio={_vinfo.get('has_audio')}) → KHÔNG DONE")
+                _fail_why = _fail_why or _strict
+                self._v94["fail"] = f"validate_fail:{_fail_why}"
+                self.log(f"    ❌ VALIDATE thất bại ({_fail_why}) → KHÔNG DONE, không MOVE")
+                if not self.keep_temp:
+                    try:
+                        if combined_file.exists():
+                            combined_file.unlink()
+                    except OSError:
+                        pass
                 self._v94_emit(url, url_index, False)
                 return
+        _vf = str((video_data_used or {}).get("video_format_id") or "?")
+        _af = str((audio_data_used or {}).get("audio_format_id") or "?")
+        _inf = "[inferred]" if (audio_data_used or {}).get("audio_inferred_single_ja") else ""
         self.log(
             f"🚀 HOT 480P READY: {hot_ready:.3f}s từ lúc worker nhận URL | "
-            f"244/135 + JA tải SONG SONG + mux copy"
+            f"{_vf}+{_af}{_inf} JA tải SONG SONG + mux copy"
         )
 
-        if not _move_file_fast_retry(combined_file, out_file_final, self.log, timeout_sec=8.0):
+        _t_rn = time.perf_counter()
+        _rn_stats = {}
+        if not _move_file_fast_retry(combined_file, out_file_final, self.log, timeout_sec=8.0, stats=_rn_stats):
+            self._v94["fail"] = "move_fail"
             self._v94_emit(url, url_index, False)
             return
+        self._v94["kpi"]["pp_rename_ms"] = round((time.perf_counter() - _t_rn) * 1000.0, 1)
+        self._v94["kpi"]["rename_retries"] = int(_rn_stats.get("retries", 0))
         self.log(f"✅ Success 480p HARD: {base_name}.mp4")
 
         success = bool(self._cut_after_merge(out_file_final, base_name, url_index))
@@ -5010,13 +6240,16 @@ class Worker(threading.Thread):
                     pass
 
         if success and url_index is not None and self.excel_path and self.status_col_name:
-            write_status_to_excel(self.excel_path, url_index, self.status_col_name, "DONE", self.log)
-            self._v94_mark("status_done_ms", "status_done")
-        self._v94["kpi"]["pipeline_total_ms"] = round((time.perf_counter() - t_total_start) * 1000.0, 2)
+            if write_status_to_excel(self.excel_path, url_index, self.status_col_name, "DONE", self.log,
+                                     expected_url=url, url_col_name=self.url_col_name, stats=self._v94["kpi"]):
+                self._v94_mark("status_done_ms", "status_done")
+            else:
+                self._v94["kpi"]["status_write_ok"] = False
+        self._v94["kpi"]["pipeline_total_ms"] = round((time.perf_counter_ns() - self._v94["t0_ns"]) / 1e6, 2)
 
         self.log(
             f"⏱️ PIPELINE TOTAL: {time.perf_counter()-t_total_start:.3f}s | "
-            f"hot480={hot_ready:.3f}s | media-wait={time.perf_counter()-t_media_wait:.3f}s"
+            f"hot480={hot_ready:.3f}s | media-wait={t_media_done-t_media_wait:.3f}s"
         )
         self.log(f"=== [END] {url} (Thành công: {success}) ===")
         self._v94_emit(url, url_index, success)
@@ -5351,12 +6584,22 @@ class PremiumDownloaderApp(QWidget):
                 self.batch_executor.submit(_start_aria2_rpc_daemon)
             except Exception:
                 pass
+        # V9.4.1: làm nóng ffmpeg/ffprobe (2 lần: nguội/nóng) + import bảng Innertube, in 1 dòng FF BASELINE.
+        # Chạy trên thread riêng (không chiếm slot Max Threads, không chặn job đầu tiên).
+        if V94_FF_WARMUP_START or V94_PREWARM_INNERTUBE:
+            try:
+                _out_dir = Path(out)
+                threading.Thread(target=_v94_start_baseline,
+                                 args=(self.log_signal.emit, str(_out_dir), str(_out_dir.parent / "_temp_yt480p")),
+                                 name="V94Baseline", daemon=True).start()
+            except Exception:
+                pass
         
         self.realtime_thread = threading.Thread(target=self._realtime_worker, daemon=True)
         self.realtime_thread.start()
         engine = (self.combo_downloader.currentData() or "aria2c").upper()
         self.logger_qt.log(
-            f"🔄 Bắt đầu **V9.4 SUB-2S (CR-CHECK + IN-PLACE-RESIZE + RANGE-FIRST + 403-NO-ARIA2 + RACE≤{V94_FIRST_WAVE_RACE_MAX}) + V9.3 SHARED-TLS + FIRST-WAVE-RACE + EAGER-STEAL + DIRECT-CUT 244→135 SHARED-REDIRECT LAZY-FALLBACK SAFE-NATIVE-403 + {engine}** | Native + yt-dlp race + "
+            f"🔄 Bắt đầu **{V94_VERSION} (CR-CHECK + IN-PLACE-RESIZE + RANGE-FIRST + 403-NO-ARIA2 + FF-PREWARM + STRICT-VALIDATE + RACE={'ALL' if int(V94_FIRST_WAVE_RACE_MAX) < 0 else V94_FIRST_WAVE_RACE_MAX}) + V9.3 SHARED-TLS + FIRST-WAVE-RACE + EAGER-STEAL + DIRECT-CUT 244→135 SHARED-REDIRECT LAZY-FALLBACK SAFE-NATIVE-403 + {engine}** | Native + yt-dlp race + "
             f"video/audio song song + zero-copy mux | Max Threads: {max_workers}"
         )
         self.logger_qt.log(
@@ -5404,6 +6647,8 @@ class PremiumDownloaderApp(QWidget):
         trigger_sig = _rt_trigger_signature(trigger_candidates)
         excel_sig = _rt_file_signature(excel_path)
         wake_reason = "STARTUP"
+        wake_ns = time.perf_counter_ns()      # V9.4.1: mốc phát hiện (KPI3 = phát hiện → GET media đầu tiên)
+        wake_lag_ms = None
 
         self.log_signal.emit(
             f"⚡ WAKE-UP FAST: trigger_wakeup.txt + Excel change | "
@@ -5435,8 +6680,12 @@ class PremiumDownloaderApp(QWidget):
                     # Old code re-read the whole xlsx 2-3 times before starting the worker.
                     if self.batch_executor:
                         worker = Worker(self, excel_path, url_col, status_col)
+                        worker._v94_wake_ns = wake_ns
+                        worker._v94_wake_lag_ms = wake_lag_ms
+                        worker._v94_wake_reason = wake_reason
                         TELEM.span(_extract_youtube_video_id(url) or "UNKNOWN", "worker_submit",
                                    row=idx + 2 if idx is not None else None, wake=wake_reason)
+                        worker._v94_submit_ns = time.perf_counter_ns()
                         self.batch_executor.submit(worker._process_single_url, url, idx)
 
                     # UI metadata is non-critical and can be read after the download has already started.
@@ -5469,6 +6718,8 @@ class PremiumDownloaderApp(QWidget):
                     trigger_sig,
                     excel_sig,
                 )
+                wake_ns = time.perf_counter_ns()
+                wake_lag_ms = _V94_LAST_WAKE.get("lag_ms") if wake_reason in ("TRIGGER", "EXCEL") else None
 
             except Exception as e:
                 self.log_signal.emit(f"❌ Lỗi Realtime Thread: {e}")
@@ -5477,6 +6728,8 @@ class PremiumDownloaderApp(QWidget):
                 trigger_sig = _rt_trigger_signature(trigger_candidates)
                 excel_sig = _rt_file_signature(excel_path)
                 wake_reason = "RECOVER"
+                wake_ns = time.perf_counter_ns()
+                wake_lag_ms = None
 
         if not self.chk_keeptemp.isChecked():
             tdir = Path(self.input_folder.text().strip()).parent / "_temp_yt480p"

@@ -1,0 +1,14 @@
+# pipeline_offline — 20261102_112917
+
+- Resolver GIẢ (trả URL mock ngay) → resolve≈0: KHÔNG đại diện độ trễ Innertube/yt-dlp thật.
+- Mock GVS: link=400.0Mbps per-conn video=40.0 audio=4.0Mbps ttfb=40.0ms. ffmpeg/ffprobe thật cho mux/validate/move.
+- V9.4 xác thực file trước DONE bằng log của chính lệnh mux (validate_ms≈0; ffprobe chỉ là fallback).
+- Cờ môi trường V94_*: mặc định
+- Máy: linux | Python 3.13.18 | CPU=4
+
+| case | version | n | success_rate | resolve_video_ms_p50 | resolve_video_ms_p90 | resolve_video_ms_p95 | resolve_video_ms_max | video_ms_p50 | video_ms_p90 | video_ms_p95 | video_ms_max | audio_ms_p50 | audio_ms_p90 | audio_ms_p95 | audio_ms_max | media_ready_ms_p50 | media_ready_ms_p90 | media_ready_ms_p95 | media_ready_ms_max | mux_ms_p50 | mux_ms_p90 | mux_ms_p95 | mux_ms_max | validate_ms_p50 | validate_ms_p90 | validate_ms_p95 | validate_ms_max | hot_ready_ms_p50 | hot_ready_ms_p90 | hot_ready_ms_p95 | hot_ready_ms_max | file_validated_ms_p50 | file_validated_ms_p90 | file_validated_ms_p95 | file_validated_ms_max | pipeline_total_ms_p50 | pipeline_total_ms_p90 | pipeline_total_ms_p95 | pipeline_total_ms_max | wall_ms_p50 | wall_ms_p90 | wall_ms_p95 | wall_ms_max | under_2s_media_ready_ms | under_2s_hot_ready_ms | fail_reasons |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| dur30_v1313KiB_a241KiB | v93 | 12 | 1.0 | 0.0 | 0.0 | 0.45 | 1.0 |  |  |  |  |  |  |  |  | 214.0 | 220.6 | 224.6 | 229.0 | 80.5 | 96.6 | 98.35 | 100.0 |  |  |  |  | 294.0 | 315.3 | 318.7 | 322.0 |  |  |  |  | 563.5 | 588.2 | 589.9 | 591.0 | 563.28 | 588.12 | 589.76 | 590.82 | 1.0 | 1.0 |  |
+| dur30_v1313KiB_a241KiB | v94 | 12 | 1.0 | 0.34 | 0.41 | 0.61 | 0.85 | 103.37 | 106.04 | 109.11 | 112.65 | 213.68 | 218.61 | 221.79 | 225.17 | 216.08 | 220.72 | 223.97 | 227.71 | 76.28 | 100.78 | 107.77 | 115.5 | 0.01 | 0.01 | 0.01 | 0.02 | 296.62 | 315.55 | 325.32 | 336.54 | 296.64 | 315.56 | 325.34 | 336.57 | 574.92 | 598.97 | 600.51 | 602.35 | 575.44 | 599.48 | 601.03 | 602.88 | 1.0 | 1.0 |  |
+| dur120_v4355KiB_a965KiB | v93 | 12 | 1.0 | 0.0 | 1.0 | 2.8 | 5.0 |  |  |  |  |  |  |  |  | 546.5 | 551.6 | 552.45 | 553.0 | 107.0 | 158.4 | 162.45 | 163.0 |  |  |  |  | 653.5 | 701.4 | 706.7 | 710.0 |  |  |  |  | 723.5 | 760.4 | 763.9 | 765.0 | 723.78 | 760.62 | 764.23 | 765.41 | 1.0 | 1.0 |  |
+| dur120_v4355KiB_a965KiB | v94 | 12 | 1.0 | 0.35 | 1.75 | 4.88 | 8.54 | 167.22 | 169.23 | 171.08 | 173.3 | 540.37 | 543.8 | 544.4 | 544.77 | 542.45 | 548.22 | 549.79 | 551.46 | 111.11 | 142.77 | 154.27 | 166.91 | 0.01 | 0.01 | 0.01 | 0.01 | 657.91 | 685.83 | 696.5 | 708.0 | 657.93 | 685.85 | 696.52 | 708.02 | 724.98 | 747.02 | 763.3 | 782.05 | 725.46 | 747.54 | 763.82 | 782.58 | 1.0 | 1.0 |  |

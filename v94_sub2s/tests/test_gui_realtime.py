@@ -152,6 +152,17 @@ def test_gui_realtime_4_jobs(request, modname, clip, tmp_path, monkeypatch):
         leftovers = [t.name for t in threading.enumerate()
                      if t.ident not in th_before and ("Range" in t.name or "MediaNow" in t.name)]
         assert not leftovers, leftovers
+        if modname == "v94":
+            # V9.4.1: dòng KPI có queue (chờ slot) và detect (phát hiện → worker chạy), detect >= queue
+            import re as _re
+            pump(0.5)
+            kl = [l for l in w.log_widget.toPlainText().splitlines() if "V9.4 KPI" in l]
+            assert len(kl) == 4, kl
+            for l in kl:
+                q = float(_re.search(r"queue=([\d.]+)", l).group(1))
+                d = float(_re.search(r"detect=([\d.]+)", l).group(1))
+                assert q >= 0 and d + 0.5 >= q, l
+                assert "KPI3=" in l and "[V9.4.1-SUB2S]" in l
         # temp sạch (keep_temp=False)
         tdir = tmp_path / "_temp_yt480p"
         left = [p.name for p in tdir.glob("*")] if tdir.exists() else []

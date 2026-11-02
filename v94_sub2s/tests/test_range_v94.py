@@ -213,8 +213,9 @@ def test_worker_override(v94, monkeypatch):
     assert v94._range_worker_count(100 * MB, "video") == 32   # heuristic V9.3 giữ nguyên
 
 
-def test_first_wave_race_cap(v94):
-    assert v94.V94_FIRST_WAVE_RACE_MAX == 4
+def test_first_wave_race_default_is_v93(v94):
+    # V9.4.1: mặc định race mọi segment đợt đầu như V9.3 (trần 4 của V9.4.0 chậm hơn khi replica nhanh)
+    assert v94.V94_FIRST_WAVE_RACE_MAX == -1
 
 
 def test_gvs_alt_url_and_redact(v94):

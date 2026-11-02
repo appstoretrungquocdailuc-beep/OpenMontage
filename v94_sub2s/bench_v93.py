@@ -515,6 +515,64 @@ def run_live(args):
     return 0
 
 
+def run_race(args):
+    """Kịch bản 2 host (log live 17:09): host chính trả 302 + TTFB chậm, replica mn nhanh hơn.
+    So V9.3 (race mọi segment đợt đầu), V9.4.0 (trần 4) và V9.4.1 (race hết khi <= 8 worker)."""
+    _ensure_qt()
+    from mock_gvs import MockGVS, make_payload, sha256
+    mods = {v: load(MODS[v]) for v in ("v93", "v94")}
+    variants = [("v93", "v93", None),
+                ("v94.0(cap4)", "v94", {"V94_FIRST_WAVE_RACE_MAX": 4, "V94_RACE_ALL_IF_WORKERS_LE": 0}),
+                ("v94.1", "v94", {"V94_FIRST_WAVE_RACE_MAX": -1, "V94_RACE_ALL_IF_WORKERS_LE": 8})]
+    rows = []
+    cases = [("short_video_2.88MB", int(2.88 * MB), "video"), ("audio_0.34MB", int(0.34 * MB), "audio"),
+             ("video_24MB", 24 * MB, "video")]
+    for cname, size, kind in cases:
+        data = make_payload(size, seed=size & 0xFFFF)
+        digest = sha256(data)
+        for rep in range(args.reps):
+            order = variants if rep % 2 == 0 else list(reversed(variants))
+            for label, ver, le in order:
+                mod = mods[ver]
+                with MockGVS(link_bytes_per_sec=int(args.link_mbps * 1e6 / 8)) as g:
+                    real = g.add("/videoplayback/real", data, rate=args.conn_mbps_video * 1e6 / 8)
+                    main = g.add("/videoplayback/main", mode="redirect", to=real, hdr_delay=args.main_ttfb_ms / 1000.0)
+                    alt = g.add("/videoplayback/alt", data, hdr_delay=args.alt_ttfb_ms / 1000.0,
+                                rate=args.conn_mbps_video * 1e6 / 8)
+                    mod._gvs_alt_url = (lambda a: (lambda u: a))(alt)
+                    mod._MN_RACE_BAD_UNTIL[0] = 0.0
+                    for _k, _v in (le or {}).items():
+                        setattr(mod, _k, _v)
+                    tmp = Path(tempfile.mkdtemp(prefix="race_"))
+                    info = {}
+                    t0 = time.perf_counter_ns()
+                    if ver == "v94":
+                        ok = mod._download_http_range_turbo(main, tmp, "o.bin", lambda m: None, 1, size, kind, info=info)
+                    else:
+                        ok = mod._download_http_range_turbo(main, tmp, "o.bin", lambda m: None, 1, size, kind)
+                    ms = (time.perf_counter_ns() - t0) / 1e6
+                    good = ok and sha256((tmp / "o.bin").read_bytes()) == digest
+                    rows.append({"case": cname, "version": label, "rep": rep, "success": bool(good), "ms": round(ms, 2),
+                                 "races": info.get("races"), "requests_alt": len(g.requests_for("/videoplayback/alt")),
+                                 "requests_main": len(g.requests_for("/videoplayback/main"))})
+                    shutil.rmtree(tmp, ignore_errors=True)
+                    mod._MN_RACE_BAD_UNTIL[0] = 0.0
+                time.sleep(0.05)
+        print(f"  {cname}: " + ", ".join(
+            f"{lab}={pct([r['ms'] for r in rows if r['case']==cname and r['version']==lab and r['success']],50)}ms"
+            for lab, _, _ in variants))
+    summ = summarize(rows, ["case", "version"], ["ms", "requests_alt", "requests_main"])
+    print_table(summ, ["case", "version", "n", "success_rate", "ms_p50", "ms_p90", "requests_alt_p50", "requests_main_p50"])
+    write_report("race", rows, summ, [
+        f"Mock 2 host: main = 302 + TTFB {args.main_ttfb_ms}ms, alt (replica mn) TTFB {args.alt_ttfb_ms}ms, "
+        f"{args.conn_mbps_video}Mbps/kết nối, link {args.link_mbps}Mbps — "
+        + ("mô phỏng log live 17:09 (alt-win=3, redirect=x1)." if args.alt_ttfb_ms < args.main_ttfb_ms
+           else "kịch bản NGƯỢC: replica chậm hơn host chính."),
+        "v94.0(cap4) = V9.4.0 (trần race 4 mọi file); v94.1 = mặc định mới (race hết như V9.3).",
+    ])
+    return 0
+
+
 def run_pipeline_offline(args):
     """A/B toàn pipeline Worker._process_single_url với resolver giả + mock GVS + ffmpeg thật."""
     qt_stub = _ensure_qt()
@@ -589,6 +647,12 @@ def main():
         p.add_argument("--conn-mbps-audio", type=float, default=4.0)
         p.add_argument("--ttfb-ms", type=float, default=40.0)
         p.add_argument("--workers", default="4,6,8,12,16,24,32,40")
+    p = sub.add_parser("race")
+    p.add_argument("--reps", type=int, default=5)
+    p.add_argument("--link-mbps", type=float, default=400.0)
+    p.add_argument("--conn-mbps-video", type=float, default=24.0)
+    p.add_argument("--main-ttfb-ms", type=float, default=250.0)
+    p.add_argument("--alt-ttfb-ms", type=float, default=40.0)
     p = sub.add_parser("pipeline")
     p.add_argument("--reps", type=int, default=5)
     p.add_argument("--versions", default="v93,v94")
@@ -627,6 +691,8 @@ def main():
         run_offline(args)
     elif args.mode == "sweep":
         run_offline(args, sweep=True)
+    elif args.mode == "race":
+        return run_race(args)
     elif args.mode == "pipeline":
         return run_pipeline_offline(args)
     elif args.mode == "trigger":

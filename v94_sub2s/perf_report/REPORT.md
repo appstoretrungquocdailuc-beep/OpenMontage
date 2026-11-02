@@ -98,3 +98,58 @@ trong test GUI. `test_v93_range_offline.py` **không có** trong gói được g
 - Trần FIRST-WAVE-RACE = 4 và keepalive nhường job: hợp lý theo code nhưng **chưa có số live**; tắt bằng
   `V94_FIRST_WAVE_RACE_MAX=-1`, `V94_KEEPALIVE_YIELD=0` nếu A/B live xấu hơn.
 - `FASTEST_VALID_480P`: có công tắc, **mặc định TẮT**; chỉ bật khi có số đo + bạn đồng ý.
+
+---
+
+# V9.4.1 — bản vá sau log live đầu tiên (Windows, 02/11/2026 17:09)
+
+## A. Log live đầu tiên (Shorts M1sbvQq1DAk, 135 + 139 [SINGLE-TRACK-JA], <60s)
+
+| Bước | Thời gian | Ghi chú |
+|---|---|---|
+| resolve (NATIVE_VISIONOS) | 276 ms | ~80% là thời gian server /player |
+| video 2.88 MB, 6 worker | 1515 ms | TTFB 0.49s có 1 redirect 302; ~5 Mbps/kết nối sau TTFB; alt-win=3 |
+| audio 0.34 MB | 594 ms | xong ở ~0.87s, không nằm trên đường găng |
+| **KPI1 (đủ video+audio)** | **≈1792 ms** | **đã < 2s** |
+| mux | **602 ms** | ~10× một lần stream-copy nóng |
+| **KPI2 HOT_READY** | **2394 ms** | trượt 2s đúng ~394 ms, nằm trọn trong mux |
+| hậu xử lý <60s | 705 ms | ffprobe đầu tiên (không đo), Excel, prepend 110ms, MOVE, ghi DONE |
+
+Cùng giây đó bước <60s chạy ffmpeg concat + ffprobe chỉ mất **0.11s**, và offline cùng lệnh mux ~110ms; mọi nguyên nhân bên
+trong ffmpeg (`-loglevel info`, probe fMP4 DASH, `-shortest`) đo được ≤5ms. Điểm khác duy nhất: đó là lần spawn ffmpeg.exe
+**đầu tiên** của job sau một quãng rảnh, và là lần duy nhất mở file python vừa đóng → giả thuyết số 1: **ffmpeg.exe nguội**
+(nạp image/DLL, kiểm tra AV khi tạo process); số 2: **AV quét-khi-mở** file vừa tải; số 3: GIL stall phía Python.
+Một con số "MUX COPY" duy nhất không phân biệt được → V9.4.1 thêm cả **bản sửa** lẫn **đo tách pha**.
+
+## B. Phân tích độc lập 5 góc (workflow 6 agent, 51 phát hiện → 13 làm ngay, 13 cần số live, 11 bác bỏ)
+Bác bỏ có lý do: gộp mux+prepend 1 lệnh (lệch audio ~1.5s), PyAV in-process (phụ thuộc 35MB, output khác byte),
+controller tăng worker động (p90 tệ hơn ~130ms trong sim), hedge /player (tăng tải 429), duration-hint từ log input
+(lệch 1 sample ở 3/16 ca), bỏ fh.truncate (NTFS zero-fill trong lock), dời mốc HOT_READY (mất so sánh với V9.3)...
+
+## C. Đã sửa (đều sau cờ `V94_*`, xem README mục 3)
+
+| Hạng mục | Vấn đề | Bằng chứng | Kết quả |
+|---|---|---|---|
+| ff-prewarm | ffmpeg.exe nguội ở lần mux đầu | log live 0.602 vs 0.11s; offline: evict page-cache 126→210ms, 1 lần warm-up xoá chênh lệch | làm nóng nền (ưu tiên thấp) lúc media bắt đầu tải; job không chờ (test: prewarm 2s không làm chậm HOT_READY) |
+| mux-diag | không phân biệt được nguyên nhân | — | dòng MUX có `pre/popen/→in0/copy/exit/life/cpu/lag`; dòng `FF BASELINE` cold/warm lúc START |
+| **race mặc định** | V9.4.0 trần race 4 → segment còn lại chờ host chính + 302 | bench 2 host (race_20261102_112312): Shorts 2.88MB **V9.3 223 / V9.4.0 365 / V9.4.1 221 ms**; 24MB 609 / 739 / 631 ms. Kịch bản ngược (replica chậm, race_…112346): trần không nhanh hơn, chỉ bớt socket | mặc định trở lại **race hết như V9.3** (`V94_FIRST_WAVE_RACE_MAX=-1`) |
+| alt-ban-strict | request thua cuộc timeout MUỘN (sau khi job xong) bật cấm replica 10 phút cho mọi job sau, không log | tái hiện: audio xong 362ms, 1.8s sau ban 599s, video sau không còn race | chỉ cấm khi lỗi chắc chắn; luôn log `mn-race OFF 600s` |
+| validate-strict | V9.4.0 đọc "Duration" của INPUT (header) → input cắt cụt 60% vẫn OK | tái hiện: v=58.17 ok=True trong khi output thật 34.87s | đọc `time=`/`video: audio:` cuối của OUTPUT + dòng lỗi; thiếu → ffprobe; input cụt → KHÔNG DONE (test pipeline) |
+| ja-infer-strict | track `audioTrack.id=en.4`, 2 track không metadata, tiêu đề dịch microformat → vẫn đoán JA | 3/5 ca probe | từ chối, ghi lý do; ca JA thật vẫn nhận |
+| excel atomic + row verify | `shutil.move` trên Windows = copy đè (đọc thấy zip dở); DONE theo vị trí có thể ghi nhầm dòng | giả lập Windows: 7 lần đọc '' / 26.984 | `os.replace` + retry; DONE chỉ vào dòng chứa đúng video id |
+| ffprobe timeout | ffprobe thời lượng không timeout (treo giữ slot) | code | timeout 20s, dùng đúng path |
+| Popen.wait polling | `_v94_ff_run` bản đầu dùng `wait(timeout)` → POSIX ngủ tới 50ms | pipeline bench: mux +35-45ms | chờ EOF stderr rồi `wait()` → mux 105 vs V9.3 109 ms |
+
+## D. Số đo offline sau bản vá (V9.3 vs V9.4.1, cùng máy)
+
+- Engine Range (offline_20261102_112537): ngang V9.3 ở size đúng (±1%); size sai/không biết vẫn nhanh hơn như V9.4.0
+  (size dư 8%: 857→517ms; 0.4MB không biết size: 829→278ms; 2MB: 4205→458ms); Content-Range lệch: V9.3 nhận file hỏng.
+- Pipeline (pipeline_offline_20261102_112917, 12 lần ABAB): HOT_READY p50 dur30 **294 vs 297 ms**, dur120 **654 vs 658 ms**;
+  mux 81 vs 76 / 107 vs 111 ms; TOTAL 564 vs 575 / 724 vs 725 ms. Trên Linux ffmpeg không bao giờ "nguội" nên lợi ích
+  prewarm không thể hiện ở đây — chỉ log live Windows mới xác nhận được (dòng FF BASELINE + MUX diag).
+- Test: 108 passed + 1 xfailed (bug V9.3), ổn định qua nhiều lần chạy.
+
+## E. Cần số live (không đổi mặc định khi chưa đo)
+A/B số worker Shorts (`V94_VIDEO_SMALL_WORKERS_AB=6,11`), quét AV khi mở file, GIL/GC stall, cờ spawn DETACHED,
+tối ưu hậu xử lý theo dòng POST, preallocate NTFS, redirect/reuse kết nối, trần race riêng cho audio, hàng đợi realtime,
+kết nối YouTube nguội sau thời gian bận, lỗi đọc Excel thoáng qua, phủ quyết ASR cho suy luận JA.

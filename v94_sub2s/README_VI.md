@@ -49,7 +49,7 @@ Thư mục này chứa:
 | `V94_UNKNOWN_FIRST_WORKERS` | 4 | – | Số request đoán song song khi chưa biết size |
 | `V94_DIRECT_1GET_DEADLINE_SEC` | 12 | 0 | Deadline tổng DIRECT-1GET |
 | `V94_NO_ARIA2_ON_AUTH_FAIL` | 1 | 0 | 403/410/429 → không aria2 cùng URL, SAFE-REFRESH 1 lần |
-| `V94_FIRST_WAVE_RACE_MAX` | 4 | -1 | Số request kép đợt đầu mỗi file (0 = tắt race) |
+| `V94_FIRST_WAVE_RACE_MAX` | -1 (từ V9.4.1) | -1 | Số request kép (host chính + replica mn) đợt đầu mỗi file. -1 = không giới hạn = V9.3; 0 = tắt race; 4 = trần của V9.4.0 (đo được: chậm hơn khi replica nhanh) |
 | `V94_HEDGE_POOL_MAX` | 192 | 192 | Trần thread hedge |
 | `V94_RANGE_WORKERS_VIDEO/AUDIO` | 0 | 0 | Ép số worker (thí nghiệm); 0 = heuristic V9.3 |
 | `V94_VALIDATE_MUX` | 1 | 0 | Xác thực video+audio trước khi đi tiếp/DONE |
@@ -60,6 +60,38 @@ Thư mục này chứa:
 | `V94_JA_INFER_GUARD` | 1 | 0 | Chặn suy luận JA khi `defaultAudioLanguage` khác ja |
 | `V94_FASTEST_VALID_480P` | 0 | 0 | **Đề xuất, mặc định TẮT**: cả 244 và 135 cùng có → lấy file nhỏ hơn. Chỉ bật khi đã đo và bạn đồng ý |
 | `V94_TELEMETRY` / `V94_TELEMETRY_DIR` | 1 / `perf_report` | 0 | Bật/tắt và thư mục telemetry |
+| **V9.4.1** `V94_FF_PREWARM` | 1 | 0 | Làm nóng ffmpeg/ffprobe (1 lần remux thật trên mẫu 12KB nhúng sẵn, trong `%TEMP%\v94_ffwarm`) ngay khi media bắt đầu tải, nếu ffmpeg đã rảnh ≥ `V94_FF_PREWARM_IDLE_SEC` (3s). Job không bao giờ chờ nó |
+| `V94_FF_WARMUP_START` | 1 | 0 | Làm nóng 2 lần lúc bấm START và in dòng `FF BASELINE` (chi phí nguội vs nóng trên máy bạn) |
+| `V94_FF_KEEPWARM_SEC` | 0 | 0 | >0: giữ ffmpeg nóng định kỳ khi rảnh (chỉ bật nếu log cho thấy job đầu sau quãng rảnh vẫn chậm) |
+| `V94_PREWARM_INNERTUBE` | 1 | 0 | Import bảng client Innertube của yt-dlp lúc START (bớt ~40-150ms cho job đầu) |
+| `V94_MUX_DIAG` | 1 | 0 | Đo tách pha lệnh mux (pre-read input, spawn, mở input, copy, thoát, thời gian kernel Windows). 2 = thêm `-benchmark`. Lệnh và file output không đổi |
+| `V94_MUX_PREREAD` | 1 | – | Đọc trước 64KiB mỗi input để quy thời gian chờ quét antivirus |
+| `V94_GIL_PROBE` | 0 | 0 | Chỉ để chẩn đoán: đo GIL/GC stall trong lúc mux |
+| `V94_VALIDATE_MUX_STRICT` | 1 | 0 | Xác thực file OUTPUT bằng báo cáo cuối của ffmpeg (`time=`, `video:/audio:` kB, không có dòng lỗi đọc input); thiếu dữ liệu → ffprobe. Input bị cắt cụt → KHÔNG DONE |
+| `V94_FFPROBE_TIMEOUT` | 20 | 0 | Timeout ffprobe đo thời lượng (V9.3 có thể treo vĩnh viễn) |
+| `V94_RACE_ALL_IF_WORKERS_LE` | 8 | – | Chỉ có tác dụng khi bạn tự đặt trần race > 0: file nhỏ vẫn race hết |
+| `V94_ALT_BAN_STRICT` | 1 | 0 | Chỉ cấm replica mn 10 phút khi lỗi chắc chắn (401/403/404/410/429, từ chối kết nối, DNS); timeout muộn của request thua cuộc không còn tắt race cho các job sau. Mỗi lần cấm đều có log `mn-race OFF 600s` |
+| `V94_VIDEO_SMALL_WORKERS` | 0 | 0 | Số worker cho video ≤ 4MiB (0 = 6 như cũ) |
+| `V94_VIDEO_SMALL_WORKERS_AB` | (trống) | – | A/B trong app, ví dụ `6,11`: job lẻ 6, job chẵn 11, có nhãn `ab=` trong log |
+| `V94_EXCEL_ATOMIC_REPLACE` | 1 | 0 | Ghi check.xlsx bằng `os.replace` (nguyên tử, retry 10×30ms, rơi về `shutil.move`) |
+| `V94_STATUS_VERIFY_URL` | 1 | 0 | DONE chỉ ghi vào dòng VẪN chứa video id của job (dòng bị chèn/xoá/sắp xếp → tìm lại hoặc không ghi) |
+| `V94_JA_INFER_STRICT` | 1 | 0 | Suy luận [SINGLE-TRACK-JA] tôn trọng `audioTrack.id/displayName`, track trùng, bỏ tiêu đề dịch của microformat |
+
+## 3b. Đọc các dòng log mới của V9.4.1
+
+- `🔥 FF BASELINE | ffmpeg version … | cold ffmpeg=X ms ffprobe=Y ms | warm ffmpeg=… | exe: … | ổ: …`: in 1 lần sau START.
+  `cold` là chi phí ffmpeg.exe "nguội" trên máy bạn. Nếu cold lớn hơn warm hàng trăm ms thì giả thuyết spawn nguội là đúng.
+- `🔥 FF PREWARM [id] ffmpeg=… ffprobe=… idle=…s (JOB)`: làm nóng nền khi job bắt đầu tải (chỉ khi ffmpeg đã rảnh ≥ 3s).
+- `⚡ MUX COPY 480P+JA: 0.602s | … | seq= idle= pre=v/a popen= →in0= →in1= →out= copy= exit= life= cpu= lag=`:
+  `pre` lớn thì antivirus quét file vừa tải. `popen`/`lag` lớn thì tạo process chậm. `→in0` lớn thì mở input chậm.
+  `life` cao trong khi `cpu` thấp nghĩa là ffmpeg đang chờ (đĩa/AV).
+- `✅ VALIDATE mux-log: … | out=58.28s | strict=OK`. `strict=FALLBACK(...)` nghĩa là đã kiểm bằng ffprobe; `❌ VALIDATE thất bại (...)` nghĩa là KHÔNG DONE.
+- `[RANGE-TURBO] ✅ HOÀN TẤT … | xfer≈ conn_p50≈ ttfb_late= hedge_real= gets= conc_peak= splits= takeovers= prealloc=`
+  (tốc độ thật sau byte đầu, tốc độ mỗi kết nối, số GET đồng thời). `alt=n/a` nghĩa là replica chưa trả lời lần nào.
+  `alt_lost=ok/err/pending` là kết cục các request thua cuộc.
+- `📮 POST: rename= probe= excel= prepend_ff= prepend_probe= move= done_lock= done_load= done_save= done_replace=` (ms sau HOT_READY).
+- Dòng `📊 V9.4 KPI` có thêm `KPI1=` (đủ video + audio), `KPI3=` (phát hiện tới GET media đầu tiên), `queue=`
+  (chờ slot Max Threads), `detect=`, `valid=`, `post=`, `done=`, `prewarm=`, `ab=` và tên bản `[V9.4.1-SUB2S]`.
 
 ## 4. Test (không cần mạng)
 
@@ -67,7 +99,7 @@ Thư mục này chứa:
 python -m py_compile V9_3_AUDIO.py V9_4_SUB2S.py bench_v93.py
 python -m pytest -q -rfxX
 ```
-Kết quả mong đợi: `56 passed, 1 xfailed`. XFAIL là **bug V9.3 được tái hiện có chủ đích** (4 job ghi STATUS
+Kết quả mong đợi (V9.4.1): `108 passed, 1 xfailed` (đôi khi `109 passed` vì bug V9.3 là race, có lần không lộ). XFAIL là **bug V9.3 được tái hiện có chủ đích** (4 job ghi STATUS
 song song làm mất DONE / hỏng `check.xlsx`). Nội dung test: 206 chuẩn (SHA256), 302, 403/410/429, 200 bỏ
 Range, size ước tính sai (4 kiểu), size không biết, Content-Range sai, đứt kết nối giữa chừng, header trễ,
 đuôi chậm (steal), 8 tải đồng thời, huỷ + dọn thread/file, 416, rollback cờ, chọn audio JA, đuôi file, Excel,
@@ -102,6 +134,16 @@ Kết quả: `perf_report\live_<thời gian>.jsonl/.csv/_summary.md` với `reso
 `media_ready_ms` (KPI1), `mux_ms`, `hot_ready_ms` (KPI2), `pipeline_total_ms`, `success_rate`, p50/p90/p95,
 `under_2s_*`, `threads_after`, `fail_reasons`. KPI3 (detection → media GET đầu) = `gvs_request_begin` trừ
 `worker_start`/`trigger_detected` trong telemetry JSONL.
+
+## 5b. Gửi lại gì sau khi chạy V9.4.1
+
+1. File `perf_report\telemetry_*.jsonl` của phiên chạy (cạnh `V9_4_SUB2S.py`). Không chứa URL có chữ ký hay token.
+2. Log GUI của **10+ job liên tiếp**, gồm cả các dòng sau START (`FF BASELINE`).
+3. Dòng đầu của `ffmpeg -version`, ffmpeg.exe nằm ở đâu, ổ SSD hay HDD/USB, có OneDrive/antivirus nào quét thư
+   mục tool/download/`_temp_yt480p` không. Chỉ cần báo lại, chưa cần đổi gì.
+4. (Tuỳ chọn) A/B số worker cho Shorts: thêm dòng `set V94_VIDEO_SMALL_WORKERS_AB=6,11` vào `RUN_V9_4_GUI.bat` trước
+   dòng `python`, chạy 20+ Shorts mới, gửi log + telemetry. Chỉ đổi mặc định khi nhánh 11 nhanh hơn ≥200ms p50, không
+   tệ hơn p90 và không tăng 403/429.
 
 ## 6. Tiêu chí để dùng V9.4 làm bản chính
 
