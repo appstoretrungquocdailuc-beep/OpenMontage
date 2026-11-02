@@ -153,3 +153,17 @@ controller tăng worker động (p90 tệ hơn ~130ms trong sim), hedge /player 
 A/B số worker Shorts (`V94_VIDEO_SMALL_WORKERS_AB=6,11`), quét AV khi mở file, GIL/GC stall, cờ spawn DETACHED,
 tối ưu hậu xử lý theo dòng POST, preallocate NTFS, redirect/reuse kết nối, trần race riêng cho audio, hàng đợi realtime,
 kết nối YouTube nguội sau thời gian bận, lỗi đọc Excel thoáng qua, phủ quyết ASR cho suy luận JA.
+
+## F. Review độc lập sau V9.4.1 (4 góc + kiểm chứng phản biện, 10 agent)
+5 lỗi được xác nhận và đã sửa, mỗi lỗi có test hồi quy (`tests/test_review_*.py`):
+1. Kiểm dòng STATUS ghi theo vị trí khi ô chứa URL khác ở dạng regex không nhận (host viết hoa, `/v/`, nocookie, URL
+   không phải YouTube) → nay mọi ô không rỗng (trừ công thức không có id) mà không chứa video id của job đều đi tìm lại dòng.
+2. Nhánh >300s DIRECT-CUT không qua xác thực chặt → input cụt vẫn DONE. Nay kiểm từng part (có video+audio, hai luồng dài
+   tương đương); lỗi → quay về MUX (có xác thực chặt) → không DONE.
+3. `os.replace` check.xlsx bị Windows từ chối khi reader đang mở file → nay reader đọc cả file vào RAM rồi parse (handle mở
+   vài ms) và replace chạy dưới khoá cache.
+4. `Duration: N/A` của 1 input làm lệch thời lượng sang input kia → nay gắn theo từng `Input #N`; thiếu → ffprobe, không đặt sàn.
+5. Fallback ffprobe dùng thời lượng video của resolver làm sàn cho output `-shortest` → bỏ sàn khi không biết đủ 2 input.
+Thêm: xoá file tạm khi xác thực thất bại; đọc thống kê dưới khoá; nhãn A/B chỉ gắn với video ≤ 4MiB.
+Test sau review: 120 passed + 1 xfailed (2/2 lần). Pipeline offline sau review (pipeline_offline_20261102_130907):
+HOT_READY p50 295 vs 301 ms (dur30), 665 vs 666 ms (dur120) — ngang V9.3.

@@ -1716,7 +1716,12 @@ def _write_status_to_excel_locked(excel_path: str, url_index: int, status_col_na
             if vid and ucol:
                 cell = str(ws.cell(row=row, column=ucol).value or "") if row <= ws.max_row else ""
                 if vid not in cell:
-                    if _V94_YT_ID_IN_CELL.search(cell) or row > ws.max_row:
+                    _c = cell.strip()
+                    _no_id_formula = (_c.startswith("=") and not _V94_YT_ID_IN_CELL.search(_c)
+                                      and not _extract_youtube_video_id(_c.split('"')[1] if '"' in _c else ""))
+                    # Review V9.4.1: mọi ô KHÔNG rỗng và không phải công thức-không-id đều coi là "video khác"
+                    # (kể cả host viết hoa, /v/, nocookie, URL không phải YouTube) → đi tìm dòng đúng.
+                    if (_c and not _no_id_formula) or row > ws.max_row:
                         matches = [r for r in range(2, ws.max_row + 1)
                                    if vid in str(ws.cell(row=r, column=ucol).value or "")]
                         if len(matches) == 1:
@@ -1751,7 +1756,8 @@ def _write_status_to_excel_locked(excel_path: str, url_index: int, status_col_na
             _tries = 0
             for _ in range(10):
                 try:
-                    os.replace(temp_path, excel_path)
+                    with _EXCEL_DF_CACHE_LOCK:      # không reader nội bộ nào đang mở file lúc đổi tên
+                        os.replace(temp_path, excel_path)
                     _done = True
                     break
                 except OSError:
@@ -1884,9 +1890,14 @@ def _read_excel_df_cached(excel_path: str):
         df = None
         _engine = "openpyxl"
         TELEM.span("-", "excel_read_begin")
+        # Review V9.4.1: đọc cả file vào RAM rồi parse từ BytesIO → handle chỉ mở vài ms, os.replace của
+        # write_status_to_excel (Windows từ chối khi file đang mở) gần như không bao giờ bị chặn.
+        import io as _io
+        with open(excel_path, "rb") as _fh:
+            _xbytes = _fh.read()
         if V94_EXCEL_CALAMINE and _v94_calamine_ok() and _V94_CALAMINE_VERIFIED.get(excel_path, True):
             try:
-                df = pd.read_excel(excel_path, sheet_name=0, dtype=str, engine="calamine").fillna("")
+                df = pd.read_excel(_io.BytesIO(_xbytes), sheet_name=0, dtype=str, engine="calamine").fillna("")
                 _engine = "calamine"
             except Exception:
                 df = None
@@ -1894,7 +1905,7 @@ def _read_excel_df_cached(excel_path: str):
                 # Lần đầu với file này: đối chiếu 1 lần với openpyxl (đúng engine V9.3). Chỉ số dòng
                 # quyết định dòng ghi DONE → bất kỳ sai khác shape/cột/URL nào là tắt calamine cho file.
                 try:
-                    ref = pd.read_excel(excel_path, sheet_name=0, dtype=str).fillna("")
+                    ref = pd.read_excel(_io.BytesIO(_xbytes), sheet_name=0, dtype=str).fillna("")
                     same = (ref.shape == df.shape and list(map(str, ref.columns)) == list(map(str, df.columns))
                             and ref.astype(str).values.tolist() == df.astype(str).values.tolist())
                     _V94_CALAMINE_VERIFIED[excel_path] = bool(same)
@@ -1904,7 +1915,7 @@ def _read_excel_df_cached(excel_path: str):
                     _V94_CALAMINE_VERIFIED[excel_path] = False
                     df = None
         if df is None:
-            df = pd.read_excel(excel_path, sheet_name=0, dtype=str).fillna("")
+            df = pd.read_excel(_io.BytesIO(_xbytes), sheet_name=0, dtype=str).fillna("")
             _engine = "openpyxl"
         TELEM.span("-", "excel_read_end", engine=_engine, rows=int(len(df)))
         _EXCEL_DF_CACHE.clear()
@@ -2310,6 +2321,22 @@ def split_video_copy_parallel(input_path: Path, out_dir: Path, part_seconds: int
                 if done % 2 == 0 or done == len(cmds):
                     logger(f"    -> {done}/{len(cmds)}")
         _v94_ff_mark_exit(FFMPEG_PATH)
+
+        if not failures and V94_VALIDATE_MUX_STRICT:
+            # Review V9.4.1: nhánh >300s (DIRECT-CUT) không đi qua bước mux nên phải kiểm từng part: có cả
+            # video + audio và hai luồng dài tương đương (input cắt cụt → part có v=79s a=100s → lỗi).
+            def _chk(i_p):
+                inf = _ffprobe_av_info(outputs[i_p])
+                vd = float(inf.get("video_duration") or 0)
+                ad = float(inf.get("audio_duration") or 0)
+                ok_ = bool(inf.get("has_video") and inf.get("has_audio") and vd > 0 and ad > 0
+                           and abs(vd - ad) <= max(0.6, 0.02 * max(vd, ad)))
+                return i_p, ok_, vd, ad
+            with ThreadPoolExecutor(max_workers=max_workers) as ex2:
+                for i_p, ok_, vd, ad in ex2.map(_chk, range(len(outputs))):
+                    if not ok_:
+                        failures.append(i_p + 1)
+                        logger(f"    ❌ Part {i_p + 1} không hợp lệ: video={vd:.1f}s audio={ad:.1f}s")
 
         if failures:
             logger(f"❌ Cắt lỗi ở part: {failures}")
@@ -3940,8 +3967,9 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
         # V9.4.1: số đo trung thực hơn (giữ nguyên mọi trường cũ ở trên, chỉ thêm phía sau)
         _fb = state["first_byte"] or 0.0
         _xfer = (total * 8.0 / 1e6 / max(1e-3, elapsed - _fb)) if _fb else 0.0
-        _br = sorted(state["body_rates"])
-        _lt = sorted(state["late_ttfb"])
+        with lock:
+            _br = sorted(state["body_rates"])
+            _lt = sorted(state["late_ttfb"])
         _p = lambda arr, q: arr[min(len(arr) - 1, int(q * (len(arr) - 1) + 0.5))] if arr else None
         _ltp50, _ltp90 = _p(_lt, 0.5), _p(_lt, 0.9)
         extra = (f" | xfer≈{_xfer:.0f}Mbps"
@@ -3949,7 +3977,7 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
                  + (f" ttfb_late={_ltp50:.2f}/{_ltp90:.2f}s" if _lt else "")
                  + f" hedge_real={state['hedges'] - state['races']} gets={state['host_req'][0] + state['host_req'][1]}"
                  + f" conc_peak={state['conc_peak']} splits={state['splits']} takeovers={state['takeovers']}"
-                 + f" prealloc={prealloc_ms:.0f}ms" + (f" ab={svw}" if svw else ""))
+                 + f" prealloc={prealloc_ms:.0f}ms" + (f" ab={svw}" if svw and total <= 4 * 1048576 else ""))
         logger(
             f"    [RANGE-TURBO] ✅ HOÀN TẤT {media_kind.upper()} | {total/1048576:.2f}MB | "
             f"{elapsed:.3f}s | ≈{total*8.0/1e6/elapsed:.0f}Mbps | workers={workers}→{state['workers_peak']} | "
@@ -4008,10 +4036,8 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
             "losers_pending": int(state["loser_pending"]), "mn_bans": state["bans"],
             "xfer_mbps": (round(state["done"] * 8.0 / 1e6 / max(1e-3, elapsed_ms / 1000.0 - (state["first_byte"] or 0)), 1)
                           if state["first_byte"] else None),
-            "conn_p50_mbps": (round(sorted(state["body_rates"])[len(state["body_rates"]) // 2], 2)
-                              if state["body_rates"] else None),
-            "ttfb_late_p50_ms": (round(sorted(state["late_ttfb"])[len(state["late_ttfb"]) // 2] * 1000.0, 1)
-                                 if state["late_ttfb"] else None),
+            "conn_p50_mbps": (lambda a: round(a[len(a) // 2], 2) if a else None)(sorted(list(state["body_rates"]))),
+            "ttfb_late_p50_ms": (lambda a: round(a[len(a) // 2] * 1000.0, 1) if a else None)(sorted(list(state["late_ttfb"]))),
         })
         TELEM.span(job, f"{media_kind}_download_complete", **{k: v for k, v in info.items()
                                                                 if k not in ("job", "cancel", "pool")})
@@ -4743,8 +4769,19 @@ def _v94_parse_mux_log(text: str) -> dict:
     info = {"format_duration": 0.0, "video_duration": 0.0, "audio_duration": 0.0, "width": 0, "height": 0,
             "has_video": False, "has_audio": False, "source": "mux_log"}
     try:
-        durs = [h * 3600 + m * 60 + sec for h, m, sec in
-                ((int(a), int(b), float(c)) for a, b, c in re.findall(r"Duration: (\d+):(\d+):([\d.]+)", text))]
+        # Review V9.4.1: gắn Duration với ĐÚNG input (#0 video, #1 audio); "Duration: N/A" → không biết.
+        _head = text.split("Output #0", 1)[0]
+        _by = {}
+        for _m in re.finditer(r"Input #(\d+),(.*?)(?=Input #\d+,|\Z)", _head, re.S):
+            _d = re.search(r"Duration: (\d+):(\d+):([\d.]+)", _m.group(2))
+            _by[int(_m.group(1))] = (int(_d.group(1)) * 3600 + int(_d.group(2)) * 60 + float(_d.group(3))) if _d else None
+        if _by:
+            durs = [(_by.get(0) or 0.0), (_by.get(1) or 0.0)]
+            info["in_dur_unknown"] = (_by.get(0) is None or _by.get(1) is None)
+        else:
+            durs = [h * 3600 + m * 60 + sec for h, m, sec in
+                    ((int(a), int(b), float(c)) for a, b, c in re.findall(r"Duration: (\d+):(\d+):([\d.]+)", text))]
+            info["in_dur_unknown"] = len(durs) < 2
         out = text.split("Output #0", 1)
         if len(out) < 2:
             return info
@@ -4784,6 +4821,8 @@ def _v94_strict_mux_check(info: dict):
     """(ok, reason) cho file OUTPUT của mux dựa trên báo cáo cuối của ffmpeg. Thiếu dữ liệu → (None, lý do)
     để caller rơi về ffprobe. Dung sai cho -shortest: max(0.3s, 1% của input ngắn nhất)."""
     try:
+        if info.get("in_dur_unknown"):
+            return None, "input_duration_unknown"
         ins = [x for x in (info.get("video_duration"), info.get("audio_duration")) if x and x > 0]
         if not ins:
             return None, "no_input_duration"
@@ -5620,6 +5659,9 @@ class Worker(threading.Thread):
                     k["first_get_ms"] = round((min(_fg) - self._v94["t0_ns"]) / 1e6, 2)
                     if _wk:
                         k["kpi3_ms"] = round((min(_fg) - _wk) / 1e6, 2)
+                # Review V9.4.1: nhãn A/B chỉ có nghĩa với video <= 4MiB (nhánh khác không dùng số worker này)
+                if k.get("ab_small_workers") and int(self._v94["video"].get("total") or 0) > 4 * 1048576:
+                    k["ab_small_workers_ignored"] = k.pop("ab_small_workers")
                 summary["first_get_ms"] = k.get("first_get_ms")
                 summary["kpi3_ms"] = k.get("kpi3_ms")
                 TELEM.span(vid, "job_summary", **summary)
@@ -6144,12 +6186,14 @@ class Worker(threading.Thread):
             _vinfo = _V94_MUX_INFO.pop(str(combined_file), None) if V94_VALIDATE_MODE == "mux_log" else None
             _mi = _vinfo if isinstance(_vinfo, dict) else {}
             _ins = [x for x in (_mi.get("video_duration"), _mi.get("audio_duration")) if x and x > 0]
-            if _ins:
+            if len(_ins) == 2 and not _mi.get("in_dur_unknown"):
                 _expected = min(_ins)
                 _tol = max(0.3, 0.01 * _expected)
-            else:   # thời lượng từ resolver có thể là số nguyên làm tròn → dung sai rộng hơn
-                _expected = float((video_data_used or {}).get("duration_sec") or 0.0)
-                _tol = max(1.05, 0.02 * _expected)
+            else:
+                # Review V9.4.1: không đủ thời lượng của CẢ HAI input → không đặt sàn thời lượng (thời lượng resolver
+                # chỉ là của video; audio có thể ngắn hơn hợp lệ với -shortest) → luật V9.4.0: có video+audio+duration>0.
+                _expected = 0.0
+                _tol = 0.0
             _strict = "off"
             _fail_why = ""
             _use_log = bool(_vinfo and _vinfo.get("has_video") and _vinfo.get("has_audio")
@@ -6201,11 +6245,12 @@ class Worker(threading.Thread):
                 self._v94["fail"] = f"validate_fail:{_fail_why}"
                 self.log(f"    ❌ VALIDATE thất bại ({_fail_why}) → KHÔNG DONE, không MOVE")
                 if not self.keep_temp:
-                    try:
-                        if combined_file.exists():
-                            combined_file.unlink()
-                    except OSError:
-                        pass
+                    for _p in (combined_file, video_file, audio_file):
+                        try:
+                            if _p and _p.exists():
+                                _p.unlink()
+                        except OSError:
+                            pass
                 self._v94_emit(url, url_index, False)
                 return
         _vf = str((video_data_used or {}).get("video_format_id") or "?")

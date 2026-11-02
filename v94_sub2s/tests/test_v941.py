@@ -796,6 +796,11 @@ def test_pipeline_ab_label(v94, monkeypatch, tmp_path, h264_media):
         w, master, st = _run_job(v94, monkeypatch, d, h264_media["v"], h264_media["a"], 30)
         assert st == "DONE"
         line = [l for l in master.logs if "HOÀN TẤT VIDEO" in l][0]
-        seen.append(w._v94["kpi"]["ab_small_workers"])
-        assert f"ab={seen[-1]}" in line
+        k = w._v94["kpi"]
+        if int(w._v94["video"].get("total") or 0) <= 4 * MB:
+            seen.append(k["ab_small_workers"])
+            assert f"ab={seen[-1]}" in line
+        else:                                   # video > 4MiB: nhánh A/B không áp dụng → không gắn nhãn
+            seen.append(k["ab_small_workers_ignored"])
+            assert " ab=" not in line
     assert seen == [6, 11]
