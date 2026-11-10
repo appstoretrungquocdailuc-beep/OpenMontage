@@ -195,3 +195,14 @@ Kết luận trung thực: 1 GET bị giới hạn bởi tốc độ **một** k
 file 2-3 MB có thể mất 4-5 s, chậm hơn 480p Range. Vì vậy có công tắc `V95_360P_RANGE` để A/B; mặc định vẫn 1 GET theo yêu cầu.
 Test: `tests/test_v95_360p.py` (15 test: 3 nhánh cắt, fallback JA→480, lỗi GET→link dự phòng, 403, không link → không DONE,
 480 không đổi, tắt cờ, config round-trip, Range flag).
+
+### Review độc lập V9.5 (3 góc + kiểm chứng, 9 agent) — 5 lỗi xác nhận, đã sửa + test
+1. Tiếng mặc định KHÔNG BIẾT (yt-dlp không ghi `language` cho itag 18) nhưng video ≥2 track có tiếng Nhật → trước đây vẫn tải
+   itag 18 im lặng. Nay: coi là không an toàn → chuyển 480p+JA; `_yt_info_to_direct` lấy tiếng mặc định từ track `(default)/(original)`;
+   link dự phòng cũng qua kiểm tra ngôn ngữ.
+2. `filesize_approx` (ước lượng tbr×duration) bị dùng làm sàn kiểm size chính xác → file đủ bị từ chối và không DONE. Nay: chỉ chặt
+   khi `length_exact`; ước lượng → dung sai 4%; không mang size của resolver A sang URL của B.
+3. Sau fallback aria2/IDM, KPI-360/span ghi dữ liệu cũ của lần 1-GET lỗi → nay ghi `engine=aria2/idm/1get`, `+alt`, bytes thật.
+4. ffprobe nền không chạy cho nhánh >300s (không có `final_file`) → nay kiểm mọi part trong thư mục cắt; test cả 3 nhánh có span.
+5. `bench report` đếm sai số job lỗi → sửa Counter.
+Test sau review: 144 passed + 1 xfailed (2 lần).

@@ -620,6 +620,7 @@ def _fast_player_request(video_id: str, client_key: str):
             "id": details.get("videoId") or video_id,
             "format_id": "18",
             "content_length": content_length,
+            "length_exact": content_length > 0,
             "source": f"FAST_RACE_{client_key.upper()}",
             "resolver_ms": (time.perf_counter() - t_req) * 1000.0,
         }
@@ -1457,6 +1458,8 @@ def _yt_info_to_direct(info, source: str):
         "id": info.get("id", str(int(time.time()))),
         "format_id": str(info.get("format_id") or "18"),
         "content_length": size,
+        # V9.5: filesize_approx = tbr×duration chỉ là ƯỚC LƯỢNG → không được dùng làm sàn kiểm size chính xác.
+        "length_exact": bool(info.get("filesize")),
         "source": source,
         "default_audio_lang": str(info.get("language") or "").lower(),
         "has_ja_audio": False, "audio_tracks": 0,
@@ -1471,6 +1474,16 @@ def _yt_info_to_direct(info, source: str):
             if _looks_japanese_lang(_fmt_lang_text(f)):
                 out["has_ja_audio"] = True
         out["audio_tracks"] = len(ids)
+        if not out["default_audio_lang"]:
+            # itag 18 không có audioTrack → info["language"] = None. Lấy từ track được yt-dlp đánh dấu
+            # default/original (language_preference 10/5 hoặc format_note "(default)"/"(original)").
+            for f in info.get("formats") or []:
+                if not _fmt_is_audio_only(f) or not f.get("language"):
+                    continue
+                note = str(f.get("format_note") or "").lower()
+                if f.get("language_preference") in (10, 5) or "(default)" in note or "(original)" in note:
+                    out["default_audio_lang"] = str(f["language"]).lower()
+                    break
         if not out["has_ja_audio"] and _looks_japanese_lang(out["default_audio_lang"]):
             out["has_ja_audio"] = True
     except Exception:
@@ -5680,6 +5693,7 @@ class Worker(threading.Thread):
             moved = move_whole_folder(target_dir)
             if moved is None:
                 return False
+            _kp["final_file"] = str(moved)          # thư mục part (ffprobe nền 360p sẽ kiểm mọi *.mp4 bên trong)
 
             if final_mp4.exists() and not self.keep_temp:
                 try:
@@ -5778,7 +5792,8 @@ class Worker(threading.Thread):
                 if k.get("mode") == "360fast":
                     self.log(
                         f"📊 V9.5 KPI-360 [{vid}] resolve={k.get('resolve_ms','-')}ms | first_byte={k.get('first_byte_ms','-')}ms "
-                        f"| download={k.get('download_ms','-')}ms ({(k.get('bytes') or 0)/1048576:.2f}MB ≈{k.get('mbps','-')}Mbps) "
+                        f"| download={k.get('download_ms','-')}ms ({(k.get('bytes') or 0)/1048576:.2f}MB ≈{k.get('mbps','-')}Mbps, {k.get('engine','-')}"
+                        f"{'+alt' if k.get('alt_link') else ''}) "
                         f"| HOT_READY={k.get('hot_ready_ms','-')}ms | post={k.get('postprocess_ms','-')} done={k.get('status_done_ms','-')} "
                         f"| TOTAL={k.get('pipeline_total_ms','-')}ms | ok={ok_holder['ok']}"
                         + (f" | fail={summary['fail_reason']}" if not ok_holder["ok"] else "")
@@ -5878,10 +5893,17 @@ class Worker(threading.Thread):
                  f" | lang={dlang or '?'} tracks={data.get('audio_tracks') or '?'}{' ja✓' if has_ja else ''}")
 
         # --- 2) tiếng mặc định ---
-        if dlang and not _looks_japanese_lang(dlang) and has_ja:
-            k["ja_fallback"] = f"default={dlang}"
-            TELEM.span(self._v94["job"], "q360_ja_fallback", default_lang=dlang)
-            self.log(f"🈁 360P [{vid}]: tiếng mặc định của itag 18 = '{dlang}' nhưng video CÓ track tiếng Nhật"
+        def _ja_unsafe(d):
+            """True khi itag 18 có thể mang tiếng KHÁC Nhật trong khi video có track Nhật: tiếng mặc định ghi rõ
+            không phải Nhật, hoặc KHÔNG BIẾT tiếng mặc định mà video có >= 2 track (review V9.5)."""
+            dl = str(d.get("default_audio_lang") or "")
+            tracks = int(d.get("audio_tracks") or 0)
+            return bool(d.get("has_ja_audio")) and not _looks_japanese_lang(dl) and (bool(dl) or tracks >= 2)
+        if _ja_unsafe(data):
+            k["ja_fallback"] = f"default={dlang or '?'}"
+            TELEM.span(self._v94["job"], "q360_ja_fallback", default_lang=dlang or "?", tracks=data.get("audio_tracks"))
+            self.log(f"🈁 360P [{vid}]: tiếng mặc định của itag 18 = '{dlang or '?'}' (tracks={data.get('audio_tracks')}) "
+                     f"nhưng video CÓ track tiếng Nhật"
                      + (" → chuyển sang 480p + audio Nhật" if V95_360P_JA_FALLBACK else " (V95_360P_JA_FALLBACK=0: vẫn tải 360p)"))
             if V95_360P_JA_FALLBACK:
                 return "FALLBACK_480"
@@ -5913,21 +5935,30 @@ class Worker(threading.Thread):
             # dự phòng 1: link khác (yt-dlp nhanh) bằng cùng đường 1 GET; dự phòng 2: engine (aria2 / IDM)
             self.log(f"    ↪ 360P [{vid}] 1GET lỗi ({dinfo.get('fail_reason')}) → link dự phòng")
             alt = self._quick_fetch_ytdlp_360p(url, robust=False) or self._quick_fetch_ytdlp_360p(url, robust=True)
+            if alt and alt.get("url") and _ja_unsafe(alt) and V95_360P_JA_FALLBACK:
+                k["ja_fallback"] = f"default={alt.get('default_audio_lang') or '?'}(alt)"
+                self.log(f"🈁 360P [{vid}]: link dự phòng cho thấy tiếng mặc định không phải Nhật → chuyển sang 480p + audio Nhật")
+                return "FALLBACK_480"
             if alt and alt.get("url") and alt.get("url") != data.get("url"):
                 used = alt
-                expected = int(alt.get("content_length") or expected)
+                expected = int(alt.get("content_length") or 0)       # KHÔNG mang size của resolver A sang URL của B
                 dinfo = {}
+                k["alt_link"] = True
                 ok = _download_direct_single_get(alt["url"], self.temp_dir, temp_name, self.log,
                                                  self.MIN_BYTES_VIDEO, expected, info=dinfo)
             if not ok:
                 src_url = (used or data).get("url")
                 if self.download_engine == "idm":
+                    k["engine"] = "idm"
                     ok = download_idm_ultimate(src_url, self.temp_dir, temp_name, self.log,
                                                self.MIN_BYTES_VIDEO, media_label="360p itag 18")
                 else:
+                    k["engine"] = "aria2"
                     self.log(f"    ↪ 360P [{vid}] → ARIA2 fallback")
                     ok = download_aria2c_ultimate(src_url, self.temp_dir, temp_name, self.log,
                                                   self.MIN_BYTES_VIDEO, expected_bytes=expected)
+                if ok and temp_file.exists():
+                    dinfo = {"bytes": temp_file.stat().st_size, "engine": k["engine"]}
         t_dl = time.perf_counter_ns()
         k["download_ms"] = round((t_dl - t_res) / 1e6, 2)
         k["video_ms"] = k["download_ms"]
@@ -5935,16 +5966,18 @@ class Worker(threading.Thread):
         if dinfo.get("elapsed_ms") and dinfo.get("bytes"):
             k["mbps"] = round(dinfo["bytes"] * 8.0 / 1e6 / max(1e-3, dinfo["elapsed_ms"] / 1000.0), 1)
         self._v94_mark("video_done_at_ms", "q360_download_complete", ok=bool(ok), bytes=dinfo.get("bytes"),
-                       ttfb_ms=dinfo.get("ttfb_ms"), elapsed_ms=dinfo.get("elapsed_ms"), fail=dinfo.get("fail_reason"))
+                       ttfb_ms=dinfo.get("ttfb_ms"), elapsed_ms=dinfo.get("elapsed_ms"), fail=dinfo.get("fail_reason"),
+                       engine=k.get("engine"), alt_link=bool(k.get("alt_link")))
         if not ok or not temp_file.exists():
             self._v94["fail"] = f"q360_download:{dinfo.get('fail_reason') or 'engine_fail'}"
             self.log(f"❌ 360P [{vid}]: tải thất bại → KHÔNG DONE")
             self._v94_emit(url, url_index, False)
             return "FAIL"
 
-        # --- 4) xác thực nhẹ: kích thước ---
+        # --- 4) xác thực nhẹ: kích thước (chỉ chặt khi content_length là số CHÍNH XÁC; filesize_approx → dung sai 4%) ---
         size = temp_file.stat().st_size
-        if expected > 0 and size < expected:
+        _exact = bool((used or data).get("length_exact", True))
+        if expected > 0 and ((size < expected) if _exact else (size + 4096 < int(expected * 0.96))):
             self._v94["fail"] = f"q360_short_{size}/{expected}"
             self.log(f"❌ 360P [{vid}]: file {size} B < content_length {expected} B → KHÔNG DONE")
             try:
@@ -6004,15 +6037,18 @@ class Worker(threading.Thread):
 
                 def _bg_probe(path=final_path, job=job, logf=logf):
                     try:
-                        info = _ffprobe_av_info(Path(path))
-                        okp = bool(info.get("has_video") and info.get("has_audio") and float(info.get("format_duration") or 0) > 0)
-                        TELEM.span(job, "q360_bg_probe", ok=okp, w=info.get("width"), h=info.get("height"),
-                                   vdur=info.get("video_duration"), adur=info.get("audio_duration"))
-                        if not okp:
-                            logf(f"    ⚠️ 360P [{job}] ffprobe SAU DONE: file nghi hỏng (video={info.get('has_video')} "
-                                 f"audio={info.get('has_audio')}) → kiểm tra tay: {Path(path).name}")
-                    except Exception:
-                        pass
+                        pth = Path(path)
+                        targets = sorted(pth.glob("*.mp4")) if pth.is_dir() else [pth]
+                        for t in targets:
+                            info = _ffprobe_av_info(t)
+                            okp = bool(info.get("has_video") and info.get("has_audio") and float(info.get("format_duration") or 0) > 0)
+                            TELEM.span(job, "q360_bg_probe", ok=okp, file=t.name, w=info.get("width"), h=info.get("height"),
+                                       vdur=info.get("video_duration"), adur=info.get("audio_duration"))
+                            if not okp:
+                                logf(f"    ⚠️ 360P [{job}] ffprobe SAU DONE: file nghi hỏng (video={info.get('has_video')} "
+                                     f"audio={info.get('has_audio')}) → kiểm tra tay: {t.name}")
+                    except Exception as _e:
+                        TELEM.span(job, "q360_bg_probe", ok=None, error=f"{type(_e).__name__}: {_e}")
                 threading.Thread(target=_bg_probe, name="V95BgProbe", daemon=True).start()
         return "DONE" if success else "FAIL"
 
@@ -6029,6 +6065,7 @@ class Worker(threading.Thread):
             if r360 != "FALLBACK_480":
                 return
             self._v94["kpi"]["mode"] = "480hard(from360)"
+            self._v94["video"] = {}
             self.log(f"    ↪ [360p→480p] {excel_info}chuyển sang luồng 480p + audio Nhật cho video này")
         self.log(f"=== [START 480P-HARD] {excel_info}{url} ===")
         t_total_start = time.perf_counter()

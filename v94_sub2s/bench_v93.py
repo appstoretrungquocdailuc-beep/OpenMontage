@@ -701,7 +701,13 @@ def run_report(args):
         if not rs:
             continue
         row = {"mode": mode, "n": len(rs), "success_rate": round(sum(1 for r in rs if r["success"]) / len(rs), 3),
-               "fail_reasons": json.dumps({str(r.get("fail_reason"))[:40]: 1 for r in rs if not r["success"]}, ensure_ascii=False)}
+               "fail_reasons": ""}
+        _fc = {}
+        for r in rs:
+            if not r["success"]:
+                _k = str(r.get("fail_reason") or "?")[:40]
+                _fc[_k] = _fc.get(_k, 0) + 1
+        row["fail_reasons"] = json.dumps(_fc, ensure_ascii=False) if _fc else ""
         for mt in metrics:
             vals = [r.get(mt) for r in rs if r["success"] and isinstance(r.get(mt), (int, float))]
             if vals:

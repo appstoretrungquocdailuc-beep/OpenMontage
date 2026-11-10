@@ -44,7 +44,7 @@ def _master360(v94, root, mode="360fast"):
 
 
 def _run(v94, monkeypatch, tmp_path, media, dur, mode="360fast", lang_meta=None, native_ok=True,
-         fast_fail=False, status_code=None):
+         fast_fail=False, status_code=None, alt_status=None, aria2_writes=False, alt_meta=None, telem=None):
     from conftest import get_qapp
     get_qapp()
     vid = "Q360TestAbc"
@@ -59,17 +59,19 @@ def _run(v94, monkeypatch, tmp_path, media, dur, mode="360fast", lang_meta=None,
             u18 = g.add("/videoplayback/18", data[: len(data) // 2])        # bị cắt → size < content_length
         else:
             u18 = g.add("/videoplayback/18", data)
-        alt18 = g.add("/videoplayback/18alt", data)
+        alt18 = (g.add("/videoplayback/18alt", mode="status", code=alt_status) if alt_status
+                 else g.add("/videoplayback/18alt", data))
         bundle18 = {"url": u18, "title": "テスト360", "id": vid, "format_id": "18", "content_length": len(data),
                     "source": "FAST_RACE_ANDROID_VR", "default_audio_lang": "ja", "has_ja_audio": True,
                     "audio_tracks": 1, "duration_sec": float(dur)}
-        bundle18.update(lang_meta or {})
+        bundle18.update({kk: vv for kk, vv in (lang_meta or {}).items() if vv is not None})
 
         def fake360(u):
             calls["native360"] += 1
             return dict(bundle18) if native_ok else None
         monkeypatch.setattr(v94, "_fast_innertube_360p", fake360)
         alt = dict(bundle18); alt["url"] = alt18; alt["source"] = "YTDLP_FAST"
+        alt.update(alt_meta or {})
         monkeypatch.setattr(v94, "_ytdlp_resolve_on_warm_thread", lambda u, robust=False: dict(alt))
         # 480p resolver (chỉ dùng khi fallback)
         v480 = g.add("/videoplayback/v480", data)
@@ -83,8 +85,13 @@ def _run(v94, monkeypatch, tmp_path, media, dur, mode="360fast", lang_meta=None,
                     "source": "NATIVE_VISIONOS"}
         monkeypatch.setattr(v94, "_fast_innertube_480", fake480)
         monkeypatch.setattr(v94, "_ytdlp_resolve_480_on_warm_thread", lambda u, robust=False: None)
-        monkeypatch.setattr(v94, "download_aria2c_ultimate",
-                            lambda *a, **k: calls.__setitem__("aria2", calls["aria2"] + 1) or False)
+        def fake_aria2(u, temp_dir, filename, logger, min_bytes, expected_bytes=0):
+            calls["aria2"] += 1
+            if aria2_writes:
+                (Path(temp_dir) / filename).write_bytes(data)
+                return True
+            return False
+        monkeypatch.setattr(v94, "download_aria2c_ultimate", fake_aria2)
         xl = tmp_path / "check.xlsx"
         _xlsx(str(xl), url)
         v94._EXCEL_DF_CACHE.clear()
@@ -92,7 +99,13 @@ def _run(v94, monkeypatch, tmp_path, media, dur, mode="360fast", lang_meta=None,
         w = v94.Worker(master, str(xl), "URL", "STATUS")
         assert w.quality_mode == mode
         w._process_single_url(url, 1)
-        time.sleep(0.6)       # ffprobe nền
+        # ffprobe nền phát log từ thread khác → Qt xếp hàng tín hiệu, cần bơm event loop để nhận
+        app = get_qapp()
+        end = time.time() + 1.0
+        while time.time() < end:
+            if app is not None:
+                app.processEvents()
+            time.sleep(0.02)
     from openpyxl import load_workbook
     st = load_workbook(str(xl)).worksheets[0].cell(row=3, column=6).value
     return w, master, st, calls
@@ -155,11 +168,65 @@ def test_360_truncated_download_no_done_then_alt_link(v94, monkeypatch, tmp_path
 
 
 @need_ff
-def test_360_http403_then_aria2_fallback_not_done_when_aria2_fails(v94, monkeypatch, tmp_path, prog18):
+def test_360_http403_alt_link_used(v94, monkeypatch, tmp_path, prog18):
     w, master, st, calls = _run(v94, monkeypatch, tmp_path, prog18[120], 120, status_code=403)
-    # cả 2 link đều /18 (403) vì alt khác URL nhưng... alt18 OK → DONE; kiểm tra alt được dùng
     log = "\n".join(master.logs)
     assert st == "DONE", log[-1500:]
+    assert w._v94["kpi"].get("alt_link") is True and calls["aria2"] == 0 and w._v94["kpi"]["engine"] == "1get"
+
+
+@need_ff
+def test_360_both_links_403_aria2_fails_no_done(v94, monkeypatch, tmp_path, prog18):
+    w, master, st, calls = _run(v94, monkeypatch, tmp_path, prog18[120], 120, status_code=403, alt_status=403)
+    assert st in (None, "") and calls["aria2"] == 1 and w._v94["fail"].startswith("q360_download")
+    assert w._v94["kpi"]["engine"] == "aria2"
+
+
+@need_ff
+def test_360_both_links_403_aria2_succeeds(v94, monkeypatch, tmp_path, prog18):
+    w, master, st, calls = _run(v94, monkeypatch, tmp_path, prog18[120], 120, status_code=403, alt_status=403,
+                                aria2_writes=True)
+    log = "\n".join(master.logs)
+    assert st == "DONE", log[-1500:]
+    k = w._v94["kpi"]
+    assert k["engine"] == "aria2" and k["bytes"] == prog18[120].stat().st_size
+    assert "aria2+alt" in [l for l in master.logs if "KPI-360" in l][0]
+
+
+@need_ff
+def test_360_unknown_default_lang_multitrack_falls_back(v94, monkeypatch, tmp_path, prog18):
+    """Review V9.5: tiếng mặc định KHÔNG BIẾT nhưng video có >= 2 track và có track Nhật → không được tải itag 18."""
+    w, master, st, calls = _run(v94, monkeypatch, tmp_path, prog18[120], 120,
+                                lang_meta={"default_audio_lang": "", "has_ja_audio": True, "audio_tracks": 2})
+    assert st == "DONE" and calls["native480"] >= 1 and w._v94["kpi"]["ja_fallback"] == "default=?"
+
+
+@need_ff
+def test_360_unknown_default_lang_single_track_ok(v94, monkeypatch, tmp_path, prog18):
+    w, master, st, calls = _run(v94, monkeypatch, tmp_path, prog18[120], 120,
+                                lang_meta={"default_audio_lang": "", "has_ja_audio": False, "audio_tracks": 1})
+    assert st == "DONE" and calls["native480"] == 0
+
+
+@need_ff
+def test_360_alt_link_language_guard(v94, monkeypatch, tmp_path, prog18):
+    w, master, st, calls = _run(v94, monkeypatch, tmp_path, prog18[120], 120, status_code=403,
+                                alt_meta={"default_audio_lang": "en", "has_ja_audio": True, "audio_tracks": 2})
+    assert st == "DONE" and calls["native480"] >= 1 and "(alt)" in w._v94["kpi"]["ja_fallback"]
+
+
+@need_ff
+def test_360_filesize_approx_overshoot_accepted(v94, monkeypatch, tmp_path, prog18):
+    """content_length từ yt-dlp filesize_approx lớn hơn file thật 2% → vẫn DONE (dung sai 4%); số chính xác → không."""
+    size = prog18[120].stat().st_size
+    w, master, st, calls = _run(v94, monkeypatch, tmp_path, prog18[120], 120,
+                                lang_meta={"content_length": int(size * 1.02), "length_exact": False})
+    assert st == "DONE"
+    d2 = tmp_path / "exact"; d2.mkdir()
+    w2, m2, st2, _ = _run(v94, monkeypatch, d2, prog18[120], 120,
+                          lang_meta={"content_length": size + 10, "length_exact": True, "url": None})
+    # url None → _run dùng u18 (file đủ) nhưng content_length chính xác lớn hơn 10 B → KHÔNG DONE (alt cũng cùng meta)
+    assert st2 in (None, "") and w2._v94["fail"].startswith("q360_short")
 
 
 @need_ff
@@ -195,16 +262,33 @@ def test_flag_off_forces_480(v94, monkeypatch, tmp_path):
     assert w.quality_mode == "480hard"
 
 
-def test_bg_probe_warns_on_bad_file(v94, monkeypatch, tmp_path):
-    """ffprobe nền sau DONE chỉ cảnh báo (không đổi DONE)."""
-    logs = []
-    w = object.__new__(v94.Worker)
-    bad = tmp_path / "x.mp4"; bad.write_bytes(b"not a video" * 1000)
-    w._v94 = {"job": "J", "kpi": {"final_file": str(bad)}, "video": {}, "audio": {}}
-    w.log = logs.append
-    # chạy trực tiếp phần probe nền
-    info = v94._ffprobe_av_info(bad)
-    assert not (info["has_video"] and info["has_audio"])
+@need_ff
+def test_bg_probe_warns_on_bad_file(v94, monkeypatch, tmp_path, prog18):
+    """ffprobe nền sau DONE chỉ cảnh báo (không đổi DONE): giả lập file cuối bị hỏng sau khi MOVE."""
+    real_probe = v94._ffprobe_av_info
+
+    def corrupt_then_probe(path):
+        p = Path(path)
+        if p.suffix == ".mp4" and "final" in str(p):
+            p.write_bytes(b"not a video" * 2000)
+        return real_probe(path)
+    monkeypatch.setattr(v94, "_ffprobe_av_info", corrupt_then_probe)
+    w, master, st, calls = _run(v94, monkeypatch, tmp_path, prog18[120], 120)
+    assert st == "DONE"
+    assert any("ffprobe SAU DONE: file nghi hỏng" in l for l in master.logs)
+
+
+@need_ff
+@pytest.mark.parametrize("dur", [30, 120, 310])
+def test_bg_probe_runs_for_all_branches(v94, monkeypatch, tmp_path, prog18, dur):
+    t = v94.V94Telemetry(out_dir=str(tmp_path), enabled=True); t._thread = object()
+    monkeypatch.setattr(v94, "TELEM", t)
+    w, master, st, calls = _run(v94, monkeypatch, tmp_path, prog18[dur], dur)
+    assert st == "DONE"
+    rows = [r for r in t.drain() if r["ev"] == "q360_bg_probe"]
+    assert rows and all(r["ok"] for r in rows), rows
+    if dur > 300:
+        assert len(rows) >= 3
 
 
 def test_audio_lang_meta(v94):

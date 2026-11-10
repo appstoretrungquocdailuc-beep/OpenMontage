@@ -99,7 +99,7 @@ Thư mục này chứa:
 python -m py_compile V9_3_AUDIO.py V9_4_SUB2S.py bench_v93.py
 python -m pytest -q -rfxX
 ```
-Kết quả mong đợi (V9.5): `135 passed, 1 xfailed` (đôi khi `136 passed` vì bug V9.3 là race, có lần không lộ). XFAIL là **bug V9.3 được tái hiện có chủ đích** (4 job ghi STATUS
+Kết quả mong đợi (V9.5): `144 passed, 1 xfailed` (đôi khi `145 passed` vì bug V9.3 là race, có lần không lộ). XFAIL là **bug V9.3 được tái hiện có chủ đích** (4 job ghi STATUS
 song song làm mất DONE / hỏng `check.xlsx`). Nội dung test: 206 chuẩn (SHA256), 302, 403/410/429, 200 bỏ
 Range, size ước tính sai (4 kiểu), size không biết, Content-Range sai, đứt kết nối giữa chừng, header trễ,
 đuôi chậm (steal), 8 tải đồng thời, huỷ + dọn thread/file, 416, rollback cờ, chọn audio JA, đuôi file, Excel,
