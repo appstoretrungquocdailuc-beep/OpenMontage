@@ -390,7 +390,7 @@ def _probe(ffprobe, f):
         return {}
 
 
-def run_live_once(mod, ver, url, work, engine, cutsec):
+def run_live_once(mod, ver, url, work, engine, cutsec, quality="480hard"):
     out = work / "out"; final = work / "final"
     for p in (out, final):
         p.mkdir(parents=True, exist_ok=True)
@@ -401,6 +401,7 @@ def run_live_once(mod, ver, url, work, engine, cutsec):
     m.worker_signals.url_finished.connect(lambda u, i, ok: done.append(ok))
     m.out_entry = _T(str(out)); m.keep_temp_checkbox = _C(False); m.final_move_entry = _T(str(final))
     m.combo_downloader = _Combo(engine); m.cutsec_entry = _T(str(cutsec))
+    m.quality_mode = (lambda q=quality: q)      # V9.5: "360fast" | "480hard" (V9.3 bỏ qua)
     m.realtime_stop_event = threading.Event()
     w = mod.Worker(m, "", "URL", "STATUS")
     th0 = threading.active_count()
@@ -470,11 +471,12 @@ def run_live(args):
     work_root = Path(tempfile.mkdtemp(prefix="live_"))
     rows = []
     wsets = [int(x) for x in (args.workers_video or "0").split(",")]
+    qualities = (["360fast", "480hard"] if args.quality == "both" else [args.quality])
     # warm-up: 1 lần/bản, không tính
     if not args.no_warmup:
         for ver, mod in mods.items():
             print(f"[warm-up] {ver} {urls[0]}")
-            run_live_once(mod, ver, urls[0], work_root / f"warm_{ver}", args.engine, args.cutsec)
+            run_live_once(mod, ver, urls[0], work_root / f"warm_{ver}", args.engine, args.cutsec, qualities[0])
             time.sleep(args.gap)
     i = 0
     for rep in range(args.reps):
@@ -486,22 +488,25 @@ def run_live(args):
                     mod = mods[ver]
                     if wv:
                         _set_workers(mod, ver, "video", wv)
-                    row = run_live_once(mod, ver, url, work_root / f"r{i}_{ver}", args.engine, args.cutsec)
-                    row.update({"rep": rep, "workers_video_override": wv, "url_kind":
-                                "short" if "/shorts/" in url else "watch"})
-                    rows.append(row)
+                    for q in (qualities if ver == "v94" else qualities[:1]):
+                        row = run_live_once(mod, ver, url, work_root / f"r{i}_{ver}_{q}", args.engine, args.cutsec, q)
+                        row.update({"rep": rep, "workers_video_override": wv, "url_kind":
+                                    "short" if "/shorts/" in url else "watch",
+                                    "quality": (q if ver == "v94" else "480hard")})
+                        rows.append(row)
+                        print(f"  {ver}/{row['quality']} {row['video_id']} ok={row['success']} hot={row.get('hot_ready_ms')}ms "
+                              f"media={row.get('media_ready_ms')}ms total={row.get('pipeline_total_ms')}ms "
+                              f"{'FAIL:' + str(row.get('fail_reason')) if not row['success'] else ''}")
+                        shutil.rmtree(work_root / f"r{i}_{ver}_{q}", ignore_errors=True)
+                        time.sleep(args.gap)
                     if wv:
                         _set_workers(mod, ver, "video", 0)
-                    print(f"  {ver} {row['video_id']} ok={row['success']} hot={row.get('hot_ready_ms')}ms "
-                          f"media={row.get('media_ready_ms')}ms total={row.get('pipeline_total_ms')}ms "
-                          f"{'FAIL:' + str(row.get('fail_reason')) if not row['success'] else ''}")
-                    shutil.rmtree(work_root / f"r{i}_{ver}", ignore_errors=True)
-                    time.sleep(args.gap)
     metrics = ["resolve_video_ms", "resolve_audio_ms", "video_ms", "audio_ms", "media_ready_ms",
                "mux_ms", "hot_ready_ms", "pipeline_total_ms", "threads_after", "cpu_s"]
-    summ = summarize(rows, ["version", "workers_video_override"], metrics)
+    metrics += ["resolve_ms", "first_byte_ms", "download_ms", "bytes", "mbps"]      # V9.5 360p
+    summ = summarize(rows, ["version", "quality", "workers_video_override"], metrics)
     summ_vid = summarize(rows, ["video_id", "version"], ["media_ready_ms", "hot_ready_ms"])
-    print_table(summ, ["version", "workers_video_override", "n", "success_rate", "resolve_video_ms_p50",
+    print_table(summ, ["version", "quality", "workers_video_override", "n", "success_rate", "resolve_video_ms_p50",
                        "video_ms_p50", "audio_ms_p50", "media_ready_ms_p50", "media_ready_ms_p90",
                        "hot_ready_ms_p50", "hot_ready_ms_p90", "hot_ready_ms_p95", "under_2s_hot_ready_ms",
                        "fail_reasons"])
@@ -596,7 +601,33 @@ def run_pipeline_offline(args):
     mods = {v: load(MODS[v]) for v in args.versions}
     rows = []
     link = int(args.link_mbps * 1e6 / 8)
+    # V9.5: 360p progressive (itag 18 giả: H.264+AAC 1 file) chạy cùng kịch bản, chỉ với v94
+    p18 = {}
+    if getattr(args, "quality", "480hard") in ("360fast", "both") and "v94" in mods:
+        for dur in (30, 120):
+            f = media_dir / f"p18_{dur}.mp4"
+            subprocess.run([ff, "-y", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=10", "-f", "lavfi", "-i",
+                            f"sine=duration={dur}", "-t", str(dur), "-c:v", "libx264", "-preset", "ultrafast",
+                            "-pix_fmt", "yuv420p", "-b:v", "300k", "-c:a", "aac", "-b:a", "48k", "-shortest", str(f)],
+                           check=True, capture_output=True)
+            p18[dur] = f
     with MockGVS(link_bytes_per_sec=link, ttfb=args.ttfb_ms / 1000.0) as g:
+        for dur, f18 in p18.items():
+            u18 = g.add(f"/videoplayback/p18_{dur}", f18.read_bytes(), rate=args.conn_mbps_video * 1e6 / 8)
+            mod = mods["v94"]
+            for rep in range(args.reps):
+                vid = f"P360{dur:03d}{rep:02d}x"[:11].ljust(11, "x")
+                b18 = {"url": u18, "title": "テスト", "id": vid, "format_id": "18", "content_length": f18.stat().st_size,
+                       "source": "FAST_RACE_ANDROID_VR", "default_audio_lang": "ja", "has_ja_audio": True,
+                       "audio_tracks": 1, "duration_sec": float(dur)}
+                mod._fast_innertube_360p = (lambda b: (lambda u: dict(b)))(b18)
+                mod._ytdlp_resolve_on_warm_thread = lambda u, robust=False: None
+                mod.ARIA2C_PATH = mod.ARIA2C_PATH or sys.executable
+                work = Path(tempfile.mkdtemp(prefix="pipe360_"))
+                row = run_live_once(mod, "v94", f"https://www.youtube.com/shorts/{vid}", work, "aria2c", "0", "360fast")
+                row.update({"case": f"dur{dur}_p18_{f18.stat().st_size // 1024}KiB", "rep": rep, "quality": "360fast"})
+                rows.append(row)
+                shutil.rmtree(work, ignore_errors=True)
         for dur, (v, a) in clips.items():
             vu = g.add(f"/videoplayback/v{dur}", v.read_bytes(), rate=args.conn_mbps_video * 1e6 / 8)
             au = g.add(f"/videoplayback/a{dur}", a.read_bytes(), rate=args.conn_mbps_audio * 1e6 / 8)
@@ -615,16 +646,16 @@ def run_pipeline_offline(args):
                     work = Path(tempfile.mkdtemp(prefix="pipe_"))
                     row = run_live_once(mod, ver, f"https://www.youtube.com/shorts/{vid}", work, "aria2c", "0")
                     row.update({"case": f"dur{dur}_v{v.stat().st_size // 1024}KiB_a{a.stat().st_size // 1024}KiB",
-                                "rep": rep})
+                                "rep": rep, "quality": "480hard"})
                     rows.append(row)
                     shutil.rmtree(work, ignore_errors=True)
                     time.sleep(0.05)
     metrics = ["resolve_video_ms", "video_ms", "audio_ms", "media_ready_ms", "mux_ms", "validate_ms",
-               "hot_ready_ms", "file_validated_ms", "pipeline_total_ms", "wall_ms"]
-    summ = summarize(rows, ["case", "version"], metrics)
-    print_table(summ, ["case", "version", "n", "success_rate", "media_ready_ms_p50", "mux_ms_p50",
-                       "hot_ready_ms_p50", "hot_ready_ms_p90", "validate_ms_p50", "pipeline_total_ms_p50",
-                       "under_2s_hot_ready_ms"])
+               "hot_ready_ms", "file_validated_ms", "pipeline_total_ms", "wall_ms",
+               "resolve_ms", "first_byte_ms", "download_ms", "mbps"]
+    summ = summarize(rows, ["case", "version", "quality"], metrics)
+    print_table(summ, ["case", "version", "quality", "n", "success_rate", "media_ready_ms_p50", "mux_ms_p50",
+                       "hot_ready_ms_p50", "hot_ready_ms_p90", "pipeline_total_ms_p50", "under_2s_hot_ready_ms"])
     write_report("pipeline_offline", rows, summ, [
         "Resolver GIẢ (trả URL mock ngay) → resolve≈0: KHÔNG đại diện độ trễ Innertube/yt-dlp thật.",
         f"Mock GVS: link={args.link_mbps}Mbps per-conn video={args.conn_mbps_video} audio={args.conn_mbps_audio}Mbps "
@@ -632,6 +663,60 @@ def run_pipeline_offline(args):
         "V9.4 xác thực file trước DONE bằng log của chính lệnh mux (validate_ms≈0; ffprobe chỉ là fallback).",
     ])
     shutil.rmtree(media_dir, ignore_errors=True)
+    return 0
+
+
+# ----------------------------------------------------------------------------- report (telemetry → percentiles)
+def run_report(args):
+    """Đọc span job_summary trong telemetry JSONL; in P50/P90/P99 từng bước cho 360p và 480p.
+    360p: resolve (có link) → first_byte → download → hot_ready (file sẵn sàng) → status_done, kèm MB và Mbps."""
+    files = args.telemetry or sorted(str(p) for p in REPORT.glob("telemetry_*.jsonl"))
+    if not files:
+        print("❌ Không có telemetry_*.jsonl trong perf_report/. Chạy GUI/bench trước."); return 2
+    rows = []
+    for f in files:
+        try:
+            for line in Path(f).read_text(encoding="utf-8").splitlines():
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                if r.get("ev") == "job_summary":
+                    rows.append(r)
+        except OSError:
+            pass
+    if not rows:
+        print("❌ Không có job_summary nào."); return 2
+    for r in rows:
+        r["success"] = bool(r.get("success"))
+        if "bytes" in r and r["bytes"]:
+            r["size_mb"] = round(r["bytes"] / 1048576.0, 2)
+    m360 = ["resolve_ms", "first_byte_ms", "download_ms", "hot_ready_ms", "postprocess_ms", "status_done_ms",
+            "pipeline_total_ms", "kpi3_ms", "size_mb", "mbps"]
+    m480 = ["resolve_video_ms", "resolve_audio_ms", "video_ms", "audio_ms", "media_ready_ms", "mux_ms",
+            "hot_ready_ms", "postprocess_ms", "status_done_ms", "pipeline_total_ms", "kpi3_ms"]
+    out = []
+    for mode, metrics in (("360fast", m360), ("480hard", m480), ("480hard(from360)", m480)):
+        rs = [r for r in rows if str(r.get("mode") or "480hard") == mode]
+        if not rs:
+            continue
+        row = {"mode": mode, "n": len(rs), "success_rate": round(sum(1 for r in rs if r["success"]) / len(rs), 3),
+               "fail_reasons": json.dumps({str(r.get("fail_reason"))[:40]: 1 for r in rs if not r["success"]}, ensure_ascii=False)}
+        for mt in metrics:
+            vals = [r.get(mt) for r in rs if r["success"] and isinstance(r.get(mt), (int, float))]
+            if vals:
+                row[f"{mt}_p50"], row[f"{mt}_p90"], row[f"{mt}_p99"] = pct(vals, 50), pct(vals, 90), pct(vals, 99)
+        hot = [r.get("hot_ready_ms") for r in rs if r["success"] and isinstance(r.get("hot_ready_ms"), (int, float))]
+        row["under_1s_hot"] = round(sum(1 for v in hot if v < 1000) / len(rs), 3) if hot else None
+        row["under_2s_hot"] = round(sum(1 for v in hot if v < 2000) / len(rs), 3) if hot else None
+        out.append(row)
+        print(f"\n=== {mode}: n={len(rs)} success={row['success_rate']}  hot<1s={row['under_1s_hot']} hot<2s={row['under_2s_hot']}")
+        print("bước | p50 | p90 | p99")
+        for mt in metrics:
+            if f"{mt}_p50" in row:
+                print(f"{mt} | {row[f'{mt}_p50']} | {row[f'{mt}_p90']} | {row[f'{mt}_p99']}")
+    write_report("report", rows, out, [f"Nguồn: {len(files)} file telemetry, {len(rows)} job_summary.",
+                                       "Mốc 0 = worker nhận URL. kpi3_ms = phát hiện (trigger/Excel) → GET media đầu."])
     return 0
 
 
@@ -654,6 +739,7 @@ def main():
     p.add_argument("--main-ttfb-ms", type=float, default=250.0)
     p.add_argument("--alt-ttfb-ms", type=float, default=40.0)
     p = sub.add_parser("pipeline")
+    p.add_argument("--quality", default="480hard", choices=["480hard", "360fast", "both"])
     p.add_argument("--reps", type=int, default=5)
     p.add_argument("--versions", default="v93,v94")
     p.add_argument("--link-mbps", type=float, default=400.0)
@@ -674,6 +760,10 @@ def main():
     p.add_argument("--cutsec", default="0", help="Cut Seconds; 0 = luôn MUX (đo KPI2 thuần)")
     p.add_argument("--workers-video", default="0", help="vd 8,16,24 để A/B số worker; 0=heuristic")
     p.add_argument("--no-warmup", action="store_true")
+    p.add_argument("--quality", default="480hard", choices=["480hard", "360fast", "both"],
+                   help="V9.5: chế độ chất lượng cho V9.4/V9.5 (V9.3 luôn 480hard)")
+    p = sub.add_parser("report", help="P50/P90/P99 từ telemetry JSONL (job_summary) theo chế độ 360/480")
+    p.add_argument("--telemetry", nargs="*", default=None, help="file telemetry_*.jsonl; mặc định: tất cả trong perf_report/")
     p.add_argument("--config", help="benchmark_config.json (ghi đè tham số)")
     args = ap.parse_args()
     cfg = getattr(args, "config", None)
@@ -691,6 +781,8 @@ def main():
         run_offline(args)
     elif args.mode == "sweep":
         run_offline(args, sweep=True)
+    elif args.mode == "report":
+        return run_report(args)
     elif args.mode == "race":
         return run_race(args)
     elif args.mode == "pipeline":

@@ -769,7 +769,7 @@ def test_pipeline_kpi_line_and_post_line(v94, monkeypatch, tmp_path, h264_media,
     assert st == "DONE"
     log = "\n".join(master.logs)
     kpi = [l for l in master.logs if "📊 V9.4 KPI" in l][-1]
-    for f in ("KPI1=", "KPI3=", "first_get=", "valid=", "post=", "done=", "[V9.4.1-SUB2S]"):
+    for f in ("KPI1=", "KPI3=", "first_get=", "valid=", "post=", "done=", "[V9.5-SUB2S]"):
         assert f in kpi, kpi
     assert "📮 POST:" in log and "done_load=" in log and "prepend_ff=" in log
     k = w._v94["kpi"]

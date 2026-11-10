@@ -162,7 +162,7 @@ def test_gui_realtime_4_jobs(request, modname, clip, tmp_path, monkeypatch):
                 q = float(_re.search(r"queue=([\d.]+)", l).group(1))
                 d = float(_re.search(r"detect=([\d.]+)", l).group(1))
                 assert q >= 0 and d + 0.5 >= q, l
-                assert "KPI3=" in l and "[V9.4.1-SUB2S]" in l
+                assert "KPI3=" in l and "[V9.5-SUB2S]" in l
         # temp sạch (keep_temp=False)
         tdir = tmp_path / "_temp_yt480p"
         left = [p.name for p in tdir.glob("*")] if tdir.exists() else []

@@ -167,3 +167,31 @@ kết nối YouTube nguội sau thời gian bận, lỗi đọc Excel thoáng qu
 Thêm: xoá file tạm khi xác thực thất bại; đọc thống kê dưới khoá; nhãn A/B chỉ gắn với video ≤ 4MiB.
 Test sau review: 120 passed + 1 xfailed (2/2 lần). Pipeline offline sau review (pipeline_offline_20261102_130907):
 HOT_READY p50 295 vs 301 ms (dur30), 665 vs 666 ms (dur120) — ngang V9.3.
+
+---
+
+# V9.5 — lựa chọn 360p nhanh (itag 18), 10/11/2026
+
+**Số đo live: CHƯA CÓ** (môi trường này không ra được YouTube). Dưới đây chỉ là mock cục bộ; con số < 1s trên máy bạn
+chỉ khả thi với Shorts vài MB trên mạng nhanh và phải đo bằng `python bench_v93.py live --quality both` / `report`.
+
+Hàm đã sửa/thêm: `_v95_audio_lang_meta` (mới), `_fast_player_request` (+lang/duration), `_yt_info_to_direct` (+lang),
+`_download_direct_single_get` (+info), `PremiumDownloaderApp.quality_mode` (mới), `_build_ui` (radio), `_save_config`,
+`_load_config`, `Worker.__init__` (quality_mode), `Worker._process_single_url_360` (mới), `_process_single_url_impl` (rẽ nhánh),
+`_cut_after_merge` (ghi `final_file` cho ffprobe nền), KPI line (`KPI-360`); `bench_v93.py`: `report`, `--quality`.
+
+Mock pipeline (pipeline_offline_20261110_185951 / _190045; link 400Mbps, 40Mbps/kết nối, TTFB 40ms, resolver giả):
+
+| Clip | Cách tải | HOT_READY p50 | TOTAL p50 |
+|---|---|---|---|
+| 30s, p18 1.3MB | 360p 1 GET | 308 ms | 496 ms |
+| 30s, p18 1.3MB | 360p Range (V95_360P_RANGE=1) | 101 ms | 284 ms |
+| 30s, 480p 1.3MB+0.24MB | 480p (mux) | 282 ms | 511 ms |
+| 120s, p18 5.1MB | 360p 1 GET | **1094 ms** | 1094 ms |
+| 120s, p18 5.1MB | 360p Range | 183 ms | 184 ms |
+| 120s, 480p 4.4MB+0.97MB | 480p (mux) | 659 ms | 713 ms |
+
+Kết luận trung thực: 1 GET bị giới hạn bởi tốc độ **một** kết nối. Với GVS thật (~5 Mbps/kết nối theo log 17:09) 1 GET cho
+file 2-3 MB có thể mất 4-5 s, chậm hơn 480p Range. Vì vậy có công tắc `V95_360P_RANGE` để A/B; mặc định vẫn 1 GET theo yêu cầu.
+Test: `tests/test_v95_360p.py` (15 test: 3 nhánh cắt, fallback JA→480, lỗi GET→link dự phòng, 403, không link → không DONE,
+480 không đổi, tắt cờ, config round-trip, Range flag).

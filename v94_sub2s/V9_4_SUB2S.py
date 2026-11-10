@@ -157,7 +157,7 @@ def _v94_env(name, default):
         return default
 
 
-V94_VERSION = "V9.4.1-SUB2S"   # bản V9.4 + bản vá sau log live đầu tiên (V9.4.1)
+V94_VERSION = "V9.5-SUB2S"     # V9.4.1 + lựa chọn 360p nhanh (V95_360P)
 # Range: kiểm tra Content-Range start/end khớp đúng request (V9.3 chỉ đọc tổng).
 V94_STRICT_CONTENT_RANGE = _v94_env("STRICT_CONTENT_RANGE", True)
 # Range: size thật ≠ ước tính → co/giãn tại chỗ, không vứt dữ liệu và tải lại (V9.3 = restart).
@@ -238,6 +238,20 @@ V94_EXCEL_ATOMIC_REPLACE = _v94_env("EXCEL_ATOMIC_REPLACE", True)
 V94_STATUS_VERIFY_URL = _v94_env("STATUS_VERIFY_URL", True)
 # Suy luận [SINGLE-TRACK-JA] chặt hơn: audioTrack.id/displayName, track trùng, bỏ microformat.title. (0 = V9.4)
 V94_JA_INFER_STRICT = _v94_env("JA_INFER_STRICT", True)
+
+# ---------------------------------------------------------------------------------------------
+# V9.5 — lựa chọn "360p nhanh" (itag 18: hình + tiếng trong 1 file, KHÔNG ghép ffmpeg).
+# V95_360P=0 → radio 360p bị ẩn/vô hiệu, mọi job đi luồng 480p y như V9.4. Luồng 480p KHÔNG thay đổi.
+# ---------------------------------------------------------------------------------------------
+V95_360P = (str(os.environ.get("V95_360P", "1")).strip().lower() in ("1", "true", "yes", "on"))
+# Khi tiếng mặc định của itag 18 KHÔNG phải tiếng Nhật nhưng video có track tiếng Nhật → tự chuyển job đó sang 480p+JA.
+V95_360P_JA_FALLBACK = (str(os.environ.get("V95_360P_JA_FALLBACK", "1")).strip().lower() in ("1", "true", "yes", "on"))
+# Tuỳ chọn A/B (mặc định TẮT theo yêu cầu "1 GET"): tải itag 18 bằng engine Range nhiều kết nối của 480p.
+# Lý do có công tắc: log live 17:09 cho thấy GVS ~5Mbps/kết nối → 1 GET cho 2-3MB có thể mất 4-5s, trong khi
+# Range 6 kết nối mất ~1.5s. Chỉ bật khi đo live thấy 1 GET chậm hơn.
+V95_360P_RANGE = (str(os.environ.get("V95_360P_RANGE", "0")).strip().lower() in ("1", "true", "yes", "on"))
+# ffprobe kiểm file 360p chạy nền SAU khi đã DONE (chỉ cảnh báo). 0 = không kiểm.
+V95_360P_BG_PROBE = (str(os.environ.get("V95_360P_BG_PROBE", "1")).strip().lower() in ("1", "true", "yes", "on"))
 
 # V9.4.1: A/B số worker video nhỏ theo job ("6,11" → job lẻ 6, job chẵn 11) + mốc phát hiện gần nhất.
 _V94_AB_LOCK = threading.Lock()
@@ -600,7 +614,7 @@ def _fast_player_request(video_id: str, client_key: str):
             content_length = int(f18.get("contentLength") or 0)
         except Exception:
             content_length = 0
-        return {
+        out = {
             "url": f18["url"],
             "title": details.get("title") or "video",
             "id": details.get("videoId") or video_id,
@@ -609,8 +623,49 @@ def _fast_player_request(video_id: str, client_key: str):
             "source": f"FAST_RACE_{client_key.upper()}",
             "resolver_ms": (time.perf_counter() - t_req) * 1000.0,
         }
+        out.update(_v95_audio_lang_meta(data, f18))
+        return out
     except Exception:
         return None
+
+
+def _v95_audio_lang_meta(data: dict, f18: dict = None) -> dict:
+    """V9.5: itag 18 chỉ chứa track tiếng MẶC ĐỊNH. Đọc defaultAudioLanguage + danh sách track audio của player
+    response để quyết định có cần chuyển sang 480p + audio Nhật không."""
+    meta = {"default_audio_lang": "", "has_ja_audio": False, "audio_tracks": 0, "duration_sec": 0.0}
+    try:
+        micro = ((data.get("microformat") or {}).get("playerMicroformatRenderer") or {})
+        meta["default_audio_lang"] = str(micro.get("defaultAudioLanguage") or "").lower()
+        details = data.get("videoDetails") or {}
+        try:
+            meta["duration_sec"] = float(details.get("lengthSeconds") or 0.0)
+        except Exception:
+            pass
+        if (f18 or {}).get("approxDurationMs"):
+            try:
+                meta["duration_sec"] = int(f18["approxDurationMs"]) / 1000.0 or meta["duration_sec"]
+            except Exception:
+                pass
+        streaming = data.get("streamingData") or {}
+        ids = set()
+        for f in list(streaming.get("adaptiveFormats") or []):
+            if not str(f.get("mimeType") or "").lower().startswith("audio/"):
+                continue
+            tr = f.get("audioTrack") or {}
+            tid = str(tr.get("id") or "").strip()
+            ids.add(tid or "_default")
+            lang = " ".join(str(x or "") for x in (tid.split(".", 1)[0] if tid else "", tr.get("displayName"),
+                                                   f.get("language"))).lower()
+            if _looks_japanese_lang(lang.strip()):
+                meta["has_ja_audio"] = True
+            if tid and tr.get("audioIsDefault") and not meta["default_audio_lang"]:
+                meta["default_audio_lang"] = tid.split(".", 1)[0].lower()
+        meta["audio_tracks"] = len(ids)
+        if not meta["has_ja_audio"] and _looks_japanese_lang(meta["default_audio_lang"]):
+            meta["has_ja_audio"] = True
+    except Exception:
+        pass
+    return meta
 
 
 def _fast_innertube_360p(url: str):
@@ -1396,14 +1451,31 @@ def _yt_info_to_direct(info, source: str):
         size = int(size or 0)
     except Exception:
         size = 0
-    return {
+    out = {
         "url": info["url"],
         "title": info.get("title", "video"),
         "id": info.get("id", str(int(time.time()))),
         "format_id": str(info.get("format_id") or "18"),
         "content_length": size,
         "source": source,
+        "default_audio_lang": str(info.get("language") or "").lower(),
+        "has_ja_audio": False, "audio_tracks": 0,
+        "duration_sec": float(info.get("duration") or 0.0),
     }
+    try:
+        ids = set()
+        for f in info.get("formats") or []:
+            if not _fmt_is_audio_only(f):
+                continue
+            ids.add(str(f.get("format_id") or "").split("-", 1)[-1] if "-" in str(f.get("format_id") or "") else "_default")
+            if _looks_japanese_lang(_fmt_lang_text(f)):
+                out["has_ja_audio"] = True
+        out["audio_tracks"] = len(ids)
+        if not out["has_ja_audio"] and _looks_japanese_lang(out["default_audio_lang"]):
+            out["has_ja_audio"] = True
+    except Exception:
+        pass
+    return out
 
 
 def _get_thread_fast_ytdlp():
@@ -2366,10 +2438,13 @@ def _get_direct_media_pool():
 
 
 def _download_direct_single_get(url: str, temp_dir: Path, filename: str, logger,
-                                min_bytes: int, expected_bytes: int = 0) -> bool:
-    """One GET, zero HEAD/Range preflight. Optimized for small progressive itag 18."""
+                                min_bytes: int, expected_bytes: int = 0, info: dict = None) -> bool:
+    """One GET, zero HEAD/Range preflight. Optimized for small progressive itag 18.
+    V9.5: info (tuỳ chọn) nhận ttfb_ms / first_byte_ns / bytes / elapsed_ms / status / fail_reason."""
+    info = info if isinstance(info, dict) else {}
     pool = _get_direct_media_pool()
     if pool is None:
+        info["fail_reason"] = "no_pool"
         return False
     ensure_dir(temp_dir)
     temp_file = temp_dir / filename
@@ -2426,7 +2501,9 @@ def _download_direct_single_get(url: str, temp_dir: Path, filename: str, logger,
             break
 
         status = int(getattr(resp, "status", 0) or 0) if resp is not None else 0
+        info["status"] = status
         if status not in (200, 206):
+            info["fail_reason"] = f"HTTP_{status}"
             logger(f"    [DIRECT-1GET] ⚠️ HTTP {status} → fallback engine")
             return False
 
@@ -2440,6 +2517,7 @@ def _download_direct_single_get(url: str, temp_dir: Path, filename: str, logger,
                     break
                 if first_byte is None:
                     first_byte = time.perf_counter()
+                    info["first_byte_ns"] = time.perf_counter_ns()
                 f.write(chunk)
                 total += len(chunk)
                 now_p = time.perf_counter()
@@ -2454,13 +2532,17 @@ def _download_direct_single_get(url: str, temp_dir: Path, filename: str, logger,
                     last_progress_log = now_p
 
         elapsed = max(0.0001, time.perf_counter() - t0)
+        info.update({"bytes": total, "elapsed_ms": round(elapsed * 1000.0, 2),
+                     "ttfb_ms": round(((first_byte or time.perf_counter()) - t0) * 1000.0, 2)})
         if total < min_bytes:
+            info["fail_reason"] = f"too_small_{total}"
             logger(f"    [DIRECT-1GET] ⚠️ File quá nhỏ: {total} bytes")
             try: temp_file.unlink()
             except OSError: pass
             return False
 
         if expected_bytes and total + 4096 < int(expected_bytes * 0.96):
+            info["fail_reason"] = f"short_{total}/{expected_bytes}"
             logger(
                 f"    [DIRECT-1GET] ⚠️ Thiếu dữ liệu: {total/1048576:.2f}MB / "
                 f"expected≈{expected_bytes/1048576:.2f}MB → fallback"
@@ -2477,6 +2559,7 @@ def _download_direct_single_get(url: str, temp_dir: Path, filename: str, logger,
         )
         return True
     except Exception as e:
+        info["fail_reason"] = f"EXC:{type(e).__name__}"
         logger(f"    [DIRECT-1GET] ⚠️ {type(e).__name__} → fallback engine")
         try:
             if temp_file.exists(): temp_file.unlink()
@@ -5368,6 +5451,12 @@ class Worker(threading.Thread):
         self.keep_temp      = self.master.keep_temp_checkbox.isChecked()
         self.final_move_dir = self.master.final_move_entry.text().strip()
         self.download_engine = (self.master.combo_downloader.currentData() or "aria2c").lower()
+        # V9.5: chế độ chất lượng chụp 1 lần lúc tạo Worker (đổi radio giữa chừng không ảnh hưởng job đang chạy).
+        try:
+            _qm = self.master.quality_mode() if callable(getattr(self.master, "quality_mode", None)) else "480hard"
+        except Exception:
+            _qm = "480hard"
+        self.quality_mode = "360fast" if (V95_360P and _qm == "360fast") else "480hard"
 
         if not yt_dlp:
             self.log("❌ Thiếu thư viện yt-dlp.")
@@ -5503,6 +5592,8 @@ class Worker(threading.Thread):
                 self.log(f"🧠 TÊN RANDOM: {renamed.name}")
 
                 moved = move_whole_folder(package_dir)
+                if moved is not None:
+                    _kp["final_file"] = str(Path(moved) / renamed.name)
                 return moved is not None
 
             # ==============================================================
@@ -5536,6 +5627,7 @@ class Worker(threading.Thread):
                 moved = move_whole_folder(package_dir)
                 if moved is None:
                     return False
+                _kp["final_file"] = str(Path(moved) / concat_output.name)
 
                 # File gốc tải về chỉ là file trung gian sau khi đã tạo bản >=60s.
                 if final_mp4.exists() and not self.keep_temp:
@@ -5648,6 +5740,7 @@ class Worker(threading.Thread):
                     "audio": {kk: vv for kk, vv in self._v94["audio"].items() if kk not in ("cancel", "pool")},
                 }
                 summary.update(k)
+                summary.setdefault("mode", "480hard")
                 try:
                     import psutil  # optional
                     summary["rss_mb"] = round(psutil.Process().memory_info().rss / 1048576.0, 1)
@@ -5682,6 +5775,18 @@ class Worker(threading.Thread):
                         + (" | STATUS-WRITE-FAIL" if k.get("status_write_ok") is False else "")
                     )
                 _f = lambda key: k.get(key, "-")
+                if k.get("mode") == "360fast":
+                    self.log(
+                        f"📊 V9.5 KPI-360 [{vid}] resolve={k.get('resolve_ms','-')}ms | first_byte={k.get('first_byte_ms','-')}ms "
+                        f"| download={k.get('download_ms','-')}ms ({(k.get('bytes') or 0)/1048576:.2f}MB ≈{k.get('mbps','-')}Mbps) "
+                        f"| HOT_READY={k.get('hot_ready_ms','-')}ms | post={k.get('postprocess_ms','-')} done={k.get('status_done_ms','-')} "
+                        f"| TOTAL={k.get('pipeline_total_ms','-')}ms | ok={ok_holder['ok']}"
+                        + (f" | fail={summary['fail_reason']}" if not ok_holder["ok"] else "")
+                        + f" | KPI3={_f('kpi3_ms')} queue={_f('queue_ms')} detect={_f('detect_ms')}"
+                        + (f" ja_fallback={k['ja_fallback']}" if k.get("ja_fallback") else "")
+                        + f" [{V94_VERSION}]"
+                    )
+                    return
                 self.log(
                     f"📊 V9.4 KPI [{vid}] resolve_v={k.get('resolve_video_ms','-')}ms "
                     f"resolve_a={k.get('resolve_audio_ms','-')}ms | video={k.get('video_ms','-')}ms "
@@ -5740,6 +5845,177 @@ class Worker(threading.Thread):
         except Exception:
             pass
 
+    # ------------------------------------------------------------------ V9.5 360p nhanh (itag 18)
+    def _process_single_url_360(self, url: str, url_index: int, excel_info: str = ""):
+        """360p nhanh: link bằng _quick_fetch_native_360p (race 3 client → yt-dlp nhanh → robust), tải 1 GET
+        (_download_direct_single_get), KHÔNG ghép ffmpeg, os.replace ra file cuối, hậu xử lý y như 480p.
+        Trả "FALLBACK_480" khi phải chuyển sang 480p+JA (tiếng mặc định không phải Nhật nhưng có track Nhật)."""
+        self.log(f"=== [START 360P-FAST] {excel_info}{url} ===")
+        t0 = time.perf_counter_ns()
+        k = self._v94["kpi"]
+        k["mode"] = "360fast"
+        vid_hint = _extract_youtube_video_id(url) or "UNKNOWN"
+        _ms = lambda ns: round((ns - self._v94["t0_ns"]) / 1e6, 2)
+
+        # --- 1) link ---
+        TELEM.span(self._v94["job"], "q360_resolve_begin", at_ms=_ms(time.perf_counter_ns()))
+        data = self._quick_fetch_native_360p(url)
+        t_res = time.perf_counter_ns()
+        if not data or not data.get("url"):
+            self._v94["fail"] = "no_itag18"
+            self.log(f"❌ 360P [{vid_hint}]: không lấy được itag 18 sau {(t_res - t0)/1e9:.2f}s")
+            self._v94_emit(url, url_index, False)
+            return "FAIL"
+        k["resolve_ms"] = round((t_res - t0) / 1e6, 2)
+        self._v94["video"].update({"itag": "18", "source": str(data.get("source") or "")})
+        vid = str(data.get("id") or vid_hint)
+        expected = int(data.get("content_length") or 0)
+        dlang = str(data.get("default_audio_lang") or "")
+        has_ja = bool(data.get("has_ja_audio"))
+        TELEM.span(self._v94["job"], "q360_resolve_end", at_ms=_ms(t_res), source=data.get("source"),
+                   clen=expected, default_lang=dlang, has_ja=has_ja, tracks=data.get("audio_tracks"))
+        self.log(f"⚡ 18 READY [{vid}] [{data.get('source')}] {(t_res - t0)/1e9:.3f}s | size≈{expected/1048576:.1f}MB"
+                 f" | lang={dlang or '?'} tracks={data.get('audio_tracks') or '?'}{' ja✓' if has_ja else ''}")
+
+        # --- 2) tiếng mặc định ---
+        if dlang and not _looks_japanese_lang(dlang) and has_ja:
+            k["ja_fallback"] = f"default={dlang}"
+            TELEM.span(self._v94["job"], "q360_ja_fallback", default_lang=dlang)
+            self.log(f"🈁 360P [{vid}]: tiếng mặc định của itag 18 = '{dlang}' nhưng video CÓ track tiếng Nhật"
+                     + (" → chuyển sang 480p + audio Nhật" if V95_360P_JA_FALLBACK else " (V95_360P_JA_FALLBACK=0: vẫn tải 360p)"))
+            if V95_360P_JA_FALLBACK:
+                return "FALLBACK_480"
+        elif dlang and not _looks_japanese_lang(dlang):
+            self.log(f"    ℹ️ 360P [{vid}]: tiếng mặc định '{dlang}', không thấy track Nhật → tải itag 18 như yêu cầu")
+
+        # --- 3) tải 1 GET ---
+        temp_name = f"{vid}_18.mp4"
+        temp_file = self.temp_dir / temp_name
+        dinfo = {}
+        TELEM.span(self._v94["job"], "q360_get_begin", at_ms=_ms(time.perf_counter_ns()))
+        self._v94["video"]["first_get_ns"] = time.perf_counter_ns()
+        if V95_360P_RANGE and expected >= RANGE_VIDEO_MIN_BYTES:
+            dinfo["job"] = self._v94["job"]
+            ok = _download_http_range_turbo(data["url"], self.temp_dir, temp_name, self.log,
+                                            self.MIN_BYTES_VIDEO, expected, media_kind="video", info=dinfo)
+            if dinfo.get("first_byte_ms") is not None:
+                dinfo["first_byte_ns"] = self._v94["video"]["first_get_ns"] + int(dinfo["first_byte_ms"] * 1e6)
+            k["engine"] = "range"
+        else:
+            ok = _download_direct_single_get(data["url"], self.temp_dir, temp_name, self.log,
+                                             self.MIN_BYTES_VIDEO, expected, info=dinfo)
+            k["engine"] = "1get"
+        if dinfo.get("first_byte_ns"):
+            k["first_byte_ms"] = _ms(dinfo["first_byte_ns"])
+            TELEM.span(self._v94["job"], "q360_first_byte", at_ms=k["first_byte_ms"], ttfb_ms=dinfo.get("ttfb_ms"))
+        used = data
+        if not ok:
+            # dự phòng 1: link khác (yt-dlp nhanh) bằng cùng đường 1 GET; dự phòng 2: engine (aria2 / IDM)
+            self.log(f"    ↪ 360P [{vid}] 1GET lỗi ({dinfo.get('fail_reason')}) → link dự phòng")
+            alt = self._quick_fetch_ytdlp_360p(url, robust=False) or self._quick_fetch_ytdlp_360p(url, robust=True)
+            if alt and alt.get("url") and alt.get("url") != data.get("url"):
+                used = alt
+                expected = int(alt.get("content_length") or expected)
+                dinfo = {}
+                ok = _download_direct_single_get(alt["url"], self.temp_dir, temp_name, self.log,
+                                                 self.MIN_BYTES_VIDEO, expected, info=dinfo)
+            if not ok:
+                src_url = (used or data).get("url")
+                if self.download_engine == "idm":
+                    ok = download_idm_ultimate(src_url, self.temp_dir, temp_name, self.log,
+                                               self.MIN_BYTES_VIDEO, media_label="360p itag 18")
+                else:
+                    self.log(f"    ↪ 360P [{vid}] → ARIA2 fallback")
+                    ok = download_aria2c_ultimate(src_url, self.temp_dir, temp_name, self.log,
+                                                  self.MIN_BYTES_VIDEO, expected_bytes=expected)
+        t_dl = time.perf_counter_ns()
+        k["download_ms"] = round((t_dl - t_res) / 1e6, 2)
+        k["video_ms"] = k["download_ms"]
+        k["bytes"] = dinfo.get("bytes")
+        if dinfo.get("elapsed_ms") and dinfo.get("bytes"):
+            k["mbps"] = round(dinfo["bytes"] * 8.0 / 1e6 / max(1e-3, dinfo["elapsed_ms"] / 1000.0), 1)
+        self._v94_mark("video_done_at_ms", "q360_download_complete", ok=bool(ok), bytes=dinfo.get("bytes"),
+                       ttfb_ms=dinfo.get("ttfb_ms"), elapsed_ms=dinfo.get("elapsed_ms"), fail=dinfo.get("fail_reason"))
+        if not ok or not temp_file.exists():
+            self._v94["fail"] = f"q360_download:{dinfo.get('fail_reason') or 'engine_fail'}"
+            self.log(f"❌ 360P [{vid}]: tải thất bại → KHÔNG DONE")
+            self._v94_emit(url, url_index, False)
+            return "FAIL"
+
+        # --- 4) xác thực nhẹ: kích thước ---
+        size = temp_file.stat().st_size
+        if expected > 0 and size < expected:
+            self._v94["fail"] = f"q360_short_{size}/{expected}"
+            self.log(f"❌ 360P [{vid}]: file {size} B < content_length {expected} B → KHÔNG DONE")
+            try:
+                if not self.keep_temp:
+                    temp_file.unlink()
+            except OSError:
+                pass
+            self._v94_emit(url, url_index, False)
+            return "FAIL"
+        k["media_ready_ms"] = _ms(time.perf_counter_ns())
+        k["media_max_ms"] = k["download_ms"]
+
+        # --- 5) đổi tên ra file cuối (không mux) ---
+        final_title = sanitize_name(str((used or data).get("title") or data.get("title") or "video"))
+        base_name = f"{final_title} [{vid}]"
+        out_file_final = self.out_dir / f"{base_name}.mp4"
+        try:
+            if out_file_final.exists():
+                out_file_final.unlink()
+            os.replace(str(temp_file), str(out_file_final))
+        except OSError:
+            if not _move_file_fast_retry(temp_file, out_file_final, self.log, timeout_sec=8.0):
+                self._v94["fail"] = "move_fail"
+                self._v94_emit(url, url_index, False)
+                return "FAIL"
+        hot_ready = (time.perf_counter_ns() - self._v94["t0_ns"]) / 1e9
+        self._v94_mark("hot_ready_ms", "hot_ready", path="q360")
+        self._v94_mark("file_validated_ms", "q360_file_ready", size=size)
+        self.log(f"🚀 HOT 360P READY: {hot_ready:.3f}s từ lúc worker nhận URL | itag 18 1-GET | {size/1048576:.2f}MB | không ghép")
+        self.log(f"✅ Success 360p: {base_name}.mp4")
+
+        # --- 6) hậu xử lý như 480p (cắt <60 / 60-300 / >300, đặt tên, MOVE) ---
+        duration = float((used or data).get("duration_sec") or data.get("duration_sec") or 0.0)
+        success = bool(self._cut_after_merge(out_file_final, base_name, url_index, duration_hint=duration))
+        self._v94_mark("postprocess_ms", "postprocess_complete", ok=bool(success))
+        if not success:
+            self._v94["fail"] = "postprocess_fail"
+            self.log("❌ Hậu xử lý/cut/move thất bại → KHÔNG ghi DONE.")
+        if success and url_index is not None and self.excel_path and self.status_col_name:
+            if write_status_to_excel(self.excel_path, url_index, self.status_col_name, "DONE", self.log,
+                                     expected_url=url, url_col_name=self.url_col_name, stats=k):
+                self._v94_mark("status_done_ms", "status_done")
+            else:
+                k["status_write_ok"] = False
+        k["pipeline_total_ms"] = _ms(time.perf_counter_ns())
+        self.log(f"⏱️ PIPELINE TOTAL: {k['pipeline_total_ms']/1000.0:.3f}s | hot360={hot_ready:.3f}s | "
+                 f"resolve={k.get('resolve_ms')}ms | download={k.get('download_ms')}ms")
+        self.log(f"=== [END] {url} (Thành công: {success}) ===")
+        self._v94_emit(url, url_index, success)
+
+        # --- 7) ffprobe nền SAU DONE, chỉ cảnh báo ---
+        if success and V95_360P_BG_PROBE and FFPROBE_PATH:
+            final_path = k.get("final_file")
+            if final_path:
+                job = self._v94["job"]
+                logf = self.log
+
+                def _bg_probe(path=final_path, job=job, logf=logf):
+                    try:
+                        info = _ffprobe_av_info(Path(path))
+                        okp = bool(info.get("has_video") and info.get("has_audio") and float(info.get("format_duration") or 0) > 0)
+                        TELEM.span(job, "q360_bg_probe", ok=okp, w=info.get("width"), h=info.get("height"),
+                                   vdur=info.get("video_duration"), adur=info.get("audio_duration"))
+                        if not okp:
+                            logf(f"    ⚠️ 360P [{job}] ffprobe SAU DONE: file nghi hỏng (video={info.get('has_video')} "
+                                 f"audio={info.get('has_audio')}) → kiểm tra tay: {Path(path).name}")
+                    except Exception:
+                        pass
+                threading.Thread(target=_bg_probe, name="V95BgProbe", daemon=True).start()
+        return "DONE" if success else "FAIL"
+
     def _process_single_url_impl(self, url: str, url_index: int):
         if self._critical_error:
             self._v94_emit(url, url_index, False); return
@@ -5747,6 +6023,13 @@ class Worker(threading.Thread):
             self._v94_emit(url, url_index, False); return
 
         excel_info = f"[Dòng {url_index+2}] " if url_index is not None else ""
+        if V95_360P and getattr(self, "quality_mode", "480hard") == "360fast":
+            # V9.5: luồng 360p nhanh. Trả "FALLBACK_480" → tiếp tục luồng 480p bên dưới y như V9.4.
+            r360 = self._process_single_url_360(url, url_index, excel_info)
+            if r360 != "FALLBACK_480":
+                return
+            self._v94["kpi"]["mode"] = "480hard(from360)"
+            self.log(f"    ↪ [360p→480p] {excel_info}chuyển sang luồng 480p + audio Nhật cho video này")
         self.log(f"=== [START 480P-HARD] {excel_info}{url} ===")
         t_total_start = time.perf_counter()
         success = False
@@ -6434,11 +6717,18 @@ class PremiumDownloaderApp(QWidget):
         
         sett_layout.addWidget(QLabel("Chất lượng:"))
         self.radio_auto = QRadioButton("Cứng 480p chất lượng — ưu tiên 244, fallback 135 tức thì + audio Nhật"); self.radio_auto.setChecked(True)
-        self.radio_light = QRadioButton("Ignored")
+        # V9.5: radio "Ignored" thứ nhất → 360p nhanh (itag 18). Chỉ hiện khi V95_360P=1.
+        self.radio_light = QRadioButton("360p nhanh — itag 18 (hình + tiếng 1 file, không ghép)")
+        self.radio_light.setToolTip(
+            "1 GET duy nhất, không HEAD/Range preflight, không ffmpeg. itag 18 chỉ có track tiếng MẶC ĐỊNH:\n"
+            "nếu tiếng mặc định không phải tiếng Nhật mà video có track Nhật → tự chuyển video đó sang 480p + audio Nhật."
+        )
         self.radio_hard = QRadioButton("Ignored")
         
         h_rad = QHBoxLayout()
         h_rad.addWidget(self.radio_auto)
+        if V95_360P:
+            h_rad.addWidget(self.radio_light)
         h_rad.addStretch()
         sett_layout.addLayout(h_rad)
 
@@ -6640,6 +6930,9 @@ class PremiumDownloaderApp(QWidget):
             except Exception:
                 pass
         
+        if self.quality_mode() == "360fast":
+            self.logger_qt.log("🎞️ CHẾ ĐỘ: 360p nhanh (itag 18, 1 GET, không ghép). Video có track Nhật nhưng tiếng mặc "
+                               "định khác → tự chuyển sang 480p+JA cho video đó.")
         self.realtime_thread = threading.Thread(target=self._realtime_worker, daemon=True)
         self.realtime_thread.start()
         engine = (self.combo_downloader.currentData() or "aria2c").upper()
@@ -6795,10 +7088,19 @@ class PremiumDownloaderApp(QWidget):
     def _on_single_url_finished(self, url, url_index, success):
         pass
 
+    def quality_mode(self) -> str:
+        """'360fast' hoặc '480hard'. Tắt cờ V95_360P → luôn '480hard' (hành vi V9.4)."""
+        try:
+            if V95_360P and self.radio_light.isChecked():
+                return "360fast"
+        except Exception:
+            pass
+        return "480hard"
+
     def _save_config(self):
         try:
-            # V8.6 is hard-locked to 480p only: 244 primary, 135 immediate fallback.
-            qm = '480hard'
+            # V9.5: "360fast" khi chọn radio 360p (và cờ V95_360P bật); mặc định "480hard" (244→135 + audio Nhật).
+            qm = self.quality_mode()
             data = {
                 "excel_path": self.input_excel.text(), "save_folder": self.input_folder.text(),
                 "cut_prefix": self.input_prefix.text(), "cut_seconds": self.input_cutsec.text(),
@@ -6827,8 +7129,11 @@ class PremiumDownloaderApp(QWidget):
                 if engine_idx >= 0:
                     self.combo_downloader.setCurrentIndex(engine_idx)
                 
-                # Ignore legacy quality mode; V8.6 always uses HARD 480p 244→135.
-                self.radio_auto.setChecked(True)
+                # V9.5: đọc lại đúng lựa chọn (V9.4 luôn ép 480p). Giá trị lạ/legacy → 480p.
+                if V95_360P and str(data.get("quality_mode", "")).lower() == "360fast":
+                    self.radio_light.setChecked(True)
+                else:
+                    self.radio_auto.setChecked(True)
             except: pass
 
     def _apply_stylesheet(self, accent_hex: str):

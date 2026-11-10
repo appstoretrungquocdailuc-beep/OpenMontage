@@ -99,7 +99,7 @@ Thư mục này chứa:
 python -m py_compile V9_3_AUDIO.py V9_4_SUB2S.py bench_v93.py
 python -m pytest -q -rfxX
 ```
-Kết quả mong đợi (V9.4.1): `120 passed, 1 xfailed` (đôi khi `121 passed` vì bug V9.3 là race, có lần không lộ). XFAIL là **bug V9.3 được tái hiện có chủ đích** (4 job ghi STATUS
+Kết quả mong đợi (V9.5): `135 passed, 1 xfailed` (đôi khi `136 passed` vì bug V9.3 là race, có lần không lộ). XFAIL là **bug V9.3 được tái hiện có chủ đích** (4 job ghi STATUS
 song song làm mất DONE / hỏng `check.xlsx`). Nội dung test: 206 chuẩn (SHA256), 302, 403/410/429, 200 bỏ
 Range, size ước tính sai (4 kiểu), size không biết, Content-Range sai, đứt kết nối giữa chừng, header trễ,
 đuôi chậm (steal), 8 tải đồng thời, huỷ + dọn thread/file, 416, rollback cờ, chọn audio JA, đuôi file, Excel,
@@ -157,3 +157,31 @@ không có `fail_reasons` mới (đặc biệt 403/429, `bad_content_range`, `ou
 - KPI < 2 s phụ thuộc trễ Innertube, giới hạn per-connection của GVS và băng thông thực; với video lớn
   (> 80 MiB) trên đường < 400 Mbps thì về lý thuyết không thể < 2 s.
 - Không lách đăng nhập/DRM/token; 403/429 được dừng có giới hạn, không spam retry.
+
+## 8. V9.5 — lựa chọn "360p nhanh" (cờ `V95_360P`, mặc định bật)
+
+Trong mục **Chất lượng** có thêm radio **"360p nhanh — itag 18 (hình + tiếng 1 file, không ghép)"**. Lựa chọn được lưu
+vào config (`quality_mode = "360fast"` / `"480hard"`) và đọc lại đúng khi mở tool (V9.4 luôn ép 480p).
+Chọn **480p** → luồng cũ chạy y như V9.4 (test `test_480_mode_unchanged`).
+
+Luồng 360p: `_quick_fetch_native_360p` (race 3 client InnerTube → yt-dlp nhanh → yt-dlp robust) → `_download_direct_single_get`
+(1 GET, không HEAD/Range preflight) → kiểm `size >= content_length` → `os.replace` ra file cuối (KHÔNG ffmpeg) → cắt/MOVE như
+480p → DONE → ffprobe chạy nền chỉ cảnh báo. Lỗi GET → link dự phòng (yt-dlp) → aria2/IDM.
+
+itag 18 chỉ có **tiếng mặc định**: nếu `defaultAudioLanguage` không phải tiếng Nhật mà video có track Nhật → log `🈁` và
+tự chuyển video đó sang 480p + audio Nhật (`V95_360P_JA_FALLBACK=0` để tắt).
+
+| Biến | Mặc định | Ý nghĩa |
+|---|---|---|
+| `V95_360P` | 1 | 0 = ẩn radio, mọi job đi 480p (hành vi V9.4) |
+| `V95_360P_JA_FALLBACK` | 1 | tự chuyển sang 480p+JA khi tiếng mặc định ≠ Nhật nhưng có track Nhật |
+| `V95_360P_RANGE` | 0 | 1 = tải itag 18 bằng engine Range nhiều kết nối (A/B). Mock 40Mbps/kết nối: 1 GET 5MB = 1094ms, Range = 183ms. Live GVS ~5Mbps/kết nối nên 1 GET với file 2-3MB có thể mất 4-5s — hãy đo |
+| `V95_360P_BG_PROBE` | 1 | ffprobe nền sau DONE, chỉ cảnh báo |
+
+Dòng log mới: `=== [START 360P-FAST]`, `⚡ 18 READY [...] | lang= tracks=`, `🚀 HOT 360P READY`, và
+`📊 V9.5 KPI-360 [...] resolve= first_byte= download= (MB ≈Mbps) HOT_READY= post= done= TOTAL=`.
+Span telemetry: `q360_resolve_begin/end`, `q360_get_begin`, `q360_first_byte`, `q360_download_complete`, `q360_file_ready`,
+`q360_ja_fallback`, `q360_bg_probe`; `job_summary` có `mode`.
+
+Báo cáo P50/P90/P99 từ telemetry: `python bench_v93.py report` (đọc mọi `perf_report\telemetry_*.jsonl`, tách 360fast / 480hard,
+kèm `size_mb`, `mbps`, `under_1s_hot`). Live A/B: `python bench_v93.py live --urls urls.txt --versions v94 --quality both`.
