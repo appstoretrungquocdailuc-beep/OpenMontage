@@ -193,6 +193,7 @@ Từ log live: resolve ≈0.14s, **TTFB ≈0.69–0.75s (có 302 đổi host)**,
 | Biến | Mặc định | Ý nghĩa |
 |---|---|---|
 | `V96_HOST_POOL` | 1 | Nhớ host đích sau 302 (TTL 10 phút) → video sau GET thẳng host đích (bỏ 1 RTT); sai → về URL gốc 1 lần. Kết nối TLS tới host đích được mở ngay khi thấy 302 và giữ trong pool; sau khi tải xong, HEAD `/generate_204` mỗi 25s giữ nóng (chỉ khi không có job). Mock: first_byte 354 → 103ms khi trúng cache |
+| `V96_MN_PRECONNECT` | 1 | Ngay khi có link, mở DNS+TLS song song tới các host trong `mn=` (ứng viên đích 302). Log `mn_pre=2✓` = 302 trỏ đúng host đã mở sẵn (bỏ ~dns+tls ≈170ms theo log 10:51), `✗` = trượt (không mất gì) |
 | `V96_RANGE_N` | 0 | Chia N đoạn Range song song (2/4/8) khi biết content_length; lỗi 403/410/429 → dừng chia, 1-GET cùng URL, không retry thêm |
 | `V96_HTTP2` | 0 | Tải qua httpx HTTP/2 (`pip install httpx[http2]`), N = `V96_RANGE_N` (1 = 1 GET h2). Không có httpx → tự về 1-GET urllib3 |
 

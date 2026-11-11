@@ -272,6 +272,9 @@ def _v96_env(name, default):
 V96_HOST_POOL = _v96_env("HOST_POOL", True)
 V96_HOST_POOL_TTL_SEC = _v96_env("HOST_POOL_TTL_SEC", 600.0)
 V96_HOST_KEEPALIVE_SEC = _v96_env("HOST_KEEPALIVE_SEC", 25.0)
+# 1b) Ngay khi có link: mở DNS+TLS song song tới các host trong tham số mn= (ứng viên host đích sau 302).
+#     Log live 10:51: 302 trỏ host khác → dns 68ms + tls 106ms nằm trên đường găng; trúng → bỏ ~170ms, sai → không mất gì.
+V96_MN_PRECONNECT = _v96_env("MN_PRECONNECT", True)
 # 2) Chia Range N đoạn song song khi biết content_length (0 = 1-GET như V9.5; thử 2/4/8). Lỗi 403/410/429 ở
 #    bất kỳ đoạn nào → dừng chia, quay về 1-GET cùng URL (không retry liên tục, không đổi IP/proxy).
 V96_RANGE_N = _v96_env("RANGE_N", 0)
@@ -2562,6 +2565,31 @@ def _v96_preconnect(url_or_host: str, pool=None, timeout: float = 1.5) -> dict:
     return d
 
 
+def _v96_mn_hosts(url: str):
+    """Các host ứng viên đích sau 302: rrN---<sn>.googlevideo.com với mọi sn trong mn= (trừ host hiện tại)."""
+    try:
+        u = urllib.parse.urlsplit(str(url))
+        m = re.match(r"^(rr\d+)---(sn-[a-z0-9-]+)\.googlevideo\.com$", u.hostname or "")
+        if not m:
+            return []
+        q = urllib.parse.parse_qs(u.query)
+        mns = [x.strip() for x in ",".join(q.get("mn", [])).split(",") if x.strip()]
+        return [f"{m.group(1)}---{x}.googlevideo.com" for x in mns
+                if x != m.group(2) and re.match(r"^sn-[a-z0-9-]+$", x)][:3]
+    except Exception:
+        return []
+
+
+def _v96_mn_preconnect(url: str, pool=None):
+    """Mở kết nối nóng tới các host mn song song (thread nền, không chặn GET). Trả list host đã bắt đầu."""
+    if not V96_MN_PRECONNECT:
+        return []
+    hosts = _v96_mn_hosts(url)
+    for h in hosts:
+        threading.Thread(target=_v96_preconnect, args=(f"https://{h}/", pool), name="V96MnPre", daemon=True).start()
+    return hosts
+
+
 def _v96_keepalive_worker():
     while True:
         time.sleep(max(5.0, float(V96_HOST_KEEPALIVE_SEC)))
@@ -2824,7 +2852,7 @@ def _download_direct_single_get(url: str, temp_dir: Path, filename: str, logger,
         info.update({"bytes": total, "elapsed_ms": round(elapsed * 1000.0, 2),
                      "ttfb_ms": round(((first_byte or time.perf_counter()) - t0) * 1000.0, 2),
                      "xfer_ms": round((time.perf_counter() - (first_byte or t0)) * 1000.0, 2),
-                     "final_host": _v96_host(current_url)[:14] + "***"})
+                     "final_host": _v96_host(current_url)[:14] + "***", "final_host_full": _v96_host(current_url)})
         if total < min_bytes:
             info["fail_reason"] = f"too_small_{total}"
             logger(f"    [DIRECT-1GET] ⚠️ File quá nhỏ: {total} bytes")
@@ -6084,6 +6112,7 @@ class Worker(threading.Thread):
                         + (f"dns={k.get('dns_ms')} tls={k.get('tls_ms')} " if k.get("tls_ms") is not None else "")
                         + (f"xfer={k['xfer_ms']}ms " if k.get("xfer_ms") is not None else "")
                         + ("302skip " if k.get("redirect_skipped") else "")
+                        + (f"mn_pre={k['mn_pre']}{'✓' if k.get('mn_hit') else ('✗' if 'mn_hit' in k else '')} " if k.get("mn_pre") else "")
                         + f"| HOT_READY={k.get('hot_ready_ms','-')}ms | post={k.get('postprocess_ms','-')} done={k.get('status_done_ms','-')} "
                         + f"| TOTAL={k.get('pipeline_total_ms','-')}ms | ok={ok_holder['ok']}"
                         + (f" | fail={summary['fail_reason']}" if not ok_holder["ok"] else "")
@@ -6204,6 +6233,9 @@ class Worker(threading.Thread):
         temp_name = f"{vid}_18.mp4"
         temp_file = self.temp_dir / temp_name
         dinfo = {}
+        _mn = _v96_mn_preconnect(data["url"]) if not _v96_predicted_url(data["url"]) else []
+        if _mn:
+            k["mn_pre"] = len(_mn)
         TELEM.span(self._v94["job"], "q360_get_begin", at_ms=_ms(time.perf_counter_ns()))
         self._v94["video"]["first_get_ns"] = time.perf_counter_ns()
         rn = int(getattr(self, "_v96_range_n", None) if getattr(self, "_v96_range_n", None) is not None else V96_RANGE_N)
@@ -6241,6 +6273,8 @@ class Worker(threading.Thread):
         for kk in ("first_resp_ms", "dns_ms", "tls_ms", "xfer_ms", "redirect_skipped", "redirect_hops", "http_version"):
             if dinfo.get(kk) is not None:
                 k[kk] = dinfo[kk]
+        if _mn and dinfo.get("final_host_full"):
+            k["mn_hit"] = dinfo["final_host_full"] in _mn      # 302 trỏ đúng host đã mở sẵn?
         if dinfo.get("first_byte_ns"):
             k["first_byte_ms"] = _ms(dinfo["first_byte_ns"])
             TELEM.span(self._v94["job"], "q360_first_byte", at_ms=k["first_byte_ms"], ttfb_ms=dinfo.get("ttfb_ms"))

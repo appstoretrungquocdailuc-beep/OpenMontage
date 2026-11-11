@@ -169,3 +169,16 @@ def test_360_flow_flags_off_is_v95(v94, monkeypatch, tmp_path, prog18):
     monkeypatch.setattr(v94, "V96_HOST_POOL", False)
     w, master, st, _ = _run(v94, monkeypatch, tmp_path, prog18[120], 120)
     assert st == "DONE" and w._v94["kpi"]["engine"] == "1get" and "redirect_skipped" not in w._v94["kpi"]
+
+
+def test_mn_hosts_and_preconnect(v94, monkeypatch):
+    u = "https://rr3---sn-aaa.googlevideo.com/videoplayback?mn=sn-aaa%2Csn-bbb%2Csn-ccc&sig=S"
+    assert v94._v96_mn_hosts(u) == ["rr3---sn-bbb.googlevideo.com", "rr3---sn-ccc.googlevideo.com"]
+    assert v94._v96_mn_hosts("https://x.y/z") == []
+    started = []
+    monkeypatch.setattr(v94, "_v96_preconnect", lambda url, pool=None: started.append(url))
+    hs = v94._v96_mn_preconnect(u)
+    time.sleep(0.1)
+    assert hs and sorted(started) == ["https://rr3---sn-bbb.googlevideo.com/", "https://rr3---sn-ccc.googlevideo.com/"]
+    monkeypatch.setattr(v94, "V96_MN_PRECONNECT", False)
+    assert v94._v96_mn_preconnect(u) == []

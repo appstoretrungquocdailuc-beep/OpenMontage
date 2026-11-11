@@ -233,3 +233,8 @@ Mock chỉ chứng minh: (a) cache host sau 302 bỏ đúng 1 RTT; (b) chia Rang
 Trên CDN thật log cho thấy 1 GET đã đạt 57–63Mbps với 8.9MB → lợi ích Range không chắc; HTTP/2 chưa đo được ở đây.
 **Mặc định giữ**: `V96_HOST_POOL=1` (không có bất lợi đo được: sai cache chỉ tốn 1 RTT rồi về URL gốc), `V96_RANGE_N=0`, `V96_HTTP2=0`
 cho tới khi `python bench_v93.py live360 --urls urls.txt` trên máy bạn chỉ ra cấu hình thắng. Chưa có số live → chưa đổi.
+
+**Log live 10:51 (V9.6, qEo6ZvVJy4Y 9.29MB):** TTFB 578ms = 302 RTT 67 + DNS 68 + TCP+TLS 106 + chờ server ≈337; xfer 527ms
+(148Mbps/1 kết nối); queue 488ms chỉ vì job đến đúng lúc START (import yt-dlp 445ms giữ GIL) — các job sau queue ≈0.
+→ thêm `V96_MN_PRECONNECT` (mở sẵn DNS+TLS tới host mn trước GET; đo hit bằng `mn_pre=N✓/✗`). Chờ server 337ms không giảm được
+bằng kết nối; phần truyền chỉ A/B `live360` mới quyết được Range N.
