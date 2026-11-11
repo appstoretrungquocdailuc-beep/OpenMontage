@@ -238,3 +238,6 @@ cho tới khi `python bench_v93.py live360 --urls urls.txt` trên máy bạn ch�
 (148Mbps/1 kết nối); queue 488ms chỉ vì job đến đúng lúc START (import yt-dlp 445ms giữ GIL) — các job sau queue ≈0.
 → thêm `V96_MN_PRECONNECT` (mở sẵn DNS+TLS tới host mn trước GET; đo hit bằng `mn_pre=N✓/✗`). Chờ server 337ms không giảm được
 bằng kết nối; phần truyền chỉ A/B `live360` mới quyết được Range N.
+**Log live 10:59 (HjD7LnMKbVQ 8.63MB):** `mn_pre=1✗` — host đích 302 KHÔNG nằm trong `mn=`; TTFB 775 = req1 182 (bắt tay + 302
+ở host đầu) + DNS 65 + TLS 114 + chờ server ≈414; xfer chỉ 263ms (262Mbps/1 kết nối) → Range N còn tối đa ~150ms để lợi.
+→ thêm log cặp cụm `rrN/sn-A → rrM/sn-B` và dự đoán cấp 2 theo cụm sn (giữ rrN) để kiểm tra host đích có quy luật không.

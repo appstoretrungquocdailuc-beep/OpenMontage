@@ -2483,6 +2483,7 @@ def _get_direct_media_pool():
 # ================== V9.6 HOST POOL / PRECONNECT / HTTP2 ================== #
 _V96_LOCK = threading.Lock()
 _V96_REDIRECT = {}          # host gốc → (host đích, t_seen)
+_V96_SN_REDIRECT = {}       # cụm sn gốc → (cụm sn đích, t_seen): dự đoán cấp 2 khi host gốc (rrN) chưa gặp
 _V96_WARM_HOSTS = {}        # host đích → t_last_use (keepalive tới khi quá TTL)
 _V96_KEEPALIVE_STARTED = [False]
 _V96_STATS = {"redirect_skip": 0, "redirect_skip_fail": 0, "preconnect": 0}
@@ -2502,6 +2503,11 @@ def _v96_swap_host(url: str, host: str) -> str:
     return urllib.parse.urlunsplit((u.scheme, netloc, u.path, u.query, u.fragment))
 
 
+def _v96_sn(host: str):
+    m = re.match(r"^(rr\d+)---(sn-[a-z0-9-]+)\.", host or "")
+    return (m.group(1), m.group(2)) if m else (None, None)
+
+
 def _v96_remember_redirect(src_url: str, dst_url: str):
     a, b = _v96_host(src_url), _v96_host(dst_url)
     if not a or not b or a == b or not b.endswith(_V96_HOST_SUFFIX):
@@ -2509,19 +2515,33 @@ def _v96_remember_redirect(src_url: str, dst_url: str):
     with _V96_LOCK:
         _V96_REDIRECT[a] = (b, time.time())
         _V96_WARM_HOSTS[b] = time.time()
+        sa, sb = _v96_sn(a)[1], _v96_sn(b)[1]
+        if sa and sb:
+            _V96_SN_REDIRECT[sa] = (sb, time.time())
     _v96_start_keepalive()
 
 
+def _v96_redirect_label(src_url: str, dst_url: str) -> str:
+    """Nhãn log an toàn: 'rr3/sn-abc → rr3/sn-xyz' (mã cụm CDN, không có chữ ký)."""
+    ra, sa = _v96_sn(_v96_host(src_url)); rb, sb = _v96_sn(_v96_host(dst_url))
+    return f"{ra or '?'}/{sa or '?'} → {rb or '?'}/{sb or '?'}"
+
+
 def _v96_predicted_url(url: str):
-    """URL với host đích đã biết (bỏ 302) hoặc None."""
+    """URL với host đích đã biết (bỏ 302) hoặc None. Cấp 1: đúng host gốc; cấp 2: cùng cụm sn gốc (giữ rrN)."""
     if not V96_HOST_POOL:
         return None
     a = _v96_host(url)
+    ttl = float(V96_HOST_POOL_TTL_SEC)
     with _V96_LOCK:
         hit = _V96_REDIRECT.get(a)
-    if not hit or time.time() - hit[1] > float(V96_HOST_POOL_TTL_SEC):
-        return None
-    return _v96_swap_host(url, hit[0])
+        if hit and time.time() - hit[1] <= ttl:
+            return _v96_swap_host(url, hit[0])
+        ra, sa = _v96_sn(a)
+        hit2 = _V96_SN_REDIRECT.get(sa) if sa else None
+    if hit2 and time.time() - hit2[1] <= ttl and ra:
+        return _v96_swap_host(url, f"{ra}---{hit2[0]}.{_V96_HOST_SUFFIX or 'googlevideo.com'}")
+    return None
 
 
 def _v96_mark_host_used(url: str):
@@ -2803,7 +2823,8 @@ def _download_direct_single_get(url: str, temp_dir: Path, filename: str, logger,
                 current_url = urllib.parse.urljoin(current_url, location)
                 info["redirect_hops"] = hop + 1
                 if hop == 0:
-                    logger(f"    [DIRECT-1GET] ↪ HTTP {status} → follow redirect trực tiếp")
+                    logger(f"    [DIRECT-1GET] ↪ HTTP {status} → follow redirect trực tiếp | {_v96_redirect_label(url, current_url)}")
+                    info["redirect_label"] = _v96_redirect_label(url, current_url)
                     if V96_HOST_POOL:
                         _pc = _v96_preconnect(current_url, pool)   # đo DNS/TLS tới host đích; kết nối vào pool
                         info["dns_ms"], info["tls_ms"] = _pc.get("dns_ms"), _pc.get("tls_ms")
@@ -6270,7 +6291,8 @@ class Worker(threading.Thread):
             ok = _download_direct_single_get(data["url"], self.temp_dir, temp_name, self.log,
                                              self.MIN_BYTES_VIDEO, expected, info=dinfo)
             k["engine"] = ("1get" if k.get("engine") in (None, "1get") else f"{k['engine']}→1get")
-        for kk in ("first_resp_ms", "dns_ms", "tls_ms", "xfer_ms", "redirect_skipped", "redirect_hops", "http_version"):
+        for kk in ("first_resp_ms", "dns_ms", "tls_ms", "xfer_ms", "redirect_skipped", "redirect_hops", "http_version",
+                   "redirect_label"):
             if dinfo.get(kk) is not None:
                 k[kk] = dinfo[kk]
         if _mn and dinfo.get("final_host_full"):

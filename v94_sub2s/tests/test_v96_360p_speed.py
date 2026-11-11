@@ -13,7 +13,7 @@ MB = 1024 * 1024
 @pytest.fixture(autouse=True)
 def _reset(v94):
     with v94._V96_LOCK:
-        v94._V96_REDIRECT.clear(); v94._V96_WARM_HOSTS.clear()
+        v94._V96_REDIRECT.clear(); v94._V96_WARM_HOSTS.clear(); v94._V96_SN_REDIRECT.clear()
     v94._MN_RACE_BAD_UNTIL[0] = 0.0
     yield
 
@@ -51,7 +51,8 @@ def test_predicted_url_swaps_host_only(v94):
     assert v94._v96_predicted_url("https://rr9---sn-zzz.googlevideo.com/x") is None
     with v94._V96_LOCK:
         v94._V96_REDIRECT["rr1---sn-aaa.googlevideo.com"] = ("rr3---sn-bbb.googlevideo.com", time.time() - 10_000)
-    assert v94._v96_predicted_url(u) is None                  # hết TTL
+        v94._V96_SN_REDIRECT["sn-aaa"] = ("sn-bbb", time.time() - 10_000)
+    assert v94._v96_predicted_url(u) is None                  # hết TTL (cả 2 cấp)
 
 
 def test_host_pool_flag_off(v94, monkeypatch):
@@ -182,3 +183,12 @@ def test_mn_hosts_and_preconnect(v94, monkeypatch):
     assert hs and sorted(started) == ["https://rr3---sn-bbb.googlevideo.com/", "https://rr3---sn-ccc.googlevideo.com/"]
     monkeypatch.setattr(v94, "V96_MN_PRECONNECT", False)
     assert v94._v96_mn_preconnect(u) == []
+
+
+def test_sn_level_prediction(v94):
+    a = "https://rr1---sn-aaa.googlevideo.com/videoplayback?x=1"
+    v94._v96_remember_redirect(a, "https://rr1---sn-bbb.googlevideo.com/videoplayback?x=1")
+    # host gốc khác (rr5) nhưng cùng cụm sn-aaa → đoán rr5---sn-bbb
+    assert v94._v96_predicted_url("https://rr5---sn-aaa.googlevideo.com/videoplayback?x=2") == \
+        "https://rr5---sn-bbb.googlevideo.com/videoplayback?x=2"
+    assert v94._v96_redirect_label(a, "https://rr1---sn-bbb.googlevideo.com/v") == "rr1/sn-aaa → rr1/sn-bbb"
