@@ -6707,7 +6707,7 @@ class PremiumDownloaderApp(QWidget):
         left_frame.setMaximumWidth(600)
         left_frame.setMinimumWidth(600) 
         
-        header = QLabel("Downloader V8.6 — FRESH-SHORT NATIVE-FIRST 480p 244→135 + JA"); header.setObjectName("HeaderLabel"); header.setMinimumHeight(60)
+        header = QLabel("Downloader V9.5 — 480p 244→135 + audio Nhật | 360p nhanh (itag 18) + JA"); header.setObjectName("HeaderLabel"); header.setMinimumHeight(60)
         header.setStyleSheet("font-size:18px; font-weight:700;"); left.addWidget(header)
         
         left.addWidget(QLabel("1. Chọn file Excel (Data Input):"))
@@ -6762,11 +6762,11 @@ class PremiumDownloaderApp(QWidget):
         )
         self.radio_hard = QRadioButton("Ignored")
         
-        h_rad = QHBoxLayout()
+        # V9.5: xếp DỌC để nhìn thấy đủ chữ của cả 2 lựa chọn
+        h_rad = QVBoxLayout()
         h_rad.addWidget(self.radio_auto)
         if V95_360P:
             h_rad.addWidget(self.radio_light)
-        h_rad.addStretch()
         sett_layout.addLayout(h_rad)
 
         sett_layout.addWidget(QLabel("Công cụ tải (Download Engine):"))
