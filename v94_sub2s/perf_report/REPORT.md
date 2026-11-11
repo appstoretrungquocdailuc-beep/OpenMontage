@@ -206,3 +206,30 @@ Test: `tests/test_v95_360p.py` (15 test: 3 nhánh cắt, fallback JA→480, lỗ
 4. ffprobe nền không chạy cho nhánh >300s (không có `final_file`) → nay kiểm mọi part trong thư mục cắt; test cả 3 nhánh có span.
 5. `bench report` đếm sai số job lỗi → sửa Counter.
 Test sau review: 144 passed + 1 xfailed (2 lần).
+
+---
+
+# V9.6 — giảm thời gian tải 360p, 11/11/2026
+
+Hàm sửa/thêm: `_v96_env`, `_v96_host/_v96_swap_host/_v96_remember_redirect/_v96_predicted_url/_v96_mark_host_used` (cache 302),
+`_v96_preconnect` (đo DNS, TCP+TLS; kết nối vào pool), `_v96_keepalive_worker` (HEAD /generate_204 tới host đích, chỉ khi rảnh),
+`_v96_h2_client/_v96_download_h2` (httpx HTTP/2, N Range), `_download_direct_single_get` (+host đích đã nhớ, +req1/dns/tls/xfer),
+`_download_http_range_turbo_v94` (+`workers_override`, nhớ redirect), `Worker._process_single_url_360` (chọn engine theo cờ,
+Range/H2 lỗi → 1-GET cùng URL), `bench_v93.py live360`.
+
+**Số đo mock** (perf_report/live360_20261111_013605; 5.1MB H.264+AAC, 302 → host khác, TTFB 250ms, 40Mbps/kết nối; KHÔNG phải CDN thật):
+
+| Cấu hình | first_byte p50 | hot_ready p50 | Mbps | 302 bỏ được |
+|---|---|---|---|---|
+| 1get (V9.5) | 354 ms | 1305 ms | 32 | 0% |
+| 1get+pool | **103 ms** | 1054 ms | 40 | 75% (lần đầu phải học) |
+| range2 | 27 | 532 | 79 | — |
+| range4 | 26 | 271 | 156 | — |
+| range8 | 27 | **146** | 290 | — |
+| h2x1 | 2 | 1093 | 39 | — (mock chỉ HTTP/1.1) |
+| h2x4 | 2 | 310 | 136 | — |
+
+Mock chỉ chứng minh: (a) cache host sau 302 bỏ đúng 1 RTT; (b) chia Range có lợi khi tốc độ bị giới hạn **theo kết nối**.
+Trên CDN thật log cho thấy 1 GET đã đạt 57–63Mbps với 8.9MB → lợi ích Range không chắc; HTTP/2 chưa đo được ở đây.
+**Mặc định giữ**: `V96_HOST_POOL=1` (không có bất lợi đo được: sai cache chỉ tốn 1 RTT rồi về URL gốc), `V96_RANGE_N=0`, `V96_HTTP2=0`
+cho tới khi `python bench_v93.py live360 --urls urls.txt` trên máy bạn chỉ ra cấu hình thắng. Chưa có số live → chưa đổi.

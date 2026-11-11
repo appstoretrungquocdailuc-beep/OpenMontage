@@ -99,7 +99,7 @@ Thư mục này chứa:
 python -m py_compile V9_3_AUDIO.py V9_4_SUB2S.py bench_v93.py
 python -m pytest -q -rfxX
 ```
-Kết quả mong đợi (V9.5): `144 passed, 1 xfailed` (đôi khi `145 passed` vì bug V9.3 là race, có lần không lộ). XFAIL là **bug V9.3 được tái hiện có chủ đích** (4 job ghi STATUS
+Kết quả mong đợi (V9.5): `159 passed, 1 xfailed` (đôi khi `160 passed` vì bug V9.3 là race, có lần không lộ). XFAIL là **bug V9.3 được tái hiện có chủ đích** (4 job ghi STATUS
 song song làm mất DONE / hỏng `check.xlsx`). Nội dung test: 206 chuẩn (SHA256), 302, 403/410/429, 200 bỏ
 Range, size ước tính sai (4 kiểu), size không biết, Content-Range sai, đứt kết nối giữa chừng, header trễ,
 đuôi chậm (steal), 8 tải đồng thời, huỷ + dọn thread/file, 416, rollback cờ, chọn audio JA, đuôi file, Excel,
@@ -185,3 +185,25 @@ Span telemetry: `q360_resolve_begin/end`, `q360_get_begin`, `q360_first_byte`, `
 
 Báo cáo P50/P90/P99 từ telemetry: `python bench_v93.py report` (đọc mọi `perf_report\telemetry_*.jsonl`, tách 360fast / 480hard,
 kèm `size_mb`, `mbps`, `under_1s_hot`). Live A/B: `python bench_v93.py live --urls urls.txt --versions v94 --quality both`.
+
+## 9. V9.6 — giảm thời gian tải 360p (cờ `V96_*`, tắt = V9.5)
+
+Từ log live: resolve ≈0.14s, **TTFB ≈0.69–0.75s (có 302 đổi host)**, truyền 5–9MB ≈0.5–0.6s.
+
+| Biến | Mặc định | Ý nghĩa |
+|---|---|---|
+| `V96_HOST_POOL` | 1 | Nhớ host đích sau 302 (TTL 10 phút) → video sau GET thẳng host đích (bỏ 1 RTT); sai → về URL gốc 1 lần. Kết nối TLS tới host đích được mở ngay khi thấy 302 và giữ trong pool; sau khi tải xong, HEAD `/generate_204` mỗi 25s giữ nóng (chỉ khi không có job). Mock: first_byte 354 → 103ms khi trúng cache |
+| `V96_RANGE_N` | 0 | Chia N đoạn Range song song (2/4/8) khi biết content_length; lỗi 403/410/429 → dừng chia, 1-GET cùng URL, không retry thêm |
+| `V96_HTTP2` | 0 | Tải qua httpx HTTP/2 (`pip install httpx[http2]`), N = `V96_RANGE_N` (1 = 1 GET h2). Không có httpx → tự về 1-GET urllib3 |
+
+Dòng `[DIRECT-1GET] ✅ …` và `KPI-360` có thêm `req1=` (RTT request đầu: 302 hoặc 200), `dns=`, `tls=` (tới host đích sau 302),
+`xfer=` (thời gian truyền sau byte đầu), `302skip` (đã bỏ 302 nhờ cache).
+
+**A/B tự động (bắt buộc chạy live để chọn mặc định):**
+```bat
+pip install httpx[http2]
+python bench_v93.py live360 --urls urls.txt --reps 3
+```
+Chạy 7 cấu hình (`1get`, `1get+pool`, `range2/4/8`, `h2x1`, `h2x4`) × URL × 3 lần, in bảng `first_byte / xfer / download /
+hot_ready p50/p90 / Mbps / 302skip_rate` và kết luận cấu hình nhanh nhất (phải nhanh hơn `1get` ≥50ms p50 và không tệ hơn p90).
+Sau đó ghi vào `RUN_V9_4_GUI.bat`, ví dụ `set V96_RANGE_N=4`. Không có URL → chạy mock (chỉ kiểm harness).

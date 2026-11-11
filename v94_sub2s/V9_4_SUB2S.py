@@ -157,7 +157,7 @@ def _v94_env(name, default):
         return default
 
 
-V94_VERSION = "V9.5-SUB2S"     # V9.4.1 + lựa chọn 360p nhanh (V95_360P)
+V94_VERSION = "V9.6-SUB2S"     # V9.5 + giảm TTFB/truyền cho 360p (V96_*)
 # Range: kiểm tra Content-Range start/end khớp đúng request (V9.3 chỉ đọc tổng).
 V94_STRICT_CONTENT_RANGE = _v94_env("STRICT_CONTENT_RANGE", True)
 # Range: size thật ≠ ước tính → co/giãn tại chỗ, không vứt dữ liệu và tải lại (V9.3 = restart).
@@ -250,6 +250,33 @@ V95_360P_JA_FALLBACK = (str(os.environ.get("V95_360P_JA_FALLBACK", "1")).strip()
 # Lý do có công tắc: log live 17:09 cho thấy GVS ~5Mbps/kết nối → 1 GET cho 2-3MB có thể mất 4-5s, trong khi
 # Range 6 kết nối mất ~1.5s. Chỉ bật khi đo live thấy 1 GET chậm hơn.
 V95_360P_RANGE = (str(os.environ.get("V95_360P_RANGE", "0")).strip().lower() in ("1", "true", "yes", "on"))
+# ---------------------------------------------------------------------------------------------
+# V9.6 — giảm thời gian tải 360p. Log live: resolve 0.14s, TTFB 0.69-0.75s (có 302 đổi host), truyền 5-9MB 0.5-0.6s.
+# Mọi cờ V96_*: tắt = hành vi V9.5. Chỉ giữ cấu hình nào ĐO ĐƯỢC nhanh hơn (python bench_v93.py live360).
+# ---------------------------------------------------------------------------------------------
+def _v96_env(name, default):
+    raw = os.environ.get(f"V96_{name}")
+    if raw is None or str(raw).strip() == "":
+        return default
+    raw = str(raw).strip()
+    if isinstance(default, bool):
+        return raw.lower() in ("1", "true", "yes", "on")
+    try:
+        return type(default)(raw)
+    except Exception:
+        return default
+
+
+# 1) Nhớ host đích sau 302 (hostA → hostB, TTL 10 phút) và GET thẳng hostB lần sau (bỏ 1 RTT 302);
+#    lỗi/không 200-206 → quay về URL gốc. Giữ kết nối nóng tới hostB sau khi tải xong (HEAD /generate_204 mỗi 25s, tối đa 10 phút).
+V96_HOST_POOL = _v96_env("HOST_POOL", True)
+V96_HOST_POOL_TTL_SEC = _v96_env("HOST_POOL_TTL_SEC", 600.0)
+V96_HOST_KEEPALIVE_SEC = _v96_env("HOST_KEEPALIVE_SEC", 25.0)
+# 2) Chia Range N đoạn song song khi biết content_length (0 = 1-GET như V9.5; thử 2/4/8). Lỗi 403/410/429 ở
+#    bất kỳ đoạn nào → dừng chia, quay về 1-GET cùng URL (không retry liên tục, không đổi IP/proxy).
+V96_RANGE_N = _v96_env("RANGE_N", 0)
+# 3) HTTP/2 qua httpx[http2] (nếu cài): 1 kết nối cho nhiều Range. 0 = urllib3 HTTP/1.1.
+V96_HTTP2 = _v96_env("HTTP2", False)
 # ffprobe kiểm file 360p chạy nền SAU khi đã DONE (chỉ cảnh báo). 0 = không kiểm.
 V95_360P_BG_PROBE = (str(os.environ.get("V95_360P_BG_PROBE", "1")).strip().lower() in ("1", "true", "yes", "on"))
 
@@ -2450,6 +2477,225 @@ def _get_direct_media_pool():
     return _DIRECT_MEDIA_POOL
 
 
+# ================== V9.6 HOST POOL / PRECONNECT / HTTP2 ================== #
+_V96_LOCK = threading.Lock()
+_V96_REDIRECT = {}          # host gốc → (host đích, t_seen)
+_V96_WARM_HOSTS = {}        # host đích → t_last_use (keepalive tới khi quá TTL)
+_V96_KEEPALIVE_STARTED = [False]
+_V96_STATS = {"redirect_skip": 0, "redirect_skip_fail": 0, "preconnect": 0}
+_V96_HOST_SUFFIX = "googlevideo.com"      # chỉ nhớ/giữ nóng host media (test có thể đổi)
+
+
+def _v96_host(url: str) -> str:
+    try:
+        return (urllib.parse.urlsplit(str(url)).hostname or "").lower()
+    except Exception:
+        return ""
+
+
+def _v96_swap_host(url: str, host: str) -> str:
+    u = urllib.parse.urlsplit(str(url))
+    netloc = host + (f":{u.port}" if u.port else "")
+    return urllib.parse.urlunsplit((u.scheme, netloc, u.path, u.query, u.fragment))
+
+
+def _v96_remember_redirect(src_url: str, dst_url: str):
+    a, b = _v96_host(src_url), _v96_host(dst_url)
+    if not a or not b or a == b or not b.endswith(_V96_HOST_SUFFIX):
+        return
+    with _V96_LOCK:
+        _V96_REDIRECT[a] = (b, time.time())
+        _V96_WARM_HOSTS[b] = time.time()
+    _v96_start_keepalive()
+
+
+def _v96_predicted_url(url: str):
+    """URL với host đích đã biết (bỏ 302) hoặc None."""
+    if not V96_HOST_POOL:
+        return None
+    a = _v96_host(url)
+    with _V96_LOCK:
+        hit = _V96_REDIRECT.get(a)
+    if not hit or time.time() - hit[1] > float(V96_HOST_POOL_TTL_SEC):
+        return None
+    return _v96_swap_host(url, hit[0])
+
+
+def _v96_mark_host_used(url: str):
+    h = _v96_host(url)
+    if h.endswith(_V96_HOST_SUFFIX):
+        with _V96_LOCK:
+            _V96_WARM_HOSTS[h] = time.time()
+        _v96_start_keepalive()
+
+
+def _v96_preconnect(url_or_host: str, pool=None, timeout: float = 1.5) -> dict:
+    """Mở 1 kết nối (TCP+TLS) tới host của URL và trả vào pool (GET sau dùng lại). Đo riêng DNS / TCP+TLS."""
+    u = urllib.parse.urlsplit(url_or_host if "://" in str(url_or_host) else f"https://{url_or_host}")
+    host, scheme = (u.hostname or "").lower(), (u.scheme or "https")
+    port = u.port or (443 if scheme == "https" else 80)
+    d = {"host": host, "dns_ms": None, "tls_ms": None, "ok": False}
+    pool = pool or _get_direct_media_pool()
+    if pool is None or not host:
+        return d
+    try:
+        t = time.perf_counter()
+        socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        d["dns_ms"] = round((time.perf_counter() - t) * 1000.0, 1)
+        hp = pool.connection_from_host(host, port, scheme)
+        conn = hp._get_conn()
+        try:
+            if getattr(conn, "sock", None) is None:
+                conn.timeout = timeout
+                t = time.perf_counter()
+                conn.connect()
+                d["tls_ms"] = round((time.perf_counter() - t) * 1000.0, 1)
+            else:
+                d["tls_ms"] = 0.0          # đã có kết nối nóng trong pool
+            d["ok"] = True
+        finally:
+            hp._put_conn(conn)
+        with _V96_LOCK:
+            _V96_STATS["preconnect"] += 1
+    except Exception as e:
+        d["error"] = type(e).__name__
+    return d
+
+
+def _v96_keepalive_worker():
+    while True:
+        time.sleep(max(5.0, float(V96_HOST_KEEPALIVE_SEC)))
+        if _v94_jobs_active() > 0:
+            continue                      # đang có job tải → kết nối tự nóng, không chen request
+        with _V96_LOCK:
+            hosts = [h for h, t in _V96_WARM_HOSTS.items() if time.time() - t <= float(V96_HOST_POOL_TTL_SEC)]
+            for h in list(_V96_WARM_HOSTS):
+                if h not in hosts:
+                    _V96_WARM_HOSTS.pop(h, None)
+        pool = _get_direct_media_pool()
+        for h in hosts[:4]:
+            try:
+                r = pool.request("HEAD", f"https://{h}/generate_204",
+                                 headers={"Connection": "keep-alive"}, redirect=False, retries=False,
+                                 timeout=urllib3.Timeout(connect=0.8, read=0.8), preload_content=True)
+                TELEM.span("-", "v96_keepalive", host=h[:12] + "***", status=int(r.status))
+            except Exception as e:
+                TELEM.span("-", "v96_keepalive", host=h[:12] + "***", error=type(e).__name__)
+
+
+def _v96_start_keepalive():
+    if not V96_HOST_POOL or float(V96_HOST_KEEPALIVE_SEC) <= 0:
+        return
+    with _V96_LOCK:
+        if _V96_KEEPALIVE_STARTED[0]:
+            return
+        _V96_KEEPALIVE_STARTED[0] = True
+    threading.Thread(target=_v96_keepalive_worker, name="V96HostKeepalive", daemon=True).start()
+
+
+_V96_H2_CLIENT = [None]
+
+
+def _v96_h2_client():
+    """httpx.Client(http2=True) dùng chung (thread-safe). None nếu chưa cài httpx[http2]."""
+    if _V96_H2_CLIENT[0] is not None:
+        return _V96_H2_CLIENT[0] or None
+    try:
+        import httpx  # noqa: F401
+        import h2  # noqa: F401
+        _V96_H2_CLIENT[0] = httpx.Client(http2=True, follow_redirects=False,
+                                         timeout=httpx.Timeout(connect=1.0, read=6.0, write=6.0, pool=5.0),
+                                         limits=httpx.Limits(max_connections=64, max_keepalive_connections=32))
+    except Exception:
+        _V96_H2_CLIENT[0] = False
+    return _V96_H2_CLIENT[0] or None
+
+
+def _v96_download_h2(url: str, temp_dir: Path, filename: str, logger, min_bytes: int, expected: int,
+                     n: int, info: dict) -> bool:
+    """Tải bằng httpx HTTP/2: follow 302 tự tay, rồi N Range song song (n=1 → 1 GET) trên cùng client.
+    Lỗi 403/410/429 ở bất kỳ đoạn nào → False (caller quay về 1-GET urllib3)."""
+    cl = _v96_h2_client()
+    if cl is None:
+        info["fail_reason"] = "no_httpx"
+        return False
+    ensure_dir(temp_dir)
+    temp_file = temp_dir / filename
+    t0 = time.perf_counter()
+    hdr = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/154.0.0.0 Safari/537.36",
+           "Accept": "*/*", "Accept-Encoding": "identity"}
+    cur = str(url)
+    try:
+        # follow redirect bằng 1 request Range nhỏ (đồng thời cho TTFB + xác nhận 206 + size thật)
+        total = int(expected or 0)
+        for hop in range(DIRECT_MAX_REDIRECTS + 1):
+            with cl.stream("GET", cur, headers={**hdr, "Range": "bytes=0-0"}) as r:
+                info["status"] = r.status_code
+                info["http_version"] = r.http_version
+                if r.status_code in (301, 302, 303, 307, 308):
+                    loc = r.headers.get("Location")
+                    if not loc:
+                        info["fail_reason"] = f"HTTP_{r.status_code}_redirect"; return False
+                    cur = urllib.parse.urljoin(cur, loc)
+                    continue
+                if r.status_code == 206:
+                    cr = str(r.headers.get("Content-Range") or "")
+                    if "/" in cr and cr.rsplit("/", 1)[1].strip().isdigit():
+                        total = int(cr.rsplit("/", 1)[1])
+                    r.read()
+                    break
+                info["fail_reason"] = f"HTTP_{r.status_code}"; return False
+        if cur != str(url):
+            _v96_remember_redirect(url, cur)
+        info["ttfb_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
+        info["first_byte_ns"] = time.perf_counter_ns()
+        if total <= 0:
+            info["fail_reason"] = "no_total"; return False
+        n = max(1, min(int(n), max(1, total // RANGE_MIN_PART_BYTES)))
+        part = (total + n - 1) // n
+        segs = [(i * part, min(total - 1, (i + 1) * part - 1)) for i in range(n)]
+        err = {}
+        fh = open(temp_file, "w+b"); fh.truncate(total)
+        lock = threading.Lock()
+
+        def _one(seg):
+            a, b = seg
+            try:
+                with cl.stream("GET", cur, headers={**hdr, "Range": f"bytes={a}-{b}"}) as r:
+                    if r.status_code != 206:
+                        err[seg] = f"HTTP_{r.status_code}"; return
+                    pos = a
+                    for chunk in r.iter_bytes(256 * 1024):
+                        with lock:
+                            fh.seek(pos); fh.write(chunk)
+                        pos += len(chunk)
+                    if pos != b + 1:
+                        err[seg] = f"short_{pos}/{b + 1}"
+            except Exception as e:
+                err[seg] = f"EXC:{type(e).__name__}"
+        with ThreadPoolExecutor(max_workers=n) as ex:
+            list(ex.map(_one, segs))
+        fh.close()
+        if err:
+            info["fail_reason"] = next(iter(err.values()))
+            try: temp_file.unlink()
+            except OSError: pass
+            return False
+        size = temp_file.stat().st_size
+        el = max(1e-3, time.perf_counter() - t0)
+        info.update({"bytes": size, "elapsed_ms": round(el * 1000.0, 2), "engine": f"h2x{n}"})
+        if size != total or size < min_bytes:
+            info["fail_reason"] = f"size_{size}/{total}"; return False
+        logger(f"    [H2-RANGE{n}] ✅ {size/1048576:.2f}MB | {info.get('http_version', '?')} | TTFB={info['ttfb_ms']:.0f}ms | "
+               f"{el:.3f}s | ≈{size*8/1e6/el:.0f}Mbps")
+        return True
+    except Exception as e:
+        info["fail_reason"] = f"EXC:{type(e).__name__}"
+        try:
+            if temp_file.exists(): temp_file.unlink()
+        except OSError: pass
+        return False
+
 def _download_direct_single_get(url: str, temp_dir: Path, filename: str, logger,
                                 min_bytes: int, expected_bytes: int = 0, info: dict = None) -> bool:
     """One GET, zero HEAD/Range preflight. Optimized for small progressive itag 18.
@@ -2473,9 +2719,13 @@ def _download_direct_single_get(url: str, temp_dir: Path, filename: str, logger,
     resp = None
     current_url = str(url)
     last_progress_log = t0
+    predicted = _v96_predicted_url(url)           # V9.6: host đích đã biết → bỏ 1 RTT 302
+    if predicted:
+        current_url = predicted
+        info["redirect_skipped"] = True
     logger(
         f"    [DIRECT-1GET] 🚀 START | {filename} | "
-        f"expected≈{int(expected_bytes or 0)/1048576:.2f}MB"
+        f"expected≈{int(expected_bytes or 0)/1048576:.2f}MB" + (" | host đích đã nhớ (bỏ 302)" if predicted else "")
     )
     try:
         # urllib3 with retries=False does not reliably follow 30x redirects.
@@ -2497,6 +2747,21 @@ def _download_direct_single_get(url: str, temp_dir: Path, filename: str, logger,
                 retries=False,
             )
             status = int(getattr(resp, "status", 0) or 0)
+            if hop == 0:
+                info["first_resp_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)   # RTT request đầu (302 hoặc 200)
+            if predicted and hop == 0 and status not in (200, 206):
+                # host đích đã nhớ không còn đúng → về URL gốc (1 lần, không retry thêm)
+                try: resp.release_conn()
+                except Exception: pass
+                resp = None
+                with _V96_LOCK:
+                    _V96_STATS["redirect_skip_fail"] += 1
+                    _V96_REDIRECT.pop(_v96_host(url), None)
+                info["redirect_skipped"] = False
+                predicted = None
+                current_url = str(url)
+                logger(f"    [DIRECT-1GET] ↩ host đích đã nhớ trả HTTP {status} → dùng URL gốc")
+                continue
             if status in (301, 302, 303, 307, 308):
                 location = str((getattr(resp, "headers", {}) or {}).get("Location") or "").strip()
                 if not location or hop >= DIRECT_MAX_REDIRECTS:
@@ -2508,10 +2773,21 @@ def _download_direct_single_get(url: str, temp_dir: Path, filename: str, logger,
                     pass
                 resp = None
                 current_url = urllib.parse.urljoin(current_url, location)
+                info["redirect_hops"] = hop + 1
                 if hop == 0:
                     logger(f"    [DIRECT-1GET] ↪ HTTP {status} → follow redirect trực tiếp")
+                    if V96_HOST_POOL:
+                        _pc = _v96_preconnect(current_url, pool)   # đo DNS/TLS tới host đích; kết nối vào pool
+                        info["dns_ms"], info["tls_ms"] = _pc.get("dns_ms"), _pc.get("tls_ms")
                 continue
             break
+        if V96_HOST_POOL and resp is not None:
+            if current_url != str(url) and not predicted:
+                _v96_remember_redirect(url, current_url)
+            _v96_mark_host_used(current_url)
+            with _V96_LOCK:
+                if predicted:
+                    _V96_STATS["redirect_skip"] += 1
 
         status = int(getattr(resp, "status", 0) or 0) if resp is not None else 0
         info["status"] = status
@@ -2546,7 +2822,9 @@ def _download_direct_single_get(url: str, temp_dir: Path, filename: str, logger,
 
         elapsed = max(0.0001, time.perf_counter() - t0)
         info.update({"bytes": total, "elapsed_ms": round(elapsed * 1000.0, 2),
-                     "ttfb_ms": round(((first_byte or time.perf_counter()) - t0) * 1000.0, 2)})
+                     "ttfb_ms": round(((first_byte or time.perf_counter()) - t0) * 1000.0, 2),
+                     "xfer_ms": round((time.perf_counter() - (first_byte or t0)) * 1000.0, 2),
+                     "final_host": _v96_host(current_url)[:14] + "***"})
         if total < min_bytes:
             info["fail_reason"] = f"too_small_{total}"
             logger(f"    [DIRECT-1GET] ⚠️ File quá nhỏ: {total} bytes")
@@ -2569,6 +2847,10 @@ def _download_direct_single_get(url: str, temp_dir: Path, filename: str, logger,
         logger(
             f"    [DIRECT-1GET] ✅ ZERO-PREFLIGHT | {total/1048576:.2f}MB | "
             f"TTFB={ttfb_ms:.0f}ms | {elapsed:.3f}s | ≈{mbps:.0f}Mbps"
+            + (f" | req1={info.get('first_resp_ms')}ms" if info.get("first_resp_ms") is not None else "")
+            + (f" dns={info.get('dns_ms')}ms tls={info.get('tls_ms')}ms" if info.get("tls_ms") is not None else "")
+            + (" | 302-skip" if info.get("redirect_skipped") else "")
+            + f" | xfer={info.get('xfer_ms')}ms"
         )
         return True
     except Exception as e:
@@ -3464,6 +3746,8 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
     svw = 0 if is_audio else int(info.get("small_video_workers") or V94_VIDEO_SMALL_WORKERS or 0)
     if size_known:
         workers = _range_worker_count(total0, media_kind, svw)
+        if int(info.get("workers_override") or 0) > 0:      # V9.6: ép N đoạn (A/B 360p)
+            workers = int(info["workers_override"])
         workers = max(1, min(workers, max(1, total0 // min_part_bytes)))
     else:
         # Size chưa biết: chia khoảng đoán [0, guess) cho vài request song song ngay t=0 (đoạn vượt
@@ -3856,6 +4140,8 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
                 if seg.h == 0 and got_url != cur_url and state["url"] == cur_url:
                     state["url"] = got_url
                     state["hops"] = hops
+                    if V96_HOST_POOL:
+                        _v96_remember_redirect(cur_url, got_url)
                 _now = time.perf_counter()
                 if state["ttfb"] is None:
                     state["ttfb"] = _now - t0
@@ -5794,8 +6080,12 @@ class Worker(threading.Thread):
                         f"📊 V9.5 KPI-360 [{vid}] resolve={k.get('resolve_ms','-')}ms | first_byte={k.get('first_byte_ms','-')}ms "
                         f"| download={k.get('download_ms','-')}ms ({(k.get('bytes') or 0)/1048576:.2f}MB ≈{k.get('mbps','-')}Mbps, {k.get('engine','-')}"
                         f"{'+alt' if k.get('alt_link') else ''}) "
-                        f"| HOT_READY={k.get('hot_ready_ms','-')}ms | post={k.get('postprocess_ms','-')} done={k.get('status_done_ms','-')} "
-                        f"| TOTAL={k.get('pipeline_total_ms','-')}ms | ok={ok_holder['ok']}"
+                        + (f"| req1={k['first_resp_ms']}ms " if k.get("first_resp_ms") is not None else "")
+                        + (f"dns={k.get('dns_ms')} tls={k.get('tls_ms')} " if k.get("tls_ms") is not None else "")
+                        + (f"xfer={k['xfer_ms']}ms " if k.get("xfer_ms") is not None else "")
+                        + ("302skip " if k.get("redirect_skipped") else "")
+                        + f"| HOT_READY={k.get('hot_ready_ms','-')}ms | post={k.get('postprocess_ms','-')} done={k.get('status_done_ms','-')} "
+                        + f"| TOTAL={k.get('pipeline_total_ms','-')}ms | ok={ok_holder['ok']}"
                         + (f" | fail={summary['fail_reason']}" if not ok_holder["ok"] else "")
                         + f" | KPI3={_f('kpi3_ms')} queue={_f('queue_ms')} detect={_f('detect_ms')}"
                         + (f" ja_fallback={k['ja_fallback']}" if k.get("ja_fallback") else "")
@@ -5916,17 +6206,41 @@ class Worker(threading.Thread):
         dinfo = {}
         TELEM.span(self._v94["job"], "q360_get_begin", at_ms=_ms(time.perf_counter_ns()))
         self._v94["video"]["first_get_ns"] = time.perf_counter_ns()
-        if V95_360P_RANGE and expected >= RANGE_VIDEO_MIN_BYTES:
+        rn = int(getattr(self, "_v96_range_n", None) if getattr(self, "_v96_range_n", None) is not None else V96_RANGE_N)
+        h2 = bool(getattr(self, "_v96_http2", None) if getattr(self, "_v96_http2", None) is not None else V96_HTTP2)
+        ok = False
+        src_url0 = _v96_predicted_url(data["url"]) if (h2 or rn > 1) else None
+        if src_url0:
+            k["redirect_skipped"] = True
+        if h2 and expected >= RANGE_VIDEO_MIN_BYTES:
+            ok = _v96_download_h2(src_url0 or data["url"], self.temp_dir, temp_name, self.log,
+                                  self.MIN_BYTES_VIDEO, expected, max(1, rn), dinfo)
+            k["engine"] = dinfo.get("engine") or f"h2x{max(1, rn)}"
+            if not ok:
+                self.log(f"    ↩ H2 lỗi ({dinfo.get('fail_reason')}) → 1-GET HTTP/1.1 cùng URL")
+                k["h2_fail"] = str(dinfo.get("fail_reason"))
+                dinfo = {}
+        elif (rn > 1 or V95_360P_RANGE) and expected >= RANGE_VIDEO_MIN_BYTES:
             dinfo["job"] = self._v94["job"]
-            ok = _download_http_range_turbo(data["url"], self.temp_dir, temp_name, self.log,
+            if rn > 1:
+                dinfo["workers_override"] = rn
+            ok = _download_http_range_turbo(src_url0 or data["url"], self.temp_dir, temp_name, self.log,
                                             self.MIN_BYTES_VIDEO, expected, media_kind="video", info=dinfo)
             if dinfo.get("first_byte_ms") is not None:
                 dinfo["first_byte_ns"] = self._v94["video"]["first_get_ns"] + int(dinfo["first_byte_ms"] * 1e6)
-            k["engine"] = "range"
-        else:
+            k["engine"] = f"range{rn}" if rn > 1 else "range"
+            if not ok:
+                # V9.6: lỗi Range (403/410/429/...) → dừng chia, 1-GET cùng URL, không retry thêm
+                self.log(f"    ↩ Range{rn} lỗi ({dinfo.get('fail_reason')}) → 1-GET cùng URL")
+                k["range_fail"] = str(dinfo.get("fail_reason"))
+                dinfo = {}
+        if not ok:
             ok = _download_direct_single_get(data["url"], self.temp_dir, temp_name, self.log,
                                              self.MIN_BYTES_VIDEO, expected, info=dinfo)
-            k["engine"] = "1get"
+            k["engine"] = ("1get" if k.get("engine") in (None, "1get") else f"{k['engine']}→1get")
+        for kk in ("first_resp_ms", "dns_ms", "tls_ms", "xfer_ms", "redirect_skipped", "redirect_hops", "http_version"):
+            if dinfo.get(kk) is not None:
+                k[kk] = dinfo[kk]
         if dinfo.get("first_byte_ns"):
             k["first_byte_ms"] = _ms(dinfo["first_byte_ns"])
             TELEM.span(self._v94["job"], "q360_first_byte", at_ms=k["first_byte_ms"], ttfb_ms=dinfo.get("ttfb_ms"))

@@ -422,6 +422,9 @@ def run_live_once(mod, ver, url, work, engine, cutsec, quality="480hard"):
                        "mbps", "ttfb_ms", "lock_wait_ms", "new_conns", "total", "resized"):
                 if kk in inf:
                     row[f"{kind}_{kk}"] = inf[kk]
+        for kk in ("engine", "redirect_skipped", "http_version", "range_fail", "h2_fail"):
+            if kk in k:
+                row[kk] = k[kk]
         row["fail_reason"] = w._v94.get("fail") or ""
     if not row["success"] and not row.get("fail_reason"):
         tail = [l for l in logs if "❌" in l or "⚠️" in l]
@@ -726,6 +729,116 @@ def run_report(args):
     return 0
 
 
+# ----------------------------------------------------------------------------- live360 (A/B cấu hình tải 360p)
+V96_CONFIGS = {
+    "1get":        {"V96_HOST_POOL": False, "V96_RANGE_N": 0, "V96_HTTP2": False},
+    "1get+pool":   {"V96_HOST_POOL": True,  "V96_RANGE_N": 0, "V96_HTTP2": False},
+    "range2":      {"V96_HOST_POOL": True,  "V96_RANGE_N": 2, "V96_HTTP2": False},
+    "range4":      {"V96_HOST_POOL": True,  "V96_RANGE_N": 4, "V96_HTTP2": False},
+    "range8":      {"V96_HOST_POOL": True,  "V96_RANGE_N": 8, "V96_HTTP2": False},
+    "h2x1":        {"V96_HOST_POOL": True,  "V96_RANGE_N": 1, "V96_HTTP2": True},
+    "h2x4":        {"V96_HOST_POOL": True,  "V96_RANGE_N": 4, "V96_HTTP2": True},
+}
+
+
+def _live360_rows_to_summary(rows):
+    metrics = ["resolve_ms", "first_resp_ms", "dns_ms", "tls_ms", "first_byte_ms", "xfer_ms", "download_ms",
+               "hot_ready_ms", "pipeline_total_ms", "mbps"]
+    summ = summarize(rows, ["config"], metrics)
+    for s_ in summ:
+        rs = [r for r in rows if r["config"] == s_["config"]]
+        s_["302skip_rate"] = round(sum(1 for r in rs if r.get("redirect_skipped")) / max(1, len(rs)), 2)
+        s_["engines"] = ",".join(sorted({str(r.get("engine")) for r in rs}))
+    return summ
+
+
+def run_live360(args):
+    """A/B cấu hình tải 360p trên URL thật: mỗi cấu hình × mỗi URL × --reps, thứ tự xoay vòng.
+    Không có URL → chạy MOCK (chỉ chứng minh harness; số đo mock KHÔNG phải số đo CDN)."""
+    qt_stub = _ensure_qt()
+    if not qt_stub:
+        from PySide6.QtWidgets import QApplication
+        _app = QApplication.instance() or QApplication([])  # noqa: F841
+    mod = load(MODS["v94"])
+    cfgs = [c for c in (args.configs.split(",") if args.configs else list(V96_CONFIGS)) if c in V96_CONFIGS]
+    urls = list(args.url or [])
+    if args.urls:
+        urls += [l.strip() for l in Path(args.urls).read_text(encoding="utf-8").splitlines()
+                 if l.strip() and not l.strip().startswith("#")]
+    rows, notes = [], []
+    work_root = Path(tempfile.mkdtemp(prefix="live360_"))
+    mock = None
+    if not urls:
+        # MOCK: file 5MB qua 302 (host "khác" = localhost), TTFB 250ms, 40Mbps/kết nối
+        from mock_gvs import MockGVS, make_payload
+        print("⚠️ Không có URL → chạy MOCK cục bộ (không phải số đo CDN thật)")
+        mock = MockGVS(ttfb=0.0).__enter__()
+        ff = shutil.which("ffmpeg")
+        f18 = work_root / "p18.mp4"
+        subprocess.run([ff, "-y", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=10", "-f", "lavfi", "-i",
+                        "sine=duration=120", "-t", "120", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt",
+                        "yuv420p", "-b:v", "300k", "-c:a", "aac", "-b:a", "48k", "-shortest", str(f18)],
+                       check=True, capture_output=True)
+        data = f18.read_bytes()
+        real = mock.add("/videoplayback/real", data, rate=args.conn_mbps * 1e6 / 8).replace("127.0.0.1", "localhost")
+        main = mock.add("/videoplayback/main", mode="redirect", to=real, hdr_delay=args.ttfb_ms / 1000.0,
+                        direct_host="localhost")
+        mod._V96_HOST_SUFFIX = ""
+        bundle = {"url": main, "title": "テスト", "id": "Mock360Vid1", "format_id": "18", "content_length": len(data),
+                  "length_exact": True, "source": "FAST_RACE_ANDROID_VR", "default_audio_lang": "ja",
+                  "has_ja_audio": True, "audio_tracks": 1, "duration_sec": 120.0}
+        mod._fast_innertube_360p = lambda u: dict(bundle)
+        mod._ytdlp_resolve_on_warm_thread = lambda u, robust=False: None
+        mod.ARIA2C_PATH = mod.ARIA2C_PATH or sys.executable
+        urls = ["https://www.youtube.com/shorts/Mock360Vid1"]
+        notes.append(f"MOCK: {len(data)/1048576:.1f}MB H.264+AAC, 302 → localhost, TTFB {args.ttfb_ms}ms, {args.conn_mbps}Mbps/kết nối.")
+    else:
+        try:
+            mod._prewarm_480_visitor_data(force=True); mod._start_fast_keepalive(); mod._prewarm_ytdlp_480_resolver_thread()
+        except Exception:
+            pass
+    i = 0
+    try:
+        for rep in range(args.reps):
+            for url in urls:
+                order = cfgs[rep % len(cfgs):] + cfgs[:rep % len(cfgs)]
+                for cfg in order:
+                    for kk, vv in V96_CONFIGS[cfg].items():
+                        setattr(mod, kk, vv)
+                    i += 1
+                    row = run_live_once(mod, "v94", url, work_root / f"r{i}", args.engine, "0", "360fast")
+                    row.update({"config": cfg, "rep": rep})
+                    rows.append(row)
+                    print(f"  {cfg:10s} {row['video_id']} ok={row['success']} hot={row.get('hot_ready_ms')}ms "
+                          f"first_byte={row.get('first_byte_ms')} xfer={row.get('xfer_ms')} eng={row.get('engine')}"
+                          f"{' 302skip' if row.get('redirect_skipped') else ''}"
+                          f"{' FAIL:' + str(row.get('fail_reason')) if not row['success'] else ''}")
+                    shutil.rmtree(work_root / f"r{i}", ignore_errors=True)
+                    time.sleep(args.gap)
+    finally:
+        if mock is not None:
+            mock.__exit__(None, None, None)
+    summ = _live360_rows_to_summary(rows)
+    summ.sort(key=lambda s_: (s_.get("hot_ready_ms_p50") is None, s_.get("hot_ready_ms_p50") or 0))
+    print_table(summ, ["config", "n", "success_rate", "first_byte_ms_p50", "xfer_ms_p50", "download_ms_p50",
+                       "hot_ready_ms_p50", "hot_ready_ms_p90", "mbps_p50", "302skip_rate", "engines", "fail_reasons"])
+    best = next((s_ for s_ in summ if s_["success_rate"] >= 0.95 and s_.get("hot_ready_ms_p50") is not None), None)
+    base = next((s_ for s_ in summ if s_["config"] == "1get"), None)
+    verdict = "không có số liệu"
+    if best and base and best["config"] != "1get":
+        gain = (base.get("hot_ready_ms_p50") or 0) - best["hot_ready_ms_p50"]
+        verdict = (f"NHANH NHẤT: {best['config']} (hot_ready p50 {best['hot_ready_ms_p50']}ms, nhanh hơn 1get {gain:.0f}ms)"
+                   if gain >= 50 and best.get("hot_ready_ms_p90", 0) <= (base.get("hot_ready_ms_p90") or 0) + 50
+                   else f"KHÔNG cấu hình nào nhanh hơn 1get rõ rệt (tốt nhất {best['config']} chỉ hơn {gain:.0f}ms p50)")
+    elif best:
+        verdict = "1get vẫn nhanh nhất"
+    print("\n→", verdict)
+    notes += [f"cấu hình: {cfgs}; reps={args.reps}; URLs={len(urls)}", "Kết luận: " + verdict,
+              "Để đặt mặc định: set V96_HOST_POOL / V96_RANGE_N / V96_HTTP2 trong RUN_V9_4_GUI.bat theo cấu hình thắng."]
+    write_report("live360", rows, summ, notes)
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="mode", required=True)
@@ -768,6 +881,12 @@ def main():
     p.add_argument("--no-warmup", action="store_true")
     p.add_argument("--quality", default="480hard", choices=["480hard", "360fast", "both"],
                    help="V9.5: chế độ chất lượng cho V9.4/V9.5 (V9.3 luôn 480hard)")
+    p = sub.add_parser("live360", help="A/B cấu hình tải 360p (1get, +pool, range2/4/8, h2x1/h2x4)")
+    p.add_argument("--url", action="append"); p.add_argument("--urls")
+    p.add_argument("--reps", type=int, default=3); p.add_argument("--gap", type=float, default=3.0)
+    p.add_argument("--engine", default="aria2c", choices=["aria2c", "idm"])
+    p.add_argument("--configs", default="", help="vd 1get,1get+pool,range4,h2x4 (mặc định: tất cả)")
+    p.add_argument("--ttfb-ms", type=float, default=250.0); p.add_argument("--conn-mbps", type=float, default=40.0)
     p = sub.add_parser("report", help="P50/P90/P99 từ telemetry JSONL (job_summary) theo chế độ 360/480")
     p.add_argument("--telemetry", nargs="*", default=None, help="file telemetry_*.jsonl; mặc định: tất cả trong perf_report/")
     p.add_argument("--config", help="benchmark_config.json (ghi đè tham số)")
@@ -789,6 +908,8 @@ def main():
         run_offline(args, sweep=True)
     elif args.mode == "report":
         return run_report(args)
+    elif args.mode == "live360":
+        return run_live360(args)
     elif args.mode == "race":
         return run_race(args)
     elif args.mode == "pipeline":

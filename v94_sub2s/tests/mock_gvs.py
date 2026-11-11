@@ -91,6 +91,12 @@ class MockGVS:
                     spec.requests += 1
                     nreq = spec.requests
                 kw = spec.kw
+                if spec.mode == "redirect" and kw.get("direct_host") and \
+                        str(self.headers.get("Host") or "").startswith(kw["direct_host"]):
+                    # Giống GVS thật: cùng path trên host ĐÍCH phục vụ thẳng nội dung (không 302 nữa)
+                    tgt = mock.files.get(kw["to"].split("//", 1)[1].split("/", 1)[1].rsplit("?", 1)[0].join(["/", ""]))
+                    if tgt is not None:
+                        spec, kw = tgt, tgt.kw
                 if mock.ttfb:
                     time.sleep(mock.ttfb)
                 if kw.get("hdr_delay"):
