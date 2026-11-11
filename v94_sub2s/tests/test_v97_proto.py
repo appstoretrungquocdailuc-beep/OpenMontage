@@ -130,3 +130,22 @@ def test_live360_verdict_rule():
     ok = [s for s in summ if s["config"] != "1get" and base["hot_ready_ms_p50"] - s["hot_ready_ms_p50"] >= 30
           and base["hot_ready_ms_p90"] - s["hot_ready_ms_p90"] >= 30 and s["errors"] <= base["errors"]]
     assert [s["config"] for s in ok] == ["h2x1"]      # h3: p90 tệ hơn; range4: có lỗi → loại
+
+
+@need_ff
+def test_360_short_video_triggers_ffmpeg_prewarm(v94, monkeypatch, tmp_path, prog18):
+    calls = []
+    monkeypatch.setattr(v94, "_v94_ff_prewarm", lambda *a, **k: calls.append(a) or {"ffmpeg_ms": 1, "ffprobe_ms": 1, "idle_s": 9})
+    with v94._V94_FF_LOCK:
+        v94._V94_FF_STATE["last_exit"]["ffmpeg"] = time.perf_counter() - 60
+    w, master, st, _ = _run(v94, monkeypatch, tmp_path, prog18[30], 30)
+    assert st == "DONE"
+    time.sleep(0.2)
+    assert calls and w._v94["kpi"].get("prewarm") not in (None, "")
+    (tmp_path / "b").mkdir()
+    calls.clear()
+    with v94._V94_FF_LOCK:
+        v94._V94_FF_STATE["last_exit"]["ffmpeg"] = time.perf_counter() - 60
+    w2, m2, st2, _ = _run(v94, monkeypatch, tmp_path / "b", prog18[120], 120)   # 60-300s: không cần ffmpeg
+    time.sleep(0.2)
+    assert st2 == "DONE" and not calls

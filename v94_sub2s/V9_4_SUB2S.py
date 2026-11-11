@@ -157,7 +157,7 @@ def _v94_env(name, default):
         return default
 
 
-V94_VERSION = "V9.7-SUB2S"     # V9.6 + thử giao thức HTTP/2, HTTP/3 cho 360p (V97_PROTO)
+V94_VERSION = "V9.7.1-SUB2S"   # V9.7 + làm nóng ffmpeg cho 360p <60s
 # Range: kiểm tra Content-Range start/end khớp đúng request (V9.3 chỉ đọc tổng).
 V94_STRICT_CONTENT_RANGE = _v94_env("STRICT_CONTENT_RANGE", True)
 # Range: size thật ≠ ước tính → co/giãn tại chỗ, không vứt dữ liệu và tải lại (V9.3 = restart).
@@ -6354,6 +6354,11 @@ class Worker(threading.Thread):
         temp_name = f"{vid}_18.mp4"
         temp_file = self.temp_dir / temp_name
         dinfo = {}
+        # V9.7.1: video <60s (hoặc chưa biết thời lượng) sẽ cần ffmpeg để bù 60.2s / ffprobe → làm nóng ngay lúc đang
+        # tải (log 17:39: prepend_ff 1272ms + probe 620ms vì ffmpeg nguội; luồng 480p đã có, 360p chưa).
+        _dur0 = float(data.get("duration_sec") or 0.0)
+        if _dur0 <= 0 or _dur0 < 60.0:
+            self._v94_maybe_prewarm(vid)
         _mn = _v96_mn_preconnect(data["url"]) if not _v96_predicted_url(data["url"]) else []
         if _mn:
             k["mn_pre"] = len(_mn)
