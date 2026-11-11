@@ -241,3 +241,17 @@ bằng kết nối; phần truyền chỉ A/B `live360` mới quyết được R
 **Log live 10:59 (HjD7LnMKbVQ 8.63MB):** `mn_pre=1✗` — host đích 302 KHÔNG nằm trong `mn=`; TTFB 775 = req1 182 (bắt tay + 302
 ở host đầu) + DNS 65 + TLS 114 + chờ server ≈414; xfer chỉ 263ms (262Mbps/1 kết nối) → Range N còn tối đa ~150ms để lợi.
 → thêm log cặp cụm `rrN/sn-A → rrM/sn-B` và dự đoán cấp 2 theo cụm sn (giữ rrN) để kiểm tra host đích có quy luật không.
+
+---
+
+# V9.7 — HTTP/2 và HTTP/3 cho 360p, 11/11/2026
+
+Hàm sửa/thêm: `_v97_find_curl` (kiểm `curl -V` có HTTP3), `_v97_download_curl_h3` (curl --http3 -L, write-out JSON →
+dns/connect/tls/TTFB/xfer), `Worker._process_single_url_360` (chọn theo `V97_PROTO`, đo `cpu_pct`, lỗi → A trong cùng job),
+`_v96_download_h2` dùng lại cho B với `V97_H2_RANGE_N`; `bench_v93.py live360` thêm cấu hình `h2x2`, `h3`, cột cpu/errors/
+http_versions và luật quyết định ≥30ms P50+P90.
+
+**Số đo live: CHƯA CÓ** — máy này không ra được YouTube; curl ở đây không có HTTP3 (`curl 8.5.0`, bỏ C); mock chỉ HTTP/1.1
+nên B chạy trên h1 (chứng minh đường code + fallback, không chứng minh lợi ích HTTP/2). Mock (live360_20261111_022231, 5.1MB,
+302 → host khác, TTFB 250ms, 40Mbps/kết nối): h2x1 1090 / h2x2 570 / h2x4 307 / range8 154 / A 1318 ms p50 — chỉ phản ánh
+giới hạn theo kết nối của mock. **Quyết định: GIỮ A (`V97_PROTO=h1`)** cho tới khi `live360` trên máy bạn có kết luận.

@@ -422,7 +422,7 @@ def run_live_once(mod, ver, url, work, engine, cutsec, quality="480hard"):
                        "mbps", "ttfb_ms", "lock_wait_ms", "new_conns", "total", "resized"):
                 if kk in inf:
                     row[f"{kind}_{kk}"] = inf[kk]
-        for kk in ("engine", "redirect_skipped", "http_version", "range_fail", "h2_fail"):
+        for kk in ("engine", "redirect_skipped", "http_version", "range_fail", "h2_fail", "h3_fail", "proto", "h3_negotiated"):
             if kk in k:
                 row[kk] = k[kk]
         row["fail_reason"] = w._v94.get("fail") or ""
@@ -730,25 +730,30 @@ def run_report(args):
 
 
 # ----------------------------------------------------------------------------- live360 (A/B cấu hình tải 360p)
+_B = {"V96_HOST_POOL": True, "V96_RANGE_N": 0, "V96_HTTP2": False, "V97_PROTO": "h1", "V97_H2_RANGE_N": 1}
 V96_CONFIGS = {
-    "1get":        {"V96_HOST_POOL": False, "V96_RANGE_N": 0, "V96_HTTP2": False},
-    "1get+pool":   {"V96_HOST_POOL": True,  "V96_RANGE_N": 0, "V96_HTTP2": False},
-    "range2":      {"V96_HOST_POOL": True,  "V96_RANGE_N": 2, "V96_HTTP2": False},
-    "range4":      {"V96_HOST_POOL": True,  "V96_RANGE_N": 4, "V96_HTTP2": False},
-    "range8":      {"V96_HOST_POOL": True,  "V96_RANGE_N": 8, "V96_HTTP2": False},
-    "h2x1":        {"V96_HOST_POOL": True,  "V96_RANGE_N": 1, "V96_HTTP2": True},
-    "h2x4":        {"V96_HOST_POOL": True,  "V96_RANGE_N": 4, "V96_HTTP2": True},
+    "1get":        {**_B, "V96_HOST_POOL": False},                      # A: urllib3 HTTP/1.1 (V9.5)
+    "1get+pool":   {**_B},                                              # A + cache host 302 (V9.6)
+    "range2":      {**_B, "V96_RANGE_N": 2},
+    "range4":      {**_B, "V96_RANGE_N": 4},
+    "range8":      {**_B, "V96_RANGE_N": 8},
+    "h2x1":        {**_B, "V97_PROTO": "h2", "V97_H2_RANGE_N": 1},      # B: httpx HTTP/2, 1 GET
+    "h2x2":        {**_B, "V97_PROTO": "h2", "V97_H2_RANGE_N": 2},      # B + 2 Range trên 1 kết nối
+    "h2x4":        {**_B, "V97_PROTO": "h2", "V97_H2_RANGE_N": 4},
+    "h3":          {**_B, "V97_PROTO": "h3"},                           # C: curl --http3
 }
 
 
 def _live360_rows_to_summary(rows):
-    metrics = ["resolve_ms", "first_resp_ms", "dns_ms", "tls_ms", "first_byte_ms", "xfer_ms", "download_ms",
-               "hot_ready_ms", "pipeline_total_ms", "mbps"]
+    metrics = ["resolve_ms", "first_resp_ms", "dns_ms", "connect_ms", "tls_ms", "first_byte_ms", "xfer_ms",
+               "download_ms", "hot_ready_ms", "pipeline_total_ms", "mbps", "cpu_pct"]
     summ = summarize(rows, ["config"], metrics)
     for s_ in summ:
         rs = [r for r in rows if r["config"] == s_["config"]]
         s_["302skip_rate"] = round(sum(1 for r in rs if r.get("redirect_skipped")) / max(1, len(rs)), 2)
         s_["engines"] = ",".join(sorted({str(r.get("engine")) for r in rs}))
+        s_["http_versions"] = ",".join(sorted({str(r.get("http_version")) for r in rs if r.get("http_version")}))
+        s_["errors"] = sum(1 for r in rs if (not r["success"]) or r.get("h2_fail") or r.get("h3_fail") or r.get("range_fail"))
     return summ
 
 
@@ -761,6 +766,14 @@ def run_live360(args):
         _app = QApplication.instance() or QApplication([])  # noqa: F841
     mod = load(MODS["v94"])
     cfgs = [c for c in (args.configs.split(",") if args.configs else list(V96_CONFIGS)) if c in V96_CONFIGS]
+    curl = mod._v97_find_curl()
+    if "h3" in cfgs and not curl.get("h3"):
+        print(f"⚠️ Bỏ qua C (HTTP/3): curl không có HTTP3 ({curl.get('ver') or 'không tìm thấy curl'}). "
+              "Tải curl build có HTTP3 (ví dụ curl.se/windows) đặt cạnh tool hoặc set V97_CURL_PATH.")
+        cfgs = [c for c in cfgs if c != "h3"]
+    if any(V96_CONFIGS[c]["V97_PROTO"] == "h2" for c in cfgs) and mod._v96_h2_client() is None:
+        print("⚠️ Bỏ qua B (HTTP/2): chưa cài httpx[http2] → pip install httpx[http2]")
+        cfgs = [c for c in cfgs if V96_CONFIGS[c]["V97_PROTO"] != "h2"]
     urls = list(args.url or [])
     if args.urls:
         urls += [l.strip() for l in Path(args.urls).read_text(encoding="utf-8").splitlines()
@@ -820,21 +833,28 @@ def run_live360(args):
             mock.__exit__(None, None, None)
     summ = _live360_rows_to_summary(rows)
     summ.sort(key=lambda s_: (s_.get("hot_ready_ms_p50") is None, s_.get("hot_ready_ms_p50") or 0))
-    print_table(summ, ["config", "n", "success_rate", "first_byte_ms_p50", "xfer_ms_p50", "download_ms_p50",
-                       "hot_ready_ms_p50", "hot_ready_ms_p90", "mbps_p50", "302skip_rate", "engines", "fail_reasons"])
-    best = next((s_ for s_ in summ if s_["success_rate"] >= 0.95 and s_.get("hot_ready_ms_p50") is not None), None)
+    print_table(summ, ["config", "n", "success_rate", "errors", "dns_ms_p50", "tls_ms_p50", "first_byte_ms_p50",
+                       "xfer_ms_p50", "download_ms_p50", "hot_ready_ms_p50", "hot_ready_ms_p90", "mbps_p50", "cpu_pct_p50",
+                       "302skip_rate", "http_versions", "engines", "fail_reasons"])
     base = next((s_ for s_ in summ if s_["config"] == "1get"), None)
     verdict = "không có số liệu"
-    if best and base and best["config"] != "1get":
-        gain = (base.get("hot_ready_ms_p50") or 0) - best["hot_ready_ms_p50"]
-        verdict = (f"NHANH NHẤT: {best['config']} (hot_ready p50 {best['hot_ready_ms_p50']}ms, nhanh hơn 1get {gain:.0f}ms)"
-                   if gain >= 50 and best.get("hot_ready_ms_p90", 0) <= (base.get("hot_ready_ms_p90") or 0) + 50
-                   else f"KHÔNG cấu hình nào nhanh hơn 1get rõ rệt (tốt nhất {best['config']} chỉ hơn {gain:.0f}ms p50)")
-    elif best:
-        verdict = "1get vẫn nhanh nhất"
+    if base and base.get("hot_ready_ms_p50") is not None:
+        # Luật V9.7: P50 VÀ P90 tổng tốt hơn A >= 30ms, lỗi không nhiều hơn A
+        ok_ = [s_ for s_ in summ if s_["config"] != "1get" and s_.get("hot_ready_ms_p50") is not None
+               and base["hot_ready_ms_p50"] - s_["hot_ready_ms_p50"] >= 30
+               and (base.get("hot_ready_ms_p90") or 0) - (s_.get("hot_ready_ms_p90") or 0) >= 30
+               and s_["errors"] <= base["errors"]]
+        if ok_:
+            b = ok_[0]
+            verdict = (f"CHỌN {b['config']}: hot_ready p50 {b['hot_ready_ms_p50']}ms (A: {base['hot_ready_ms_p50']}), "
+                       f"p90 {b['hot_ready_ms_p90']}ms (A: {base['hot_ready_ms_p90']}), lỗi {b['errors']} (A: {base['errors']})")
+        else:
+            verdict = "GIỮ A (1get HTTP/1.1): không phương án nào tốt hơn >= 30ms ở CẢ p50 và p90 mà không tăng lỗi"
     print("\n→", verdict)
     notes += [f"cấu hình: {cfgs}; reps={args.reps}; URLs={len(urls)}", "Kết luận: " + verdict,
-              "Để đặt mặc định: set V96_HOST_POOL / V96_RANGE_N / V96_HTTP2 trong RUN_V9_4_GUI.bat theo cấu hình thắng."]
+              "Để đặt mặc định: set V97_PROTO=h2|h3, V97_H2_RANGE_N, V96_RANGE_N trong RUN_V9_4_GUI.bat theo cấu hình thắng.",
+              f"curl: {curl.get('ver') or 'không có'} HTTP3={curl.get('h3')} | httpx[http2]: {'có' if mod._v96_h2_client() else 'không'}",
+              "D (aioquic) KHÔNG thử: chỉ có ý nghĩa khi B/C đã thắng; không có số đo."]
     write_report("live360", rows, summ, notes)
     return 0
 

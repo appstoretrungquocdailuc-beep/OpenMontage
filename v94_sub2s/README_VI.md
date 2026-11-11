@@ -99,7 +99,7 @@ Thư mục này chứa:
 python -m py_compile V9_3_AUDIO.py V9_4_SUB2S.py bench_v93.py
 python -m pytest -q -rfxX
 ```
-Kết quả mong đợi (V9.5): `161 passed, 1 xfailed` (đôi khi `162 passed` vì bug V9.3 là race, có lần không lộ). XFAIL là **bug V9.3 được tái hiện có chủ đích** (4 job ghi STATUS
+Kết quả mong đợi (V9.5): `171 passed, 1 xfailed` (đôi khi `172 passed` vì bug V9.3 là race, có lần không lộ). XFAIL là **bug V9.3 được tái hiện có chủ đích** (4 job ghi STATUS
 song song làm mất DONE / hỏng `check.xlsx`). Nội dung test: 206 chuẩn (SHA256), 302, 403/410/429, 200 bỏ
 Range, size ước tính sai (4 kiểu), size không biết, Content-Range sai, đứt kết nối giữa chừng, header trễ,
 đuôi chậm (steal), 8 tải đồng thời, huỷ + dọn thread/file, 416, rollback cờ, chọn audio JA, đuôi file, Excel,
@@ -208,3 +208,21 @@ python bench_v93.py live360 --urls urls.txt --reps 3
 Chạy 7 cấu hình (`1get`, `1get+pool`, `range2/4/8`, `h2x1`, `h2x4`) × URL × 3 lần, in bảng `first_byte / xfer / download /
 hot_ready p50/p90 / Mbps / 302skip_rate` và kết luận cấu hình nhanh nhất (phải nhanh hơn `1get` ≥50ms p50 và không tệ hơn p90).
 Sau đó ghi vào `RUN_V9_4_GUI.bat`, ví dụ `set V96_RANGE_N=4`. Không có URL → chạy mock (chỉ kiểm harness).
+
+## 10. V9.7 — giao thức HTTP/2, HTTP/3 cho 360p (cờ `V97_PROTO`, mặc định `h1` = V9.6)
+
+| Biến | Giá trị | Ý nghĩa |
+|---|---|---|
+| `V97_PROTO` | `h1` (mặc định) | A: urllib3 HTTP/1.1, 1-GET — như V9.6 |
+| | `h2` | B: httpx HTTP/2 (`pip install httpx[http2]`), client nóng dùng chung; `V97_H2_RANGE_N`=1/2/4 đoạn Range trên cùng kết nối |
+| | `h3` | C: `curl --http3` (curl phải có HTTP3: `curl -V` → Features có `HTTP3`; tải build từ curl.se/windows, đặt `curl.exe` cạnh tool hoặc `set V97_CURL_PATH=...`). Theo redirect, ghi thẳng file tạm; `--write-out` cho DNS/connect/TLS/TTFB/truyền |
+| `V97_H2_RANGE_N` | 1 | số đoạn Range cho `h2` |
+| `V97_CURL_PATH` | (trống) | đường dẫn curl.exe có HTTP3 |
+
+Lỗi bất kỳ ở h2/h3 (không cài, bắt tay thất bại, HTTP ≠ 200/206, file thiếu) → về A ngay trong cùng job, không thử lại.
+Dòng KPI-360 có `proto=h3/3 cpu=12.5%` (phiên bản HTTP đã thương lượng + % CPU tiến trình trong lúc tải).
+D (aioquic thuần Python) **không** thử: chỉ có ý nghĩa khi B/C đã thắng và chưa có số đo.
+
+**Đo & quyết định:** `python bench_v93.py live360 --urls urls.txt --reps 3` chạy A, A+pool, range2/4/8, h2x1/h2x2/h2x4, h3
+xen kẽ thứ tự; bảng có dns/tls/first_byte/xfer/download/hot_ready p50–p90/Mbps/cpu%/errors/http_versions. Luật chọn:
+P50 **và** P90 `hot_ready` tốt hơn A ≥ 30 ms, lỗi không nhiều hơn A. curl không có HTTP3 → bỏ C và ghi rõ trong báo cáo.

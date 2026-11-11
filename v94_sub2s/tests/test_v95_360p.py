@@ -119,7 +119,7 @@ def test_360_end_to_end(v94, monkeypatch, tmp_path, prog18, dur):
     assert st == "DONE", log[-3000:]
     assert calls["native360"] == 1 and calls["native480"] == 0 and calls["aria2"] == 0
     assert "START 360P-FAST" in log and "HOT 360P READY" in log and "MUX COPY" not in log
-    assert "V9.5 KPI-360" in log and "[V9.6-SUB2S]" in log
+    assert "V9.5 KPI-360" in log and "[V9.7-SUB2S]" in log
     k = w._v94["kpi"]
     assert k["mode"] == "360fast"
     for key in ("resolve_ms", "first_byte_ms", "download_ms", "hot_ready_ms", "postprocess_ms", "status_done_ms",

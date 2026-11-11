@@ -157,7 +157,7 @@ def _v94_env(name, default):
         return default
 
 
-V94_VERSION = "V9.6-SUB2S"     # V9.5 + giảm TTFB/truyền cho 360p (V96_*)
+V94_VERSION = "V9.7-SUB2S"     # V9.6 + thử giao thức HTTP/2, HTTP/3 cho 360p (V97_PROTO)
 # Range: kiểm tra Content-Range start/end khớp đúng request (V9.3 chỉ đọc tổng).
 V94_STRICT_CONTENT_RANGE = _v94_env("STRICT_CONTENT_RANGE", True)
 # Range: size thật ≠ ước tính → co/giãn tại chỗ, không vứt dữ liệu và tải lại (V9.3 = restart).
@@ -280,6 +280,15 @@ V96_MN_PRECONNECT = _v96_env("MN_PRECONNECT", True)
 V96_RANGE_N = _v96_env("RANGE_N", 0)
 # 3) HTTP/2 qua httpx[http2] (nếu cài): 1 kết nối cho nhiều Range. 0 = urllib3 HTTP/1.1.
 V96_HTTP2 = _v96_env("HTTP2", False)
+# ---------------------------------------------------------------------------------------------
+# V9.7 — giao thức tải 360p: V97_PROTO = h1 (mặc định: urllib3 HTTP/1.1 = V9.6) | h2 (httpx[http2], client nóng
+# dùng chung) | h3 (curl.exe có HTTP3: --http3, theo redirect, ghi thẳng file). Lỗi bất kỳ ở h2/h3 → về h1 NGAY trong
+# cùng job, không thử lại. V97_H2_RANGE_N = số đoạn Range trên cùng kết nối HTTP/2 (1 = 1 GET; thử 2, 4).
+# Chỉ đổi mặc định khi `bench_v93.py live360` cho thấy P50 VÀ P90 tổng tốt hơn h1 >= 30ms và không tăng lỗi.
+# ---------------------------------------------------------------------------------------------
+V97_PROTO = str(os.environ.get("V97_PROTO", "h1") or "h1").strip().lower()
+V97_H2_RANGE_N = int(os.environ.get("V97_H2_RANGE_N", "1") or 1)
+V97_CURL_PATH = str(os.environ.get("V97_CURL_PATH", "") or "")
 # ffprobe kiểm file 360p chạy nền SAU khi đã DONE (chỉ cảnh báo). 0 = không kiểm.
 V95_360P_BG_PROBE = (str(os.environ.get("V95_360P_BG_PROBE", "1")).strip().lower() in ("1", "true", "yes", "on"))
 
@@ -2736,6 +2745,95 @@ def _v96_download_h2(url: str, temp_dir: Path, filename: str, logger, min_bytes:
             info["fail_reason"] = f"size_{size}/{total}"; return False
         logger(f"    [H2-RANGE{n}] ✅ {size/1048576:.2f}MB | {info.get('http_version', '?')} | TTFB={info['ttfb_ms']:.0f}ms | "
                f"{el:.3f}s | ≈{size*8/1e6/el:.0f}Mbps")
+        return True
+    except Exception as e:
+        info["fail_reason"] = f"EXC:{type(e).__name__}"
+        try:
+            if temp_file.exists(): temp_file.unlink()
+        except OSError: pass
+        return False
+
+# ================== V9.7 HTTP/3 qua curl ================== #
+_V97_CURL = {"path": None, "h3": None, "ver": ""}
+
+
+def _v97_find_curl():
+    """curl có HTTP/3? Kiểm 1 lần: `curl -V` chứa 'HTTP3'. Ưu tiên V97_CURL_PATH, rồi curl.exe cạnh tool, rồi PATH."""
+    if _V97_CURL["h3"] is not None:
+        return _V97_CURL
+    cands = [V97_CURL_PATH, os.path.join(BASE_DIR, "curl.exe"), os.path.join(BASE_DIR, "curl", "bin", "curl.exe"),
+             shutil.which("curl.exe"), shutil.which("curl")]
+    for c in cands:
+        if not c or not os.path.isfile(c):
+            continue
+        try:
+            r = subprocess.run([c, "-V"], capture_output=True, text=True, timeout=5,
+                               creationflags=0x08000000 if os.name == "nt" else 0)
+            out = (r.stdout or "") + (r.stderr or "")
+            _V97_CURL.update({"path": c, "ver": (out.splitlines() or ["?"])[0][:60],
+                              "h3": ("HTTP3" in out) or ("http3" in out.lower().split("features:")[-1])})
+            if _V97_CURL["h3"]:
+                return _V97_CURL
+        except Exception:
+            continue
+    if _V97_CURL["h3"] is None:
+        _V97_CURL["h3"] = False
+    return _V97_CURL
+
+
+def _v97_download_curl_h3(url: str, temp_dir: Path, filename: str, logger, min_bytes: int, expected: int,
+                          info: dict) -> bool:
+    """C: curl --http3 theo redirect, ghi thẳng file tạm; đọc --write-out để tách kết nối/bắt tay/TTFB/truyền."""
+    c = _v97_find_curl()
+    if not c.get("h3"):
+        info["fail_reason"] = "no_curl_http3"
+        return False
+    ensure_dir(temp_dir)
+    temp_file = temp_dir / filename
+    wo = ("{\"http_version\":\"%{http_version}\",\"code\":%{http_code},\"t_namelookup\":%{time_namelookup},"
+          "\"t_connect\":%{time_connect},\"t_appconnect\":%{time_appconnect},\"t_pretransfer\":%{time_pretransfer},"
+          "\"t_redirect\":%{time_redirect},\"t_start\":%{time_starttransfer},\"t_total\":%{time_total},"
+          "\"size\":%{size_download},\"redirects\":%{num_redirects}}")
+    cmd = [c["path"], "--http3", "-sS", "-L", "--max-redirs", str(DIRECT_MAX_REDIRECTS), "--connect-timeout", "2",
+           "--max-time", str(int(V94_DIRECT_1GET_DEADLINE_SEC or 12)), "-A",
+           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/154.0.0.0 Safari/537.36",
+           "-H", "Accept: */*", "-H", "Accept-Encoding: identity", "-o", str(temp_file), "-w", wo, str(url)]
+    t0 = time.perf_counter()
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=float(V94_DIRECT_1GET_DEADLINE_SEC or 12) + 3,
+                           creationflags=0x08000000 if os.name == "nt" else 0)
+        el = time.perf_counter() - t0
+        try:
+            w = json.loads((r.stdout or "").strip().splitlines()[-1])
+        except Exception:
+            w = {}
+        info.update({"engine": "h3curl", "http_version": str(w.get("http_version") or "?"), "status": int(w.get("code") or 0),
+                     "dns_ms": round(float(w.get("t_namelookup") or 0) * 1000, 1),
+                     "connect_ms": round(float(w.get("t_connect") or 0) * 1000, 1),
+                     "tls_ms": round((float(w.get("t_appconnect") or 0) - float(w.get("t_connect") or 0)) * 1000, 1),
+                     "first_resp_ms": round(float(w.get("t_redirect") or 0) * 1000, 1) or None,
+                     "ttfb_ms": round(float(w.get("t_start") or 0) * 1000, 1),
+                     "xfer_ms": round((float(w.get("t_total") or 0) - float(w.get("t_start") or 0)) * 1000, 1),
+                     "elapsed_ms": round(el * 1000, 2), "redirect_hops": int(w.get("redirects") or 0)})
+        if r.returncode != 0 or int(w.get("code") or 0) not in (200, 206):
+            info["fail_reason"] = f"curl_rc{r.returncode}_HTTP_{w.get('code')}" + (f":{(r.stderr or '').strip()[:60]}" if r.stderr else "")
+            try: temp_file.unlink()
+            except OSError: pass
+            return False
+        size = temp_file.stat().st_size if temp_file.exists() else 0
+        info["bytes"] = size
+        info["first_byte_ns"] = int(t0 * 1e9) + int(info["ttfb_ms"] * 1e6)   # xấp xỉ: perf_counter cùng gốc
+        if size < min_bytes or (expected and size + 4096 < int(expected * 0.96)):
+            info["fail_reason"] = f"short_{size}/{expected}"
+            try: temp_file.unlink()
+            except OSError: pass
+            return False
+        if not str(info["http_version"]).startswith("3"):
+            info["h3_negotiated"] = False      # curl có thể rơi về h2/h1 (Alt-Svc chưa biết) — vẫn hợp lệ, nhưng ghi rõ
+        logger(f"    [CURL-H3] ✅ {size/1048576:.2f}MB | HTTP/{info['http_version']} | dns={info['dns_ms']}ms "
+               f"connect={info['connect_ms']}ms tls={info['tls_ms']}ms TTFB={info['ttfb_ms']:.0f}ms | {el:.3f}s | "
+               f"≈{size*8/1e6/max(1e-3, el):.0f}Mbps")
         return True
     except Exception as e:
         info["fail_reason"] = f"EXC:{type(e).__name__}"
@@ -6134,6 +6232,8 @@ class Worker(threading.Thread):
                         + (f"xfer={k['xfer_ms']}ms " if k.get("xfer_ms") is not None else "")
                         + ("302skip " if k.get("redirect_skipped") else "")
                         + (f"mn_pre={k['mn_pre']}{'✓' if k.get('mn_hit') else ('✗' if 'mn_hit' in k else '')} " if k.get("mn_pre") else "")
+                        + (f"proto={k.get('proto')}" + (f"/{k['http_version']}" if k.get("http_version") else "") + f" cpu={k.get('cpu_pct')}% "
+                           if k.get("proto") else "")
                         + f"| HOT_READY={k.get('hot_ready_ms','-')}ms | post={k.get('postprocess_ms','-')} done={k.get('status_done_ms','-')} "
                         + f"| TOTAL={k.get('pipeline_total_ms','-')}ms | ok={ok_holder['ok']}"
                         + (f" | fail={summary['fail_reason']}" if not ok_holder["ok"] else "")
@@ -6260,15 +6360,28 @@ class Worker(threading.Thread):
         TELEM.span(self._v94["job"], "q360_get_begin", at_ms=_ms(time.perf_counter_ns()))
         self._v94["video"]["first_get_ns"] = time.perf_counter_ns()
         rn = int(getattr(self, "_v96_range_n", None) if getattr(self, "_v96_range_n", None) is not None else V96_RANGE_N)
-        h2 = bool(getattr(self, "_v96_http2", None) if getattr(self, "_v96_http2", None) is not None else V96_HTTP2)
+        proto = str(getattr(self, "_v97_proto", None) or V97_PROTO or "h1").lower()
+        h2 = (proto == "h2") or bool(getattr(self, "_v96_http2", None) if getattr(self, "_v96_http2", None) is not None else V96_HTTP2)
+        h3 = (proto == "h3")
+        h2n = max(1, int(getattr(self, "_v97_h2_range_n", None) or V97_H2_RANGE_N or 1)) if proto == "h2" else max(1, rn)
+        k["proto"] = proto
+        _cpu0, _wall0 = time.process_time(), time.perf_counter()
         ok = False
-        src_url0 = _v96_predicted_url(data["url"]) if (h2 or rn > 1) else None
+        src_url0 = _v96_predicted_url(data["url"]) if (h2 or h3 or rn > 1) else None
         if src_url0:
             k["redirect_skipped"] = True
-        if h2 and expected >= RANGE_VIDEO_MIN_BYTES:
+        if h3:
+            ok = _v97_download_curl_h3(src_url0 or data["url"], self.temp_dir, temp_name, self.log,
+                                       self.MIN_BYTES_VIDEO, expected, dinfo)
+            k["engine"] = "h3curl"
+            if not ok:
+                self.log(f"    ↩ H3/curl lỗi ({dinfo.get('fail_reason')}) → 1-GET HTTP/1.1 cùng URL")
+                k["h3_fail"] = str(dinfo.get("fail_reason"))
+                dinfo = {}
+        elif h2 and expected >= RANGE_VIDEO_MIN_BYTES:
             ok = _v96_download_h2(src_url0 or data["url"], self.temp_dir, temp_name, self.log,
-                                  self.MIN_BYTES_VIDEO, expected, max(1, rn), dinfo)
-            k["engine"] = dinfo.get("engine") or f"h2x{max(1, rn)}"
+                                  self.MIN_BYTES_VIDEO, expected, h2n, dinfo)
+            k["engine"] = dinfo.get("engine") or f"h2x{h2n}"
             if not ok:
                 self.log(f"    ↩ H2 lỗi ({dinfo.get('fail_reason')}) → 1-GET HTTP/1.1 cùng URL")
                 k["h2_fail"] = str(dinfo.get("fail_reason"))
@@ -6291,8 +6404,10 @@ class Worker(threading.Thread):
             ok = _download_direct_single_get(data["url"], self.temp_dir, temp_name, self.log,
                                              self.MIN_BYTES_VIDEO, expected, info=dinfo)
             k["engine"] = ("1get" if k.get("engine") in (None, "1get") else f"{k['engine']}→1get")
-        for kk in ("first_resp_ms", "dns_ms", "tls_ms", "xfer_ms", "redirect_skipped", "redirect_hops", "http_version",
-                   "redirect_label"):
+        _wall = max(1e-3, time.perf_counter() - _wall0)
+        k["cpu_pct"] = round(100.0 * (time.process_time() - _cpu0) / _wall, 1)     # CPU tiến trình trong lúc tải
+        for kk in ("first_resp_ms", "dns_ms", "tls_ms", "connect_ms", "xfer_ms", "redirect_skipped", "redirect_hops",
+                   "http_version", "redirect_label", "h3_negotiated"):
             if dinfo.get(kk) is not None:
                 k[kk] = dinfo[kk]
         if _mn and dinfo.get("final_host_full"):
