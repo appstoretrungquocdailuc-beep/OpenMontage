@@ -798,3 +798,34 @@ def test_range_probe_leaves_pool_connections_reusable(tmp_path, gvs, media):
         d = tmp_path / f"o{i}.mp4"
         ws.download_ranges(url, d, len(media["prog"]), 4, info)
         assert d.read_bytes() == media["prog"]
+
+
+def test_hub_retry_and_denied_handled(tmp_path):
+    e = make_engine(tmp_path, CH[:1])
+    e.start(api=False, feed=False, workers=False)
+    port = e.httpd.server_address[1]
+    with e.hub_lock:
+        e.pending_hub[(CH[0], "subscribe")] = time.time()
+    q = urlencode({"hub.mode": "subscribe", "hub.topic": ws.TOPIC_FMT.format(CH[0]), "hub.challenge": "r1", "hub.lease_seconds": "432000"})
+    for _ in range(2):                                     # hub gửi lại xác minh (phản hồi đầu bị mất) → vẫn 200
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/websub?{q}", timeout=3) as r:
+            assert r.read() == b"r1"
+    d = urlencode({"hub.mode": "denied", "hub.topic": ws.TOPIC_FMT.format(CH[0]), "hub.reason": "nope"})
+    urllib.request.urlopen(f"http://127.0.0.1:{port}/websub?{d}", timeout=3).read()
+    assert e.db.one("SELECT state FROM subs WHERE channel_id=?", (CH[0],))["state"] == "DENIED"
+    e.stop()
+
+
+def test_stop_during_start_is_clean_and_restart_works(tmp_path, monkeypatch):
+    e = make_engine(tmp_path, CH[:1])
+    monkeypatch.setattr(e.resolver, "warm", lambda: time.sleep(1.0))
+    th = threading.Thread(target=e.start, kwargs={"api": False, "feed": False})
+    th.start()
+    time.sleep(0.2)
+    e.stop()                                               # chờ start() xong rồi mới dọn → webhook không bị bỏ rơi
+    th.join()
+    assert e.httpd is None and not [t for t in e.threads if t.is_alive()]
+    e2 = make_engine(tmp_path, CH[:1], keep_excel=True)
+    e2.start(api=False, feed=False)                       # khoá đã nhả, cổng đã đóng
+    assert e2.httpd is not None
+    e2.stop()

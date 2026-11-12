@@ -430,12 +430,7 @@ class ExcelBook:
             raise ExcelLocked("Excel đang mở và không có pywin32 để ghi qua COM — sẽ ghi khi Excel đóng")
         pythoncom.CoInitialize()
         try:
-            try:
-                xl = win32com.client.GetActiveObject("Excel.Application")
-            except Exception:
-                raise ExcelLocked("không thấy Excel đang chạy để ghi qua COM")
-            want = str(self.path.resolve()).lower()
-            wb = next((b for b in xl.Workbooks if str(b.FullName).lower() == want), None)
+            wb = self._com_find_workbook(win32com.client)
             if wb is None:
                 raise ExcelLocked("file không mở trong Excel của phiên này (có thể máy/người khác đang mở) — chờ")
             ws = wb.Worksheets(self.sheet) if self.sheet else wb.Worksheets(1)
@@ -462,6 +457,41 @@ class ExcelBook:
             raise ExcelLocked(f"COM lỗi: {type(e).__name__}: {e}")
         finally:
             pythoncom.CoUninitialize()
+
+    def _com_find_workbook(self, w32):
+        """Tìm workbook ĐANG MỞ (không bao giờ tự mở file ẩn):
+        1) qua ROT theo đường dẫn — chỉ chấp nhận nếu Excel đã có sẵn workbook đó (Workbooks.Count không tăng);
+        2) quét Excel đang chạy, so FullName (chuẩn hoá: ổ mạng/UNC, OneDrive https) hoặc Name trùng duy nhất."""
+        try:
+            xl = w32.GetActiveObject("Excel.Application")
+        except Exception:
+            xl = None
+        names = []
+        if xl is not None:
+            try:
+                names = [(b, str(b.FullName), str(b.Name)) for b in xl.Workbooks]
+            except Exception:
+                names = []
+        want_full = {str(self.path).lower(), str(self.path.resolve()).lower()}
+        for b, full, _n in names:
+            if full.lower() in want_full:
+                return b
+        if xl is not None:                                     # ROT: chỉ khi số workbook không đổi (không mở ẩn)
+            try:
+                before = xl.Workbooks.Count
+                b = w32.GetObject(str(self.path.resolve()))
+                if xl.Workbooks.Count == before:
+                    return b
+                try:
+                    b.Close(SaveChanges=False)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        same = [b for b, full, n in names if n.lower() == self.path.name.lower()]
+        if len(same) == 1:                                     # OneDrive/UNC: FullName khác dạng nhưng tên trùng duy nhất
+            return same[0]
+        return None
 
     def read_cell(self, row, col_letter="D"):
         wb = openpyxl.load_workbook(self.path, read_only=True, data_only=True)
@@ -878,6 +908,7 @@ class Engine:
         self.sem = threading.Semaphore(max(1, int(cfg.get("max_concurrent_downloads", 3))))
         self.active = set()
         self.active_lock = threading.Lock()
+        self.life_lock = threading.Lock()
         self.pending_hub = {}                 # channel → (mode, thời điểm) yêu cầu ta THỰC SỰ gửi tới hub
         self.hub_lock = threading.Lock()
         self.resolver = Resolver(log)
@@ -899,8 +930,17 @@ class Engine:
 
     # ---------------- vòng đời ---------------- #
     def start(self, websub=True, api=True, feed=True, workers=True, excel_watch=True):
-        self._acquire_instance_lock()
-        self.stop_ev.clear()
+        with self.life_lock:                              # start/stop không bao giờ chạy chồng nhau
+            self._acquire_instance_lock()
+            self.stop_ev.clear()
+            try:
+                self._start_inner(websub, api, feed, workers, excel_watch)
+            except Exception:
+                self.stop_ev.set()
+                self._stop_inner()
+                raise
+
+    def _start_inner(self, websub, api, feed, workers, excel_watch):
         self.reload_channels(initial=True)
         self.recover()
         self.resolver.warm()
@@ -951,6 +991,11 @@ class Engine:
 
     def stop(self):
         self.stop_ev.set()
+        with self.life_lock:
+            self._stop_inner()
+
+    def _stop_inner(self):
+        self.stop_ev.set()
         if self.httpd:
             try:
                 self.httpd.shutdown()
@@ -963,9 +1008,11 @@ class Engine:
         self.xlq.put(None)
         for t in self.threads:
             t.join(timeout=5)
-        end = time.time() + 120                           # chờ các lần tải/ghép dở dang trả về
-        while self.active and time.time() < end:
-            time.sleep(0.1)
+        t0 = time.time()                                  # chờ các lần tải/ghép dở dang trả về (mỗi bước đều có timeout riêng)
+        while self.active:
+            if int(time.time() - t0) % 10 == 0 and time.time() - t0 > 1:
+                self.log(f"⏳ đang chờ {len(self.active)} video dở dang kết thúc trước khi nhả khoá...")
+            time.sleep(0.5)
         self.threads = []
         self._release_instance_lock()
         self.log("⏹ đã dừng")
@@ -1102,12 +1149,6 @@ class Engine:
                                                          "t_recv_ns": None, "t_enq_ns": time.perf_counter_ns(), "recovered": True}))
             n += 1
         m = 0
-        if self.flags["excel"]:
-            for r in self.db.all("SELECT v.* FROM videos v LEFT JOIN excel_jobs x ON x.video_id=v.video_id "
-                                 "WHERE x.video_id IS NULL"):
-                self.db.x("INSERT OR IGNORE INTO excel_jobs(video_id, channel_id, url, state, created_at, order_key) "
-                          "VALUES(?,?,?,?,?,?)", (r["video_id"], r["channel_id"], r["url"], "PENDING", iso(),
-                                                  r["published_at"] or r["detected_at"]))
         for r in self.db.all("SELECT * FROM excel_jobs WHERE state IN ('PENDING','RETRY')"):
             self.xlq.put({"vid": r["video_id"], "ch": r["channel_id"], "url": r["url"], "t_enq_ns": time.perf_counter_ns(),
                           "okey": r["order_key"] or r["created_at"] or ""})
@@ -1418,6 +1459,12 @@ class Engine:
                 if u.path != path:
                     return self._reply(404)
                 q = {k: v[0] for k, v in parse_qs(u.query).items()}
+                if q.get("hub.mode") == "denied":
+                    chd = norm_channel(q.get("hub.topic", ""))
+                    if chd and eng.monitored(chd):
+                        eng.db.x("UPDATE subs SET state='DENIED', error=? WHERE channel_id=?", (q.get("hub.reason", "")[:200], chd))
+                        eng.log(f"⚠️ WebSub hub TỪ CHỐI kênh {chd}: {q.get('hub.reason', '')[:120]}")
+                    return self._reply(200)
                 if "hub.challenge" not in q:
                     return self._reply(200, b"WS360 OK")          # kiểm tra sống (health)
                 ch = norm_channel(q.get("hub.topic", ""))
@@ -1443,12 +1490,7 @@ class Engine:
                                  (ch, eng.callback, time.time(), lease))
                     else:
                         eng.db.x("UPDATE subs SET state='UNSUBSCRIBED' WHERE channel_id=?", (ch,))
-                    eng.hub_done(ch, mode)
-                    return self._reply(200, q["hub.challenge"].encode())
-                if mode == "denied" and ch and eng.hub_asked(ch, "subscribe"):
-                    eng.db.x("UPDATE subs SET state='DENIED', error=? WHERE channel_id=?", (q.get("hub.reason", ""), ch))
-                    eng.log(f"⚠️ WebSub hub TỪ CHỐI kênh {ch}: {q.get('hub.reason', '')}")
-                    return self._reply(200)
+                    return self._reply(200, q["hub.challenge"].encode())   # giữ pending: hub có thể gửi lại xác minh
                 return self._reply(404)
 
             def do_POST(self):
@@ -1477,6 +1519,13 @@ class Engine:
 
         slots = threading.BoundedSemaphore(32)
 
+        def _hard_close(sock):
+            try:
+                import socket as _s
+                sock.shutdown(_s.SHUT_RDWR)
+            except OSError:
+                pass
+
         class Srv(ThreadingHTTPServer):
             daemon_threads = True
 
@@ -1487,9 +1536,13 @@ class Engine:
                 super().process_request(request, client_address)
 
             def process_request_thread(self, request, client_address):
+                killer = threading.Timer(15.0, lambda: _hard_close(request))   # hạn TỔNG 15 s / request
+                killer.daemon = True
+                killer.start()
                 try:
                     super().process_request_thread(request, client_address)
                 finally:
+                    killer.cancel()
                     slots.release()
 
         self.httpd = Srv((self.cfg.get("listen_host", "0.0.0.0"), int(self.cfg.get("listen_port", 8765))), H)
@@ -1572,7 +1625,9 @@ class Engine:
                 ok += st != "ERROR"
             except Exception as e:  # noqa: BLE001
                 self.db.x("INSERT INTO subs(channel_id, callback, requested_at, state, error) VALUES(?,?,?,?,?) "
-                          "ON CONFLICT(channel_id) DO UPDATE SET error=excluded.error, state='ERROR'",
+                          "ON CONFLICT(channel_id) DO UPDATE SET error=excluded.error, requested_at=excluded.requested_at, "
+                          "state=CASE WHEN subs.state='VERIFIED' AND subs.callback=excluded.callback "
+                          "AND subs.verified_at + subs.lease_seconds > excluded.requested_at THEN 'VERIFIED' ELSE 'ERROR' END",
                           (ch, cb, time.time(), "ERROR", f"{type(e).__name__}"))
             self.stop_ev.wait(0.05)
         return ok
@@ -1775,6 +1830,7 @@ def run_gui(cfg, base):
         line = Signal(str)
         stats = Signal(dict)
         stopped = Signal()
+        started = Signal()
 
     app = QApplication.instance() or QApplication(sys.argv)
     w = QWidget()
@@ -1834,9 +1890,17 @@ def run_gui(cfg, base):
         state["eng"] = e
         for k, c in chk.items():
             c.toggled.connect(lambda v, k=k: e.flags.__setitem__(k, bool(v)))
-        threading.Thread(target=e.start, daemon=True).start()
         b_start.setEnabled(False)
-        b_stop.setEnabled(True)
+        b_stop.setEnabled(False)                         # STOP chỉ bật khi start() đã xong hẳn
+
+        def _bg():
+            try:
+                e.start()
+                br.started.emit()
+            except Exception as ex:  # noqa: BLE001 — báo lỗi lên cửa sổ log, không im lặng
+                log(f"❌ KHÔNG khởi động được: {type(ex).__name__}: {ex}")
+                br.stopped.emit()
+        threading.Thread(target=_bg, daemon=True).start()
 
     def stop():
         # START chỉ bật lại khi engine cũ đã dừng HẲN (mọi worker xong) → không bao giờ 2 engine cùng 1 database
@@ -1851,7 +1915,8 @@ def run_gui(cfg, base):
             finally:
                 br.stopped.emit()
         threading.Thread(target=_bg, daemon=True).start()
-    br.stopped.connect(lambda: b_start.setEnabled(True))
+    br.stopped.connect(lambda: (b_start.setEnabled(True), b_stop.setEnabled(False)))
+    br.started.connect(lambda: b_stop.setEnabled(True))
     b_start.clicked.connect(start)
     b_stop.clicked.connect(stop)
     w.show()
