@@ -1531,3 +1531,44 @@ def test_bench360_runs_production_path(tmp_path, gvs, media, monkeypatch, capsys
     out = capsys.readouterr().out
     assert "median" in out and "ffprobe_ms" in out and (tmp_path / "BENCH360.csv").exists()
     assert not (tmp_path / "database.sqlite").exists() or True
+
+
+# ------------------------------------------------------------------ DASH chậm 31.9 s (MY524yaPKUk): 1 kết nối bị bóp băng thông
+@need_ff
+def test_dash_unknown_size_uses_parallel_ranges_against_per_connection_throttle(tmp_path, monkeypatch, media):
+    big_v = media["v"] * 1                                        # file hình
+    with MockGVS() as g:
+        rate = 300_000                                            # 300 KB/s MỖI kết nối (giống YouTube bóp 1 kết nối)
+        vu = g.add("/dv", big_v, "ok", rate=rate)
+        au = g.add("/da", media["a"], "ok", rate=rate)
+        plan = {"pick": {"kind": "dash", "video": mkfmt(vu, 134, 360, 'video/mp4; codecs="avc1"', 0, adaptive=True),
+                         "audio": mkfmt(au, 140, 0, 'audio/mp4; codecs="mp4a"', 0, adaptive=True)}, "source": "YTDLP",
+                "race": "android_vr=noformat(prog 0, adap 12, cipher 0, itag18 không)"}
+        e = make_engine(tmp_path, CH[:1], dash_range_connections=4)
+        monkeypatch.setattr(e.resolver, "resolve", lambda v, deadline_s=2.5: plan)
+        e.start(websub=False)
+        e.on_event(CH[0], "DASHPAR0001", "WEBSUB", TS)
+        r = wait_state(e, "DASHPAR0001", t=60)
+        assert r["state"] == "DONE", r["error"]
+        single_s = len(big_v) / rate
+        assert r["download_ms"] / 1000 < single_s * 0.6                   # nhanh hơn rõ so với 1 kết nối
+        i = ws.ffprobe_info(Path(r["file"]))
+        assert i["video"] and i["audio"]
+        assert any("kết nối DASH: hình 4, tiếng 4" in l and "vì sao không dùng Innertube nhanh" in l for l in e._logs)
+        e.stop()
+
+
+def test_probe_size_reads_content_range(gvs, media):
+    u = gvs.add("/ps", media["a"])
+    assert ws.probe_size(u) == len(media["a"])
+
+
+def test_resolver_race_summary_when_falling_back_to_ytdlp(monkeypatch):
+    rs = ws.Resolver(lambda m: None)
+    monkeypatch.setattr(ws, "urllib3", ws.urllib3)
+    monkeypatch.setattr(rs, "_player", lambda vid, c: {"client": c, "verdict": "noformat", "pick": None,
+                                                        "counts": {"prog": 0, "adap": 9, "cipher": 0, "has18": False}})
+    monkeypatch.setattr(rs, "_ytdlp", lambda vid: {"verdict": "ok", "pick": {"kind": "dash", "video": {}, "audio": {}},
+                                                   "source": "YTDLP"})
+    r = rs.resolve("AAAAAAAAAAA")
+    assert r["source"] == "YTDLP" and "itag18 không" in r["race"] and "android_vr=noformat" in r["race"]

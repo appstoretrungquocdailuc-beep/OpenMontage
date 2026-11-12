@@ -93,7 +93,8 @@ DEFAULT_CONFIG = {
     "max_age_minutes": 30,             # video có 'published' cũ hơn → coi là CẬP NHẬT video cũ, không tải
     "download_dir": "DOWNLOADS",
     "workers": 3,
-    "range_connections": 1,            # 1 = 1 GET (mặc định). Đổi sau khi chạy --bench trên máy bạn.
+    "range_connections": 1,            # itag 18 (1 file): 1 GET — đã đạt 1.0–1.5 s, GIỮ NGUYÊN
+    "dash_range_connections": 4,       # DASH (hình+tiếng riêng, khi chưa có itag 18): N kết nối/luồng — 1 kết nối bị bóp ~0.8 Mbps
     "retry_schedule_sec": [1, 2, 3, 5, 8, 13, 20, 30, 45, 60],
     "max_concurrent_downloads": 3,
     "v9_path": "",                     # đường dẫn V9_4_SUB2S.py (chỉ dùng để benchmark so sánh)
@@ -740,7 +741,11 @@ class Resolver:
         pick = pick_formats(prog, adap)
         verdict = classify_playability(data.get("playabilityStatus") or {}, bool(prog or adap))
         dur = float((data.get("videoDetails") or {}).get("lengthSeconds") or 0)
-        return {"client": client, "verdict": verdict if (pick or verdict != "ok") else "noformat", "pick": pick,
+        sd = data.get("streamingData") or {}
+        allf = list(sd.get("formats") or []) + list(sd.get("adaptiveFormats") or [])
+        counts = {"prog": len(prog), "adap": len(adap), "cipher": sum(1 for f in allf if not f.get("url")),
+                  "has18": any(str(f.get("itag")) == "18" for f in allf)}
+        return {"client": client, "verdict": verdict if (pick or verdict != "ok") else "noformat", "pick": pick, "counts": counts,
                 "reason": str((data.get("playabilityStatus") or {}).get("reason") or (data.get("playabilityStatus") or {}).get("status") or ""),
                 "duration": dur, "title": (data.get("videoDetails") or {}).get("title") or ""}
 
@@ -764,9 +769,15 @@ class Resolver:
                         return r
         except FTE:
             pass
+        race = "; ".join(f"{x.get('client', '?')}={x.get('verdict')}"
+                         + (f"(prog {x['counts']['prog']}, adap {x['counts']['adap']}, cipher {x['counts']['cipher']}, "
+                            f"itag18 {'có' if x['counts']['has18'] else 'không'})" if x.get("counts") else "")
+                         + (f" '{str(x.get('reason'))[:60]}'" if x.get("reason") and x.get("verdict") != "noformat" else "")
+                         for x in results) or "không client nào trả lời kịp"
         r = self._ytdlp(vid)
         if r and r.get("pick"):
             r["resolve_ms"] = ms(t0, time.perf_counter_ns())
+            r["race"] = race                      # vì sao Innertube nhanh không dùng được → phải dùng yt-dlp
             return r
         verdicts = [x.get("verdict") for x in results + ([r] if r else [])]
         reasons = "; ".join(sorted({str(x.get("reason") or "")[:80] for x in results + ([r] if r else []) if x.get("reason")}))
@@ -829,6 +840,22 @@ def _follow(url, headers=None, method="GET", preload=False, timeout=None):
             raise HttpStatus(r.status, float(ra) if ra and ra.isdigit() else None)
         return r, cur
     raise HttpStatus(310)
+
+
+def probe_size(url: str) -> int:
+    """Dung lượng thật qua Range bytes=0-0 → Content-Range: bytes 0-0/TỔNG (theo 302)."""
+    r, _ = _follow(url, headers={"Range": "bytes=0-0"}, preload=False)
+    cr = r.headers.get("Content-Range", "")
+    st = r.status
+    if st == 206:
+        r.drain_conn()
+        r.release_conn()
+    else:
+        r.close()
+    m = re.search(r"/(\d+)$", cr)
+    if st != 206 or not m:
+        raise HttpStatus(st)
+    return int(m.group(1))
 
 
 def download_single(url: str, dest: Path, info: dict, cancel: threading.Event | None = None) -> int:
@@ -1418,14 +1445,16 @@ class Engine:
                 parts += [vtmp, atmp]
                 errs = []
                 if pick["audio"]:
+                    nd = max(1, int(self.cfg.get("dash_range_connections", 4)))
+
                     def _a():
                         try:
-                            self._fetch(pick["audio"], atmp, info_a, 1, cancel)
+                            self._fetch(pick["audio"], atmp, info_a, nd, cancel)
                         except Exception as e:  # noqa: BLE001
                             errs.append(e)
                     th = threading.Thread(target=_a, daemon=True, name=f"audio-{vid}")
                     th.start()
-                self._fetch(pick["video"], vtmp, info_v, n, cancel)
+                self._fetch(pick["video"], vtmp, info_v, max(1, int(self.cfg.get("dash_range_connections", 4))), cancel)
                 if th:
                     th.join()
                     th = None
@@ -1483,7 +1512,10 @@ class Engine:
             self.log(f"✅ DONE {vid} | {pick['kind']} itag {itags} | {size / 1e6:.2f} MB | resolver {ms(t_start, t_res):.0f} ms "
                      f"({plan.get('source')}) | TTFB {info_v.get('ttfb_ms')} ms | tải {dl_ms:.0f} ms ≈{mbps} Mbps | "
                      f"mux {mux_ms or 0:.0f} ms | verify {verify_ms:.0f} ms | TỔNG {total:.0f} ms | "
-                     f"{v.get('width')}x{v.get('height')} {v.get('vcodec')}/{v.get('acodec')}")
+                     f"{v.get('width')}x{v.get('height')} {v.get('vcodec')}/{v.get('acodec')}"
+                     + (f" | kết nối DASH: hình {info_v.get('connections', 1)}, tiếng {info_a.get('connections', 1)}"
+                        if pick["kind"] == "dash" else "")
+                     + (f" | vì sao không dùng Innertube nhanh: {plan.get('race')}" if plan.get("race") else ""))
             return "DONE"
         except Exception as e:  # noqa: BLE001
             if isinstance(e, InterruptedError) or self.stop_ev.is_set():
@@ -1521,6 +1553,12 @@ class Engine:
     def _fetch(self, fmt, dest, info, n, cancel=None):
         size = int(fmt.get("clen") or 0)
         cancel = cancel or self.stop_ev
+        if n > 1 and size <= 0:
+            try:
+                size = probe_size(fmt["url"])                 # yt-dlp hay không báo dung lượng → dò bằng 1 byte đầu
+                info["probed_size"] = size
+            except Exception as e:  # noqa: BLE001
+                info["probe_error"] = f"{type(e).__name__}"
         if n > 1 and size > 0:
             try:
                 return download_ranges(fmt["url"], dest, size, n, info, _AnyEvent(cancel, self.stop_ev))

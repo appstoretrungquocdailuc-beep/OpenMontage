@@ -131,6 +131,21 @@ Hai ứng viên: Windows Defender giữ thao tác đổi tên file .mp4 vừa gh
 
 **Số đo 10 lượt Shorts THẬT: PENDING.** Máy test không vào được YouTube. Chạy BENCH360.bat trên máy bạn.
 
+## LIVE PUSH thật (log 16:43–17:18 trên máy bạn)
+
+| Video | Push | Excel | Tải | TỔNG | Ghi chú |
+|---|---|---|---|---|---|
+| pj4F8q6H_A0 | VALID, tuổi 5.0 s | D17, 41 ms | itag 18, 2.34 MB | **1024 ms** | resolver 644, TTFB 209, tải 331, ffprobe 45; các khoảng hở = 0 |
+| sLrFIdWkR0c | VALID, tuổi 4.9 s | D7, 41 ms | itag 18, 4.21 MB | **1566 ms** | TTFB 860 ms (chờ YouTube) |
+| MY524yaPKUk | VALID, tuổi 7.3 s | D10, 46 ms | DASH 134+140 qua yt-dlp | **31 924 ms** | chưa có itag 18; DASH tải 1 kết nối bị bóp 0.8 Mbps → **đã sửa** |
+
+- Khoảng 860 ms bất thường **không lặp lại**: DB 0.1 ms, đổi tên 0, các khoảng hở 0, lệch tổng ≈ 0.
+- Các push `UNKNOWN_SUBSCRIPTION` "THẾ HỆ CŨ" là bản sao từ thuê bao cũ (secret đã mất), đúng như dự kiến. Bản gửi
+  tới thuê bao mới đã được tải. Sau mỗi push như vậy, tool tự đăng ký lại kênh đó và hub xác minh trong < 2 s.
+- **Sửa nhánh DASH:** tải hình và tiếng bằng 4 kết nối mỗi luồng (`dash_range_connections`), tự dò dung lượng khi yt-dlp
+  không báo. Test với máy chủ giới hạn 300 KB/s mỗi kết nối: nhanh hơn rõ so với 1 kết nối. Nhánh itag 18 (1.0–1.5 s)
+  **giữ nguyên**. Log DONE giờ ghi vì sao Innertube nhanh không dùng được (mỗi client: số format, có itag 18 hay không).
+
 ## Review đối kháng
 
 Riêng các thay đổi WebSub đã qua 2 vòng review: vòng 3 xác nhận 13 lỗi, vòng 4 xác nhận thêm 3 lỗi do chính các bản sửa gây ra. **Đã sửa cả 16, mỗi lỗi có test hồi quy.**
@@ -139,7 +154,7 @@ Riêng các thay đổi WebSub đã qua 2 vòng review: vòng 3 xác nhận 13 l
 
 | # | Bài test | Kết quả | Ghi chú |
 |---|---|---|---|
-| A | Bộ test tự động `tests/test_ws360.py` | **67/67 PASS**, chạy 3 lần liên tiếp đều qua | hub WebSub giả (đúng đặc tả), máy chủ video giả, Excel thật, ffmpeg thật |
+| A | Bộ test tự động `tests/test_ws360.py` | **70/70 PASS**, chạy 3 lần liên tiếp đều qua | hub WebSub giả (đúng đặc tả), máy chủ video giả, Excel thật, ffmpeg thật |
 | B | Chỉ dùng WebSub, không polling/API | **PASS** | |
 | C | Đăng ký → hub gọi xác minh → VERIFIED, lease 432000 s | **PASS** (hub giả) | hub thật: chạy SELFTEST / DIAG trên máy bạn |
 | D | Kênh hub không xác minh: không bao giờ tính là đã xác minh, tự gửi lại theo lịch | **PASS** | |
@@ -154,7 +169,7 @@ Riêng các thay đổi WebSub đã qua 2 vòng review: vòng 3 xác nhận 13 l
 | L | SELFTEST không sửa `check.xlsx` gốc (so hash SHA-256) | **PASS** | |
 | M | SELFTEST trên Windows của bạn với YouTube thật (bản trước, cùng bộ tải) | **PASS**: TỔNG **1352 ms**, tải 900 ms, verify 112 ms, Excel 34 ms | bộ tải 360p **không đổi** trong bản này |
 | N | Hub THẬT xác minh đủ 15/15 | **PENDING** | chạy SELFTEST.bat hoặc DIAG.bat (chọn 2) với ngrok đang chạy |
-| O | **LIVE PUSH: video mới THẬT qua WebSub thật** | **PENDING, CHƯA KIỂM CHỨNG** | chỉ xác minh được khi một trong 15 kênh đăng video lúc tool chính đang chạy |
+| O | **LIVE PUSH: video mới THẬT qua WebSub thật** | **PASS trên máy bạn (12/11)** | 3 video thật: pj4F8q6H_A0 (push 5.0 s sau đăng, TỔNG 1024 ms, Excel D17 41 ms), sLrFIdWkR0c (1566 ms, Excel D7), MY524yaPKUk (31.9 s: nhánh DASH chậm, đã sửa bên dưới) |
 
 **Phân biệt giả lập và thật:**
 - Mọi sự kiện trong bộ test và trong TEST3 của SELFTEST là **giả lập**. Tiêu đề ghi `SELFTEST (giả lập, không phải video mới thật)`.

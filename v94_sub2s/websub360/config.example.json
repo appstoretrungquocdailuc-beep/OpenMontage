@@ -15,6 +15,7 @@
   "download_dir": "DOWNLOADS",
   "workers": 3,
   "range_connections": 1,
+  "dash_range_connections": 4,
   "retry_schedule_sec": [
     1,
     2,
