@@ -1017,6 +1017,9 @@ def test_selftest_reports_real_verification_only_and_never_touches_original_exce
         assert res[f"TEST2c-kênh {CH[0]}"][0] == "FAIL"
         assert res["TEST2d POST sai chữ ký bị chặn, POST đúng chữ ký (video cũ) nhận nhưng không tải"][0] == "PASS"
         assert hashlib.sha256((tmp_path / "check.xlsx").read_bytes()).hexdigest() == h0
+        logtxt = "".join(p.read_text(encoding="utf-8") for p in (tmp_path / "logs").glob("*.log"))
+        assert "(GIẢ LẬP SELFTEST) webhook trả đúng challenge" in logtxt
+        assert f"Hub XÁC MINH kênh {CH[0]}" not in logtxt             # kênh hub thật KHÔNG xác minh → không bao giờ in "Hub XÁC MINH"
     finally:
         hub.close()
 

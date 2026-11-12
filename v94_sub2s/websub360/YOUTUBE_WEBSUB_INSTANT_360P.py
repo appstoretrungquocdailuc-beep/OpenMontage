@@ -984,6 +984,7 @@ class Engine:
         self.old_logged = set()
         self.inbox_db = None          # SELFTEST: push THẬT nhận nhầm → chuyển vào database.sqlite của tool chính
         self.sim_vids = set()         # SELFTEST: video id của sự kiện giả lập
+        self.sim_pending = set()      # SELFTEST: (kênh, mode) của các lần xác minh GIẢ LẬP (TEST2a/2b)
         self.threads = []
         self.httpd = None
         self.callback = ""
@@ -1569,9 +1570,13 @@ class Engine:
                                  "ON CONFLICT(channel_id) DO UPDATE SET verified_at=excluded.verified_at, callback=excluded.callback, "
                                  "lease_seconds=excluded.lease_seconds, state='VERIFIED', error=NULL, attempts=0",
                                  (ch, eng.callback, time.time(), lease))
-                        eng.hub_event(ch, "verify", mode, 200, 1, f"lease {lease}s")
+                        sim = (ch, mode) in eng.sim_pending
+                        eng.hub_event(ch, "verify-sim" if sim else "verify", mode, 200, 1, f"lease {lease}s")
                         eng.hub_accepted(ch, mode)
-                        eng.log(f"✅ Hub XÁC MINH kênh {ch} | lease {lease}s")
+                        if sim:
+                            eng.log(f"🧪 (GIẢ LẬP SELFTEST) webhook trả đúng challenge cho kênh {ch} — KHÔNG phải hub Google xác minh")
+                        else:
+                            eng.log(f"✅ Hub XÁC MINH kênh {ch} | lease {lease}s")
                     else:
                         eng.db.x("UPDATE subs SET state='UNSUBSCRIBED' WHERE channel_id=?", (ch,))
                         eng.hub_event(ch, "verify", mode, 200, 1, "huỷ")
@@ -2048,6 +2053,7 @@ def selftest(cfg, base, video_id=None, wait_verify=90):
         if ch0:
             with eng.hub_lock:
                 eng.pending_hub[(ch0, "subscribe")] = time.time()     # mô phỏng: tool vừa gửi yêu cầu đăng ký
+            eng.sim_pending.add((ch0, "subscribe"))
             q = urlencode({"hub.mode": "subscribe", "hub.topic": TOPIC_FMT.format(ch0), "hub.challenge": "xyz123", "hub.lease_seconds": "60"})
             with urllib.request.urlopen(f"http://127.0.0.1:{port}{cfg['websub_path']}?{q}", timeout=3) as r:
                 ok_local = r.read() == b"xyz123"
@@ -2063,6 +2069,8 @@ def selftest(cfg, base, video_id=None, wait_verify=90):
             try:
                 with eng.hub_lock:
                     eng.pending_hub[(ch0, "subscribe")] = time.time()
+                    eng.pending_ok.pop((ch0, "subscribe"), None)
+                eng.sim_pending.add((ch0, "subscribe"))
                 q = urlencode({"hub.mode": "subscribe", "hub.topic": TOPIC_FMT.format(ch0), "hub.challenge": "pub456"})
                 req = urllib.request.Request(f"{cb}?{q}", headers={"ngrok-skip-browser-warning": "1"})
                 with urllib.request.urlopen(req, timeout=8) as r:
@@ -2070,6 +2078,7 @@ def selftest(cfg, base, video_id=None, wait_verify=90):
                 rec("TEST2b callback HTTPS công khai", "PASS" if okp and cb.startswith("https://") else "FAIL", cb)
             except Exception as e:
                 rec("TEST2b callback HTTPS công khai", "FAIL", f"{cb}: {type(e).__name__}: {e}")
+            eng.sim_pending.clear()                       # từ đây chỉ còn xác minh THẬT từ hub
             eng.db.x("DELETE FROM subs")                 # xoá dấu vết xác minh GIẢ LẬP của TEST2a/2b trước khi đo thật
             eng.db.x("DELETE FROM hub_events")
             eng.callback = cb
