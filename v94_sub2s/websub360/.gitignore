@@ -1,0 +1,10 @@
+database.sqlite*
+database_TEST.sqlite*
+websub_secret.txt
+websub_secret_history.txt
+*.lock
+logs/*.log
+DOWNLOADS*/
+config.json
+check*.xlsx
+__pycache__/

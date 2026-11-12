@@ -1134,3 +1134,101 @@ def test_failed_first_excel_read_never_unsubscribes(tmp_path):
         e2.stop()
     finally:
         hub.close()
+
+
+# ------------------------------------------------------------------ HMAC (điều tra 14:43 POST sai chữ ký)
+def _post(port, body, headers):
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/websub", data=body, headers=headers)
+    return urllib.request.urlopen(req, timeout=3).status
+
+
+def test_hmac_correct_wrong_missing_and_no_secret_in_logs(tmp_path):
+    e = make_engine(tmp_path, CH[:1])
+    e.start(websub=True, workers=False)
+    port = e.httpd.server_address[1]
+    now = datetime.now(timezone.utc)
+    b1 = atom(CH[0], "SIGSHA10001", now)
+    b2 = atom(CH[0], "SIGSHA25601", now)
+    b3 = atom(CH[0], "SIGWRONG001", now)
+    b4 = atom(CH[0], "SIGMISSING1", now)
+    assert _post(port, b1, {"X-Hub-Signature": "sha1=" + hmac.new(e.secret.encode(), b1, hashlib.sha1).hexdigest()}) == 204
+    assert _post(port, b2, {"X-Hub-Signature": "sha256=" + hmac.new(e.secret.encode(), b2, hashlib.sha256).hexdigest(),
+                            "X-Forwarded-For": "66.249.1.1", "User-Agent": "AppEngine-Google"}) == 204
+    wrong = hmac.new(b"khac-secret", b3, hashlib.sha1).hexdigest()
+    assert _post(port, b3, {"X-Hub-Signature": "sha1=" + wrong, "X-Forwarded-For": "66.249.1.1"}) == 204
+    assert _post(port, b4, {}) == 204
+    # HMAC trên byte THÔ: cùng nội dung XML nhưng khác 1 byte khoảng trắng → chữ ký cũ phải sai
+    b5 = b1.replace(b"<entry>", b"<entry> ")
+    assert _post(port, b5, {"X-Hub-Signature": "sha1=" + hmac.new(e.secret.encode(), b1, hashlib.sha1).hexdigest()}) == 204
+    time.sleep(0.5)
+    vids = {r["video_id"] for r in e.db.all("SELECT video_id FROM videos")}
+    assert vids == {"SIGSHA10001", "SIGSHA25601"}
+    ev = [r["detail"] for r in e.db.all("SELECT detail FROM hub_events WHERE kind='push-badsig'")]
+    assert any("KHÔNG khớp secret hiện tại" in d and "qua tunnel (ngrok) từ 66.249.1.1" in d for d in ev)
+    assert any("THIẾU header X-Hub-Signature" in d for d in ev)
+    logs = "\n".join(e._logs) + (tmp_path / "logs").glob("*.log").__next__().read_text(encoding="utf-8")
+    assert e.secret not in logs and wrong not in logs and wrong[:6] + "…" in logs
+    e.stop()
+
+
+def test_hmac_chunked_body(tmp_path):
+    import http.client
+    e = make_engine(tmp_path, CH[:1])
+    e.start(websub=True, workers=False)
+    port = e.httpd.server_address[1]
+    body = atom(CH[0], "CHUNKED0001", datetime.now(timezone.utc))
+    sig = "sha1=" + hmac.new(e.secret.encode(), body, hashlib.sha1).hexdigest()
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+    c.putrequest("POST", "/websub")
+    c.putheader("Transfer-Encoding", "chunked")
+    c.putheader("X-Hub-Signature", sig)
+    c.endheaders()
+    for i in range(0, len(body), 100):
+        part = body[i:i + 100]
+        c.send(f"{len(part):x}\r\n".encode() + part + b"\r\n")
+    c.send(b"0\r\n\r\n")
+    assert c.getresponse().status == 204
+    time.sleep(0.4)
+    assert e.db.one("SELECT 1 FROM videos WHERE video_id='CHUNKED0001'")
+    e.stop()
+
+
+def test_old_secret_after_db_overwrite_is_recognised_and_resubscribed(tmp_path):
+    """Tình huống thật: database.sqlite bị ghi đè → secret mới; hub vẫn ký bằng secret CŨ của thuê bao cũ."""
+    hub = FakeHub()
+    port = _free_port()
+    cb = f"http://127.0.0.1:{port}/websub"
+    try:
+        make_excel(tmp_path / "check.xlsx", CH[:1])
+        old = "ab" * 24
+        db = ws.DB(tmp_path / "database.sqlite")
+        db.meta_set("websub_secret", old)                            # secret của bản chạy trước
+        db.con.close()
+        (tmp_path / "websub_secret.txt").write_text("cd" * 24)        # secret hiện tại khác
+        e = make_engine(tmp_path, CH[:1], hub, keep_excel=True, listen_port=port, callback_url=cb, websub_loop_sec=0.3)
+        assert [x for x, _ in ws.load_secret_history(tmp_path)] == [old]
+        e.start(workers=False)
+        end = time.time() + 5
+        while time.time() < end and not hub.verified:
+            time.sleep(0.1)
+        n0 = len(hub.reqs)
+        body = atom(CH[0], "OLDSECRET01", datetime.now(timezone.utc))
+        assert _post(port, body, {"X-Hub-Signature": "sha1=" + hmac.new(old.encode(), body, hashlib.sha1).hexdigest(),
+                                  "X-Forwarded-For": "66.249.1.1"}) == 204
+        time.sleep(1.0)
+        assert e.db.one("SELECT 1 FROM videos WHERE video_id='OLDSECRET01'")          # chữ ký hợp lệ (secret tool cấp) → nhận
+        assert any("secret CŨ" in l for l in e._logs)
+        assert len(hub.reqs) > n0 and hub.reqs[-1]["hub.secret"] == e.secret           # đăng ký lại bằng secret hiện tại
+        assert old not in "\n".join(e._logs)
+        e.stop()
+    finally:
+        hub.close()
+
+
+def test_retired_secret_expires_after_10_days(tmp_path):
+    e = make_engine(tmp_path, CH[:1])
+    old = "ef" * 24
+    (tmp_path / "websub_secret_history.txt").write_text(f"{old} {int(time.time() - 11 * 86400)}\n")
+    body = b"<feed/>"
+    v = e.check_signature(body, "sha1=" + hmac.new(old.encode(), body, hashlib.sha1).hexdigest())
+    assert not v["ok"]

@@ -58,6 +58,25 @@ KIỂM TRA (SELFTEST.bat) — có phân biệt GIẢ LẬP và THẬT
   để không ảnh hưởng tool chính.
 - Mọi chế độ trong cùng thư mục dùng chung 1 secret HMAC (websub_secret.txt). ĐỪNG xoá hay sửa file này.
 
+CẬP NHẬT BẢN MỚI (an toàn)
+--------------------------
+Gói zip KHÔNG chứa database.sqlite, websub_secret.txt, websub_secret_history.txt, config.json hay check.xlsx,
+nên giải nén chép đè sẽ không ghi đè dữ liệu và secret của bạn.
+(Bản trước có kèm một database.sqlite rỗng. Chép đè làm tool tạo secret mới, trong khi hub vẫn ký push bằng secret
+cũ, nên push bị báo "sai chữ ký". Bản này tự nhận ra trường hợp đó và tự đăng ký lại.)
+
+LỖI "WebSub POST BỊ TỪ CHỐI" (chữ ký HMAC)
+------------------------------------------
+Mỗi POST bị từ chối đều được ghi rõ trong log:
+  nguồn gửi (qua ngrok / localhost / trực tiếp), User-Agent, thuật toán ký, 6 ký tự đầu của chữ ký, số byte body,
+  và lý do: THIẾU header / sai định dạng / không khớp secret hiện tại hay secret cũ.
+Log không bao giờ ghi secret hay chữ ký đầy đủ. Secret chỉ hiện dưới dạng "dấu vân tay" 8 ký tự.
+- Push THẬT qua ngrok mà chữ ký sai → hub đang giữ secret khác cho kênh đó → tool tự đăng ký lại kênh đó
+  (tối đa 1 lần / 10 phút).
+- Push ký bằng secret CŨ do chính tool tạo (vẫn còn trong 10 ngày) → vẫn là chữ ký hợp lệ nên được nhận. Tool đăng ký lại
+  để hub chuyển sang secret mới. Log có dòng "🔑 POST ký bằng secret CŨ".
+- Muốn xem lại các lần bị từ chối: DIAG.bat (mục "POST chữ ký sai / secret cũ gần nhất").
+
 BENCHMARK.bat (tuỳ chọn)
 ------------------------
 Nhập 2 ID video (1 ngắn, 1 dài). Tool thử 1 GET và Range x4/x8/x12/x16, rồi ghi BENCHMARK.csv.

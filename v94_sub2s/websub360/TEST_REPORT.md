@@ -41,6 +41,31 @@ Muốn biết chính xác, chạy **DIAG.bat → chọn 2** (tắt tool chính, 
 Channel ID, mã HTTP lúc gửi đăng ký, số lần gửi, các lần hub gọi xác minh (chấp nhận hoặc từ chối, kèm lý do),
 **trạng thái do chính hub Google báo** (State / Last verification error / Expiration), và trang kênh có tồn tại hay không.
 
+## Điều tra POST sai chữ ký HMAC (14:43:36)
+
+**Nguyên nhân tìm được trong code và gói giao:** gói zip trước có kèm `database.sqlite` rỗng. Giải nén chép đè làm mất
+secret HMAC đã đăng ký với hub, nên tool tạo secret mới. Thuê bao cũ trên hub vẫn còn hiệu lực với secret CŨ, còn lần đăng ký
+lại (14:40) chỉ có hiệu lực khi hub xác minh xong. Hub vì vậy vẫn ký push bằng secret cũ, và tool từ chối.
+Khớp với log: 15/15 HTTP 202 nhưng chưa thấy dòng `✅ Hub XÁC MINH`.
+Kết luận này chưa chứng minh được 100% từ phía máy chủ test: cần log mới, có ghi nguồn và chữ ký, từ máy bạn.
+
+**Đã kiểm tra trong code:**
+
+| Yêu cầu | Kết quả |
+|---|---|
+| Header | `X-Hub-Signature: <thuật toán>=<hex>`; hỗ trợ sha1 (hub Google dùng), sha256, sha384, sha512 |
+| HMAC tính trên | **byte thô** của body đọc từ socket (cả kiểu chunked), không parse hay serialize lại. Test: đổi 1 byte khoảng trắng thì chữ ký cũ phải sai |
+| So sánh | `hmac.compare_digest` |
+| Secret khi subscribe và khi kiểm POST | cùng `self.secret` (từ `websub_secret.txt`). Test kiểm `hub.secret` gửi đi bằng secret dùng để kiểm |
+| Secret có đổi khi khởi động lại | không (giữ trong `websub_secret.txt`). Nếu database cũ có secret khác thì secret đó được đưa vào `websub_secret_history.txt` |
+| Thuê bao cũ dùng secret khác | nhận diện được: POST ký bằng secret cũ do chính tool cấp (trong 10 ngày) là chữ ký HỢP LỆ → nhận và đăng ký lại; chữ ký không khớp → từ chối, ghi lý do, đăng ký lại kênh |
+| Nguồn POST | log ghi: qua tunnel/ngrok (X-Forwarded-For) / localhost (SELFTEST) / trực tiếp, kèm User-Agent |
+| Không lộ bí mật | log chỉ có dấu vân tay secret (8 ký tự) và 6 ký tự đầu chữ ký. Test kiểm log không chứa secret và chữ ký đầy đủ |
+| Không tắt HMAC | POST không có chữ ký, hoặc chữ ký không khớp secret nào của tool, đều bị từ chối |
+
+**Test mới (đều PASS):** chữ ký đúng (sha1, sha256), sai, thiếu, lệch 1 byte, body chunked, tình huống ghi đè DB
+(secret cũ → nhận + đăng ký lại), secret cũ quá 10 ngày → từ chối.
+
 ## Review đối kháng
 
 Riêng các thay đổi WebSub đã qua 2 vòng review: vòng 3 xác nhận 13 lỗi, vòng 4 xác nhận thêm 3 lỗi do chính các bản sửa gây ra. **Đã sửa cả 16, mỗi lỗi có test hồi quy.**
@@ -49,7 +74,7 @@ Riêng các thay đổi WebSub đã qua 2 vòng review: vòng 3 xác nhận 13 l
 
 | # | Bài test | Kết quả | Ghi chú |
 |---|---|---|---|
-| A | Bộ test tự động `tests/test_ws360.py` | **48/48 PASS**, chạy 3 lần liên tiếp đều qua | hub WebSub giả (đúng đặc tả), máy chủ video giả, Excel thật, ffmpeg thật |
+| A | Bộ test tự động `tests/test_ws360.py` | **52/52 PASS**, chạy 3 lần liên tiếp đều qua | hub WebSub giả (đúng đặc tả), máy chủ video giả, Excel thật, ffmpeg thật |
 | B | Chỉ dùng WebSub, không polling/API | **PASS** | |
 | C | Đăng ký → hub gọi xác minh → VERIFIED, lease 432000 s | **PASS** (hub giả) | hub thật: chạy SELFTEST / DIAG trên máy bạn |
 | D | Kênh hub không xác minh: không bao giờ tính là đã xác minh, tự gửi lại theo lịch | **PASS** | |

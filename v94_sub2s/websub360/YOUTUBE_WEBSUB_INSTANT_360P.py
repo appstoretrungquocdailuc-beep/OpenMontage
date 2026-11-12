@@ -915,6 +915,37 @@ def ffmpeg_mux(vfile: Path, afile: Path | None, out: Path) -> float:
     return ms(t0, time.perf_counter_ns())
 
 
+def secret_fp(sec: str) -> str:
+    """Dấu vân tay để so sánh trong log — KHÔNG lộ secret."""
+    return hashlib.sha256(str(sec or "").encode()).hexdigest()[:8]
+
+
+def retire_secret(base: Path, old: str, current: str):
+    """Ghi secret cũ (hub có thể vẫn giữ cho thuê bao cũ) vào websub_secret_history.txt để chẩn đoán + chuyển tiếp an toàn."""
+    if not old or old == current or not re.fullmatch(r"[0-9a-f]{32,128}", old):
+        return
+    f = base / "websub_secret_history.txt"
+    try:
+        have = f.read_text(encoding="utf-8").split() if f.exists() else []
+    except OSError:
+        have = []
+    if old not in have:
+        with open(f, "a", encoding="utf-8") as fh:
+            fh.write(f"{old} {int(time.time())}\n")
+
+
+def load_secret_history(base: Path) -> list[tuple[str, float]]:
+    out = []
+    try:
+        for line in (base / "websub_secret_history.txt").read_text(encoding="utf-8").splitlines():
+            parts = line.split()
+            if parts and re.fullmatch(r"[0-9a-f]{32,128}", parts[0]):
+                out.append((parts[0], float(parts[1]) if len(parts) > 1 else 0.0))
+    except OSError:
+        pass
+    return out
+
+
 def load_shared_secret(base: Path, db: "DB | None" = None) -> str:
     """MỘT secret HMAC cho cả thư mục (tool chính, SELFTEST, DIAG). Hub lưu thuê bao theo (callback, topic):
     nếu mỗi chế độ dùng secret khác nhau, lần đăng ký sau sẽ ghi đè secret và tool chính bỏ nhầm push thật."""
@@ -971,6 +1002,7 @@ class Engine:
         self.resolver = Resolver(log)
         old_secret = self.db.meta_get("websub_secret")
         self.secret = load_shared_secret(base, self.db)
+        retire_secret(base, old_secret, self.secret)     # DB từng dùng secret khác → giữ lại để nhận diện thuê bao cũ
         if old_secret and old_secret != self.secret and self.db.meta_get("subs_secret_sig") is None:
             # DB này từng đăng ký với secret cũ → buộc vòng WebSub coi là 'secret đổi' và đăng ký lại toàn bộ
             self.db.meta_set("subs_secret_sig", hashlib.sha256(old_secret.encode()).hexdigest()[:16])
@@ -985,6 +1017,7 @@ class Engine:
         self.inbox_db = None          # SELFTEST: push THẬT nhận nhầm → chuyển vào database.sqlite của tool chính
         self.sim_vids = set()         # SELFTEST: video id của sự kiện giả lập
         self.sim_pending = set()      # SELFTEST: (kênh, mode) của các lần xác minh GIẢ LẬP (TEST2a/2b)
+        self._badsig_resub = {}       # kênh → lần cuối đăng ký lại vì chữ ký sai
         self.threads = []
         self.httpd = None
         self.callback = ""
@@ -1024,6 +1057,8 @@ class Engine:
         self._spawn(self._stats_loop, "STATS")
         if workers and FFPROBE:
             self._spawn(self._ff_keepwarm, "FF-WARM")
+        self.log(f"🔑 secret HMAC hiện tại: dấu vân tay {secret_fp(self.secret)} (websub_secret.txt) | "
+                 f"secret cũ đã biết: {len(load_secret_history(self.base))}")
         self.log(f"✅ {VERSION} chạy | {len(self.channels)} kênh | workers={self.cfg.get('workers')} | "
                  f"ffmpeg={'có' if FFMPEG else 'KHÔNG'} | ffprobe={'có' if FFPROBE else 'KHÔNG'} | yt-dlp={'có' if yt_dlp else 'KHÔNG'}")
 
@@ -1589,30 +1624,43 @@ class Engine:
                 t_recv = time.perf_counter_ns()
                 if urlparse(self.path).path != path:
                     return self._reply(404)
+                raw = self._read_body()
+                if raw is None:
+                    return
+                src = eng.describe_source(self.client_address[0], self.headers)
+                verdict = eng.check_signature(raw, self.headers.get("X-Hub-Signature"))
+                self._reply(204)                              # ACK ngay — xử lý sau, không bắt hub chờ
+                eng.on_signed_post(raw, verdict, src, self.headers, t_recv)
+
+            def _read_body(self):
+                """Đọc ĐÚNG byte thô hub gửi (HMAC tính trên đây). Hỗ trợ Content-Length và chunked; tối đa 256 KB."""
+                te = (self.headers.get("Transfer-Encoding") or "").lower()
+                if "chunked" in te:
+                    buf = bytearray()
+                    while True:
+                        line = self.rfile.readline(64)
+                        try:
+                            size = int(line.split(b";")[0].strip(), 16)
+                        except ValueError:
+                            self._reply(400)
+                            return None
+                        if size == 0:
+                            self.rfile.readline(64)
+                            break
+                        if len(buf) + size > 256 * 1024:
+                            self._reply(413)
+                            return None
+                        buf += self.rfile.read(size)
+                        self.rfile.readline(8)
+                    return bytes(buf)
                 try:
                     n = int(self.headers.get("Content-Length") or 0)
                 except ValueError:
                     n = -1
                 if n <= 0 or n > 256 * 1024:                  # push thật chỉ vài KB
-                    return self._reply(413 if n > 0 else 400)
-                raw = self.rfile.read(n)
-                sig = (self.headers.get("X-Hub-Signature") or "").strip()
-                ok = False
-                if "=" in sig:
-                    algo, _, hexs = sig.partition("=")
-                    if algo.lower() in ("sha1", "sha256", "sha384", "sha512"):
-                        mac = hmac.new(eng.secret.encode(), raw, getattr(hashlib, algo.lower())).hexdigest()
-                        ok = hmac.compare_digest(mac, hexs.lower())
-                self._reply(204)                              # ACK ngay — xử lý sau, không bắt hub chờ
-                if not ok:
-                    eng.log("🚫 WebSub POST sai/thiếu chữ ký HMAC — bỏ qua")
-                    try:
-                        ids = [(x["channel_id"], x["video_id"]) for x in parse_atom(raw)][:3]
-                    except Exception:  # noqa: BLE001
-                        ids = []
-                    eng.hub_event(ids[0][0] if ids else "", "push-badsig", "", None, 0, str(ids))
-                    return
-                eng.handle_push(raw, t_recv)
+                    self._reply(413 if n > 0 else 400)
+                    return None
+                return self.rfile.read(n)
 
         slots = threading.BoundedSemaphore(32)
 
@@ -1646,6 +1694,80 @@ class Engine:
         threading.Thread(target=self.httpd.serve_forever, kwargs={"poll_interval": 0.2}, daemon=True, name="WEBHOOK").start()
         self.stats["webhook"] = f"LOCAL :{self.httpd.server_address[1]}{path}"
         self.log(f"📡 Webhook lắng nghe {self.cfg.get('listen_host')}:{self.httpd.server_address[1]}{path}")
+
+    def describe_source(self, ip, headers) -> str:
+        xff = (headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+        ua = (headers.get("User-Agent") or "-")[:60]
+        if xff:
+            return f"qua tunnel (ngrok) từ {xff} | UA {ua}"
+        if ip in ("127.0.0.1", "::1"):
+            return f"localhost (SELFTEST/thử tay) | UA {ua}"
+        return f"trực tiếp từ {ip} | UA {ua}"
+
+    def check_signature(self, raw: bytes, header) -> dict:
+        """HMAC trên BYTE THÔ của body, so sánh bằng hmac.compare_digest. Trả về kết quả + thông tin chẩn đoán an toàn."""
+        sig = str(header or "").strip()
+        out = {"ok": False, "which": None, "algo": None, "sig_hint": "", "len": len(raw), "reason": ""}
+        if not sig:
+            out["reason"] = "THIẾU header X-Hub-Signature"
+            return out
+        algo, _, hexs = sig.partition("=")
+        algo = algo.strip().lower()
+        hexs = hexs.strip().lower()
+        out["algo"] = algo
+        out["sig_hint"] = (hexs[:6] + "…") if hexs else ""
+        if algo not in ("sha1", "sha256", "sha384", "sha512") or not re.fullmatch(r"[0-9a-f]+", hexs or ""):
+            out["reason"] = f"header sai định dạng (thuật toán '{algo[:10]}')"
+            return out
+
+        def match(sec):
+            return hmac.compare_digest(hmac.new(sec.encode(), raw, getattr(hashlib, algo)).hexdigest(), hexs)
+        if match(self.secret):
+            out.update(ok=True, which="current")
+            return out
+        for old, retired_at in load_secret_history(self.base):
+            # secret CŨ do chính tool tạo: chỉ chấp nhận trong thời hạn lease tối đa sau khi bị thay (hub chưa chuyển xong)
+            if time.time() - retired_at <= 10 * 86400 and match(old):
+                out.update(ok=True, which=f"old:{secret_fp(old)}")
+                return out
+        out["reason"] = (f"chữ ký {algo} KHÔNG khớp secret hiện tại ({secret_fp(self.secret)}) "
+                         f"hay {len(load_secret_history(self.base))} secret cũ đã biết")
+        return out
+
+    def on_signed_post(self, raw, v, src, headers, t_recv_ns):
+        try:
+            ids = [(x["channel_id"], x["video_id"]) for x in parse_atom(raw) if x.get("video_id")][:3]
+        except Exception:  # noqa: BLE001
+            ids = []
+        chans = sorted({c for c, _ in ids if c})
+        diag = (f"nguồn: {src} | {v['algo'] or '-'} {v['sig_hint']} | body {v['len']} B | "
+                f"Content-Encoding {headers.get('Content-Encoding') or '-'} | video {ids}")
+        if not v["ok"]:
+            self.log(f"🚫 WebSub POST BỊ TỪ CHỐI: {v['reason']} | {diag}")
+            for c in chans:
+                self.hub_event(c, "push-badsig", "", None, 0, f"{v['reason']} | {diag}"[:300])
+            if not chans:
+                self.hub_event("", "push-badsig", "", None, 0, f"{v['reason']} | {diag}"[:300])
+            self._resubscribe_after_badsig(chans, src)
+            return
+        if v["which"] != "current":
+            self.log(f"🔑 POST ký bằng secret CŨ ({v['which']}) — chính tool đã cấp, hợp lệ → nhận. Hub vẫn giữ thuê bao cũ "
+                     f"→ đăng ký lại kênh {chans} để hub chuyển sang secret hiện tại | {diag}")
+            for c in chans:
+                self.hub_event(c, "push-oldsecret", "", None, 1, diag[:300])
+            self._resubscribe_after_badsig(chans, src, force=True)
+        self.handle_push(raw, t_recv_ns)
+
+    def _resubscribe_after_badsig(self, chans, src, force=False):
+        """Push THẬT (qua tunnel) mang chữ ký không khớp → hub đang giữ secret khác cho kênh đó → đăng ký lại (≤1 lần/10 phút/kênh)."""
+        if not chans or not self.callback or ("tunnel" not in src and not force):
+            return
+        now = time.time()
+        todo = [c for c in chans if self.monitored(c) and now - self._badsig_resub.get(c, 0) > 600]
+        for c in todo:
+            self._badsig_resub[c] = now
+        if todo:
+            threading.Thread(target=self.subscribe_all, args=(todo,), daemon=True, name="RESUB-BADSIG").start()
 
     def handle_push(self, raw: bytes, t_recv_ns: int):
         try:
@@ -2220,6 +2342,12 @@ def diag(cfg, base, resubscribe=False, wait_s=120):
     cb = eng.resolve_callback()
     out.append(f"Callback: {cb or 'KHÔNG CÓ (ngrok chưa chạy / callback_url trống)'}")
     out.append(f"Topic WebSub dùng để đăng ký: {TOPIC_FMT.format('<CHANNEL_ID>')}")
+    out.append(f"Secret HMAC hiện tại: dấu vân tay {secret_fp(eng.secret)} | secret cũ đã biết: "
+               f"{[secret_fp(x) for x, _ in load_secret_history(base)]}")
+    bad = eng.db.all("SELECT * FROM hub_events WHERE kind IN ('push-badsig','push-oldsecret') ORDER BY id DESC LIMIT 8")
+    out.append("POST chữ ký sai / secret cũ gần nhất:" + ("" if bad else " không có"))
+    for e in bad:
+        out.append(f"  - {datetime.fromtimestamp(e['at']):%d/%m %H:%M:%S} {e['kind']} kênh {e['channel_id'] or '?'}: {e['detail']}")
     out.append("Phát hiện video: CHỈ WebSub (không feed polling, không Data API). Trang kênh chỉ dùng ở đây để kiểm tra ID.")
     if cb:
         try:
