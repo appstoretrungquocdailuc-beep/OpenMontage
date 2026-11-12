@@ -1,0 +1,646 @@
+# -*- coding: utf-8 -*-
+"""Test tích hợp WS360: hub WebSub GIẢ (local) + máy chủ video GIẢ (mock_gvs) + Excel thật (openpyxl) + ffmpeg/ffprobe thật.
+Mọi sự kiện ở đây là GIẢ LẬP qua đúng đường webhook/event processor mà WebSub thật dùng — không phải video mới thật."""
+import hashlib
+import hmac
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+from datetime import datetime, timezone, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlencode
+
+import pytest
+from openpyxl import Workbook, load_workbook
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parents[1] / "tests"))          # mock_gvs của V9
+from mock_gvs import MockGVS  # noqa: E402
+
+spec = importlib.util.spec_from_file_location("ws", HERE.parent / "YOUTUBE_WEBSUB_INSTANT_360P.py")
+ws = importlib.util.module_from_spec(spec)
+sys.modules["ws"] = ws
+spec.loader.exec_module(ws)
+
+FF = shutil.which("ffmpeg")
+need_ff = pytest.mark.skipif(not FF, reason="cần ffmpeg")
+CH = ["UC" + c * 22 for c in "ABCDEFG"]          # Channel ID đúng định dạng (giả)
+TS = datetime.now(timezone.utc)
+
+
+# ------------------------------------------------------------------ fixtures
+@pytest.fixture(scope="module")
+def media(tmp_path_factory):
+    d = tmp_path_factory.mktemp("media")
+    prog, vonly, aonly, silent = d / "p.mp4", d / "v.mp4", d / "a.m4a", d / "s.mp4"
+    run = lambda *a: subprocess.run([FF, "-y", "-loglevel", "error", *a], check=True)
+    run("-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25", "-f", "lavfi", "-i", "sine=duration=6", "-t", "6",
+        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(prog))
+    run("-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25", "-t", "6", "-c:v", "libx264", "-preset", "ultrafast",
+        "-pix_fmt", "yuv420p", "-an", str(vonly))
+    run("-f", "lavfi", "-i", "sine=duration=6", "-c:a", "aac", "-vn", str(aonly))
+    shutil.copyfile(vonly, silent)
+    return {k: v.read_bytes() for k, v in (("prog", prog), ("v", vonly), ("a", aonly), ("silent", silent))}
+
+
+@pytest.fixture()
+def gvs():
+    with MockGVS() as g:
+        yield g
+
+
+def make_excel(path, chans, extra_rows=0):
+    wb = Workbook()
+    ws_ = wb.active
+    ws_.append(["A", "B", "C", "URL", "E", "F", "G", "H", "I", "J", "CHANNEL ID", "L"])
+    for i, ch in enumerate(chans):
+        ws_.append([f"a{i}", f"b{i}", f"c{i}", None, f"e{i}", f"f{i}", 7, 8.5, "i", "j", ch, f"l{i}"])
+    for i in range(extra_rows):
+        ws_.append([f"x{i}", None, None, None, None, None, None, None, None, None, "khong-phai-kenh", None])
+    wb.save(path)
+
+
+def snapshot(path, skip_col=4):
+    ws_ = load_workbook(path).active
+    return [[c.value for c in row if c.column != skip_col] for row in ws_.iter_rows()]
+
+
+class FakeHub:
+    """Hub WebSub giả theo đặc tả: nhận POST subscribe → 202 → GỌI GET xác minh tới callback (async)."""
+
+    def __init__(self):
+        self.reqs, self.verified, self.secret = [], {}, {}
+        hub = self
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                return
+
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                q = {k: v[0] for k, v in parse_qs(self.rfile.read(n).decode()).items()}
+                hub.reqs.append(q)
+                self.send_response(202)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                threading.Thread(target=hub._verify, args=(q,), daemon=True).start()
+
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.srv.server_address[1]}/subscribe"
+
+    def _verify(self, q):
+        time.sleep(0.05)
+        chal = "c" + os.urandom(6).hex()
+        u = q["hub.callback"] + "?" + urlencode({"hub.mode": q["hub.mode"], "hub.topic": q["hub.topic"],
+                                                  "hub.challenge": chal, "hub.lease_seconds": "432000"})
+        try:
+            with urllib.request.urlopen(u, timeout=3) as r:
+                ok = r.status == 200 and r.read().decode() == chal
+        except Exception:
+            ok = False
+        ch = ws.norm_channel(q["hub.topic"])
+        self.verified[ch] = (q["hub.mode"], ok)
+        if q.get("hub.secret"):
+            self.secret[ch] = q["hub.secret"]
+
+    def push(self, callback, ch, vid, published=None, title="t", sign=True, secret=None):
+        body = atom(ch, vid, published or datetime.now(timezone.utc), title)
+        h = {"Content-Type": "application/atom+xml"}
+        if sign:
+            h["X-Hub-Signature"] = "sha1=" + hmac.new((secret or self.secret[ch]).encode(), body, hashlib.sha1).hexdigest()
+        with urllib.request.urlopen(urllib.request.Request(callback, data=body, headers=h), timeout=3) as r:
+            return r.status
+
+    def close(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+
+
+def atom(ch, vid, published, title="t"):
+    return (f'<?xml version="1.0" encoding="UTF-8"?><feed xmlns:yt="http://www.youtube.com/xml/schemas/2015" '
+            f'xmlns="http://www.w3.org/2005/Atom"><link rel="hub" href="https://pubsubhubbub.appspot.com"/>'
+            f'<entry><id>yt:video:{vid}</id><yt:videoId>{vid}</yt:videoId><yt:channelId>{ch}</yt:channelId>'
+            f'<title>{title}</title><link rel="alternate" href="https://www.youtube.com/watch?v={vid}"/>'
+            f'<author><name>n</name><uri>https://www.youtube.com/channel/{ch}</uri></author>'
+            f'<published>{published.isoformat()}</published><updated>{datetime.now(timezone.utc).isoformat()}</updated>'
+            f'</entry></feed>').encode()
+
+
+def mkfmt(url, itag, height, mime, clen, **kw):
+    d = {"itag": itag, "url": url, "height": height, "mime": mime, "clen": clen, "bitrate": 0,
+         "is_video": mime.startswith("video/") and kw.get("adaptive", False),
+         "is_audio": mime.startswith("audio/"), "has_audio": not kw.get("adaptive", False) or mime.startswith("audio/"),
+         "is_default_audio": True}
+    return d
+
+
+def make_engine(tmp, chans, hub=None, **cfg_over):
+    make_excel(tmp / "check.xlsx", chans)
+    cfg = dict(ws.DEFAULT_CONFIG, listen_host="127.0.0.1", listen_port=0, api_enabled=False, feed_enabled=False,
+               retry_schedule_sec=[0.1, 0.2, 0.3], workers=3)
+    if hub:
+        cfg["hub_url"] = hub.url
+    cfg.update(cfg_over)
+    logs = []
+    log = ws.Log(tmp / "logs")
+    log.sinks.append(logs.append)
+    e = ws.Engine(cfg, tmp, log)
+    e._logs = logs
+    return e
+
+
+def wait_state(e, vid, states=("DONE", "FAILED"), t=20):
+    end = time.time() + t
+    while time.time() < end:
+        r = e.db.one("SELECT * FROM videos WHERE video_id=?", (vid,))
+        if r and r["state"] in states:
+            return r
+        time.sleep(0.05)
+    return e.db.one("SELECT * FROM videos WHERE video_id=?", (vid,))
+
+
+def wait_excel(e, vid, t=20):
+    end = time.time() + t
+    while time.time() < end:
+        r = e.db.one("SELECT * FROM excel_jobs WHERE video_id=?", (vid,))
+        if r and r["state"] in ("DONE", "NO_ROW", "SUPERSEDED"):
+            return r
+        time.sleep(0.05)
+    return e.db.one("SELECT * FROM excel_jobs WHERE video_id=?", (vid,))
+
+
+def plan_prog(gvs, media, vid, mode="ok", data=None, **kw):
+    data = media["prog"] if data is None else data
+    url = gvs.add(f"/vp/{vid}", data, mode, **kw)
+    return {"pick": {"kind": "progressive", "video": mkfmt(url, 18, 360, 'video/mp4; codecs="avc1, mp4a"', len(data)),
+                     "audio": None}, "source": "MOCK"}
+
+
+# ------------------------------------------------------------------ parse / chọn format
+def test_pick_formats_prefers_progressive_avc_and_never_assumes_itag18():
+    prog = [mkfmt("u1", 43, 360, 'video/webm; codecs="vp8"', 10), mkfmt("u2", 777, 360, 'video/mp4; codecs="avc1.42001E, mp4a"', 9),
+            mkfmt("u3", 22, 720, 'video/mp4; codecs="avc1"', 50)]
+    p = ws.pick_formats(prog, [])
+    assert p["kind"] == "progressive" and p["video"]["itag"] == 777
+    adap = [mkfmt("v1", 243, 360, 'video/webm; codecs="vp9"', 5, adaptive=True),
+            mkfmt("v2", 134, 360, 'video/mp4; codecs="avc1.4d401e"', 6, adaptive=True),
+            mkfmt("a1", 251, 0, 'audio/webm; codecs="opus"', 1, adaptive=True),
+            mkfmt("a2", 140, 0, 'audio/mp4; codecs="mp4a.40.2"', 1, adaptive=True)]
+    p = ws.pick_formats([mkfmt("x", 22, 720, "video/mp4", 1)], adap)
+    assert p["kind"] == "dash" and p["video"]["itag"] == 134 and p["audio"]["itag"] == 140
+    assert ws.pick_formats([], [mkfmt("a", 140, 0, "audio/mp4", 1, adaptive=True)]) is None
+
+
+def test_innertube_json_parse_and_playability():
+    data = {"playabilityStatus": {"status": "OK"},
+            "streamingData": {"formats": [{"itag": 18, "url": "https://x/18", "mimeType": 'video/mp4; codecs="avc1.42001E, mp4a.40.2"',
+                                           "qualityLabel": "360p", "height": 360, "contentLength": "123"}],
+                              "adaptiveFormats": [{"itag": 140, "url": "https://x/140", "mimeType": 'audio/mp4; codecs="mp4a.40.2"'}]}}
+    prog, adap = ws._innertube_formats(data)
+    assert prog[0]["height"] == 360 and prog[0]["clen"] == 123 and adap[0]["is_audio"]
+    assert ws.classify_playability({"status": "OK"}, False) == "notready"
+    assert ws.classify_playability({"status": "LOGIN_REQUIRED", "reason": "Sign in to confirm your age"}, False) == "fatal"
+    assert ws.classify_playability({"status": "ERROR", "reason": "Video unavailable"}, False) == "notready"
+    assert ws.classify_playability({"status": "UNPLAYABLE", "reason": "Join this channel to get access to members-only content"}, False) == "fatal"
+
+
+def test_parse_atom_entry_deleted_and_xxe():
+    raw = atom(CH[0], "VIDVIDVID01", TS)
+    e = ws.parse_atom(raw)[0]
+    assert e["video_id"] == "VIDVIDVID01" and e["channel_id"] == CH[0] and e["published"] is not None
+    tomb = (b'<?xml version="1.0"?><feed xmlns:at="http://purl.org/atompub/tombstones/1.0" xmlns="http://www.w3.org/2005/Atom">'
+            b'<at:deleted-entry ref="yt:video:VIDVIDVID02" when="2026-11-11T00:00:00+00:00"/></feed>')
+    d = ws.parse_atom(tomb)[0]
+    assert d["deleted"] and d["video_id"] == "VIDVIDVID02"
+    with pytest.raises(ValueError):
+        ws.parse_atom(b'<?xml version="1.0"?><!DOCTYPE x [<!ENTITY a "b">]><feed/>')
+
+
+# ------------------------------------------------------------------ Excel
+def test_excel_reads_column_K_with_duplicates_and_writes_D_only(tmp_path):
+    p = tmp_path / "check.xlsx"
+    make_excel(p, [CH[0], CH[1], CH[0], "https://www.youtube.com/channel/" + CH[2]], extra_rows=2)
+    before = snapshot(p)
+    xb = ws.ExcelBook(p)
+    chans, bad = xb.read_channels()
+    assert chans == {CH[0]: [2, 4], CH[1]: [3], CH[2]: [5]} and len(bad) == 2
+    rows = xb.write_url(CH[0], "https://www.youtube.com/watch?v=VIDVIDVID01")
+    assert rows == [2, 4]
+    after = snapshot(p)
+    assert before == after                              # mọi cột khác D giữ nguyên
+    w = load_workbook(p).active
+    assert w["D2"].value == w["D4"].value == "https://www.youtube.com/watch?v=VIDVIDVID01" and w["D3"].value is None
+
+
+def test_excel_resorted_rows_written_to_correct_row(tmp_path):
+    p = tmp_path / "check.xlsx"
+    make_excel(p, [CH[0], CH[1], CH[2]])
+    xb = ws.ExcelBook(p)
+    assert xb.read_channels()[0][CH[2]] == [4]
+    wb = load_workbook(p)                               # người dùng sắp xếp lại: CH[2] lên dòng 2
+    s = wb.active
+    rows = [[c.value for c in r] for r in s.iter_rows(min_row=2)]
+    rows.sort(key=lambda r: r[10], reverse=True)
+    for i, r in enumerate(rows, start=2):
+        for j, v in enumerate(r, start=1):
+            s.cell(i, j).value = v
+    wb.save(p)
+    assert xb.write_url(CH[2], "U") == [2]
+    w = load_workbook(p).active
+    assert w["D2"].value == "U" and w["K2"].value == CH[2] and w["D4"].value is None
+
+
+def test_excel_open_lockfile_without_com_raises_locked(tmp_path):
+    p = tmp_path / "check.xlsx"
+    make_excel(p, [CH[0]])
+    xb = ws.ExcelBook(p)
+    (tmp_path / "~$check.xlsx").write_text("x")
+    with pytest.raises(ws.ExcelLocked):
+        xb.write_url(CH[0], "U")
+    assert load_workbook(p).active["D2"].value is None
+
+
+# ------------------------------------------------------------------ WebSub đầy đủ (hub giả)
+@need_ff
+def test_websub_subscribe_verify_push_download_and_excel_parallel(tmp_path, gvs, media, monkeypatch):
+    hub = FakeHub()
+    try:
+        e = make_engine(tmp_path, CH[:3] + [CH[0]], hub)
+        plans = {}
+        monkeypatch.setattr(e.resolver, "resolve", lambda vid, deadline_s=2.5: plans[vid])
+        e.start(api=False, feed=False)
+        port = e.httpd.server_address[1]
+        e.callback = f"http://127.0.0.1:{port}/websub"
+        assert e.subscribe_all() == 3                         # 3 kênh duy nhất (CH[0] trùng 2 dòng)
+        end = time.time() + 5
+        while time.time() < end and len(hub.verified) < 3:
+            time.sleep(0.05)
+        assert all(v == ("subscribe", True) for v in hub.verified.values()) and len(hub.verified) == 3
+        assert e.db.one("SELECT COUNT(*) c FROM subs WHERE state='VERIFIED'")["c"] == 3
+        assert all(r["lease_seconds"] == 432000 for r in e.db.all("SELECT * FROM subs"))
+        assert all(q["hub.topic"].startswith("https://www.youtube.com/xml/feeds/videos.xml?channel_id=") for q in hub.reqs)
+        # Excel bị khoá suốt lúc tải → download vẫn chạy xong TRƯỚC khi Excel ghi được
+        lock = tmp_path / "~$check.xlsx"
+        lock.write_text("x")
+        vid = "NEWVID00001"
+        plans[vid] = plan_prog(gvs, media, vid)
+        t0 = time.perf_counter()
+        assert hub.push(e.callback, CH[0], vid, title="video mới") == 204
+        r = wait_state(e, vid)
+        t_dl = time.perf_counter() - t0
+        assert r["state"] == "DONE", r["error"]
+        x = e.db.one("SELECT * FROM excel_jobs WHERE video_id=?", (vid,))
+        assert x["state"] != "DONE"                           # Excel vẫn đang chờ — download KHÔNG chờ Excel
+        f = Path(r["file"])
+        assert f.name == f"{vid}_360p.mp4" and f.parent.name == CH[0] and ws.ffprobe_info(f)["audio"]
+        assert r["engine"] == "WEBSUB" and r["enqueue_ms"] < 100 and r["resolver_start_ms"] < 100
+        lock.unlink()
+        x = wait_excel(e, vid)
+        assert x["state"] == "DONE" and x["rows"] == "2,5"
+        w = load_workbook(tmp_path / "check.xlsx").active
+        assert w["D2"].value == w["D5"].value == ws.video_url(vid) and w["D3"].value is None
+        assert t_dl < 10
+        # push sai chữ ký → bỏ; push trùng → không tải lại; video cũ (cập nhật) → không tải; kênh lạ → bỏ
+        assert hub.push(e.callback, CH[1], "BADSIG00001", sign=False) == 204
+        assert hub.push(e.callback, CH[0], vid) == 204
+        assert hub.push(e.callback, CH[1], "OLDVID00001", published=TS - timedelta(days=3)) == 204
+        assert hub.push(e.callback, CH[5], "FOREIGN0001", secret=e.secret) == 204
+        time.sleep(0.5)
+        assert e.db.one("SELECT COUNT(*) c FROM videos")["c"] == 1
+        assert e.db.one("SELECT why FROM seen WHERE video_id='OLDVID00001'")["why"].startswith("old:")
+        assert len(gvs.requests_for(f"/vp/{vid}")) == 1
+        e.stop()
+    finally:
+        hub.close()
+
+
+@need_ff
+def test_three_engines_same_video_downloaded_once(tmp_path, gvs, media, monkeypatch):
+    e = make_engine(tmp_path, CH[:1])
+    vid = "SAMEVID0001"
+    calls = []
+    plan = plan_prog(gvs, media, vid)
+    monkeypatch.setattr(e.resolver, "resolve", lambda v, deadline_s=2.5: calls.append(v) or plan)
+    e.start(websub=False, api=False, feed=False)
+    out = []
+    ths = [threading.Thread(target=lambda eng=eng: out.append(e.on_event(CH[0], vid, eng, TS))) for eng in ("WEBSUB", "API", "FEED") * 5]
+    [t.start() for t in ths]
+    [t.join() for t in ths]
+    assert sorted(out).count("queued") == 1 and out.count("dup") == 14
+    assert wait_state(e, vid)["state"] == "DONE" and calls == [vid]
+    e.stop()
+
+
+@need_ff
+def test_many_videos_at_once_and_latency_percentiles(tmp_path, gvs, media, monkeypatch):
+    e = make_engine(tmp_path, CH[:4], max_concurrent_downloads=3)
+    plans = {}
+    monkeypatch.setattr(e.resolver, "resolve", lambda v, deadline_s=2.5: plans[v])
+    e.start(websub=False, api=False, feed=False)
+    vids = [f"MANYVID{i:04d}" for i in range(12)]
+    for i, v in enumerate(vids):
+        plans[v] = plan_prog(gvs, media, v)
+        assert e.on_event(CH[i % 4], v, "WEBSUB", TS) == "queued"
+    rs = [wait_state(e, v, t=60) for v in vids]
+    assert all(r["state"] == "DONE" for r in rs), [(r["video_id"], r["error"]) for r in rs if r["state"] != "DONE"]
+    enq = [r["enqueue_ms"] for r in rs]
+    assert ws.pct(enq, 99) < 100
+    sts = [wait_excel(e, v)["state"] for v in vids]
+    assert set(sts) <= {"DONE", "SUPERSEDED"} and sts.count("DONE") >= 4
+    w = load_workbook(tmp_path / "check.xlsx").active
+    for i in range(4):                                     # mỗi kênh: ô D = video MỚI NHẤT của kênh đó
+        assert w[f"D{i + 2}"].value == ws.video_url(vids[8 + i])
+    e.stop()
+
+
+# ------------------------------------------------------------------ đường tải
+@need_ff
+def test_dash_360_video_plus_audio_mux(tmp_path, gvs, media, monkeypatch):
+    e = make_engine(tmp_path, CH[:1])
+    vid = "DASHVID0001"
+    vu = gvs.add("/dv", media["v"])
+    au = gvs.add("/da", media["a"])
+    plan = {"pick": {"kind": "dash", "video": mkfmt(vu, 134, 360, 'video/mp4; codecs="avc1"', len(media["v"]), adaptive=True),
+                     "audio": mkfmt(au, 140, 0, 'audio/mp4; codecs="mp4a"', len(media["a"]), adaptive=True)}}
+    monkeypatch.setattr(e.resolver, "resolve", lambda v, deadline_s=2.5: plan)
+    e.start(websub=False, api=False, feed=False)
+    e.on_event(CH[0], vid, "WEBSUB", TS)
+    r = wait_state(e, vid)
+    assert r["state"] == "DONE" and r["kind"] == "dash" and r["mux_ms"] > 0 and r["itags"] == "134,140"
+    i = ws.ffprobe_info(Path(r["file"]))
+    assert i["video"] and i["audio"] and i["height"] == 360
+    e.stop()
+
+
+@need_ff
+def test_progressive_without_audio_is_kept_with_warning(tmp_path, gvs, media, monkeypatch):
+    e = make_engine(tmp_path, CH[:1])
+    vid = "SILENTVID01"
+    monkeypatch.setattr(e.resolver, "resolve", lambda v, deadline_s=2.5: plan_prog(gvs, media, vid, data=media["silent"]))
+    e.start(websub=False, api=False, feed=False)
+    e.on_event(CH[0], vid, "WEBSUB", TS)
+    r = wait_state(e, vid)
+    assert r["state"] == "DONE" and not ws.ffprobe_info(Path(r["file"]))["audio"]
+    assert any("không có tiếng" in l for l in e._logs)
+    e.stop()
+
+
+@need_ff
+@pytest.mark.parametrize("n", [4, 8])
+def test_range_connections_and_bad_content_range_fallback(tmp_path, gvs, media, monkeypatch, n):
+    e = make_engine(tmp_path, CH[:1], range_connections=n)
+    good, bad = "RANGEGOOD01", "RANGEBADCR1"
+    plans = {good: plan_prog(gvs, media, good), bad: plan_prog(gvs, media, bad, mode="badcr", shift=7)}
+    monkeypatch.setattr(e.resolver, "resolve", lambda v, deadline_s=2.5: plans[v])
+    e.start(websub=False, api=False, feed=False)
+    e.on_event(CH[0], good, "WEBSUB", TS)
+    e.on_event(CH[0], bad, "WEBSUB", TS)
+    for v in (good, bad):
+        r = wait_state(e, v)
+        assert r["state"] == "DONE", r["error"]
+        assert Path(r["file"]).read_bytes() == media["prog"]           # không bao giờ ghép sai byte
+    assert any("Range" in l and "1 GET" in l for l in e._logs)
+    e.stop()
+
+
+@need_ff
+def test_403_then_ok_429_backoff_notready_then_ready(tmp_path, gvs, media, monkeypatch):
+    e = make_engine(tmp_path, CH[:1], retry_schedule_sec=[0.2, 0.3, 0.5, 0.5])
+    v403, vnr = "FORBID00001", "NOTREADY001"
+    p403 = plan_prog(gvs, media, v403, mode="status", code=403)
+    cnt = {"nr": 0}
+
+    def resolve(v, deadline_s=2.5):
+        if v == v403:
+            if len(gvs.requests_for(f"/vp/{v403}")) >= 1:
+                gvs.files[f"/vp/{v403}"].mode = "ok"
+            return p403
+        cnt["nr"] += 1
+        if cnt["nr"] < 3:
+            raise ws.NotReady("chưa có luồng 360p")
+        return plan_prog(gvs, media, vnr)
+    monkeypatch.setattr(e.resolver, "resolve", resolve)
+    e.start(websub=False, api=False, feed=False)
+    e.on_event(CH[0], v403, "WEBSUB", TS)
+    e.on_event(CH[0], vnr, "WEBSUB", TS)
+    r1, r2 = wait_state(e, v403), wait_state(e, vnr)
+    assert r1["state"] == "DONE" and r1["attempts"] == 2
+    assert r2["state"] == "DONE" and r2["attempts"] == 3
+    e.stop()
+
+
+def test_429_respects_retry_after_and_retry_limit_then_failed(tmp_path, gvs, media, monkeypatch):
+    e = make_engine(tmp_path, CH[:1], retry_schedule_sec=[0.1, 0.1])
+    v = "TOOMANY0001"
+    monkeypatch.setattr(e.resolver, "resolve", lambda x, deadline_s=2.5: plan_prog(gvs, media, v, mode="status", code=429,
+                                                                                    headers={"Retry-After": "1"}))
+    e.start(websub=False, api=False, feed=False)
+    e.on_event(CH[0], v, "WEBSUB", TS)
+    time.sleep(1.0)
+    r = e.db.one("SELECT * FROM videos WHERE video_id=?", (v,))
+    assert r["state"] == "RETRY_WAIT" and r["next_try"] - time.time() > 5          # 429 → chờ ≥10s, không dội liên tục
+    assert len(gvs.requests_for(f"/vp/{v}")) == 1
+    e.stop()
+    e2 = make_engine(tmp_path / "b", CH[:1], retry_schedule_sec=[0.05, 0.05]) if (tmp_path / "b").mkdir() is None else None
+    monkeypatch.setattr(e2.resolver, "resolve", lambda x, deadline_s=2.5: (_ for _ in ()).throw(ws.NotReady("x")))
+    e2.start(websub=False, api=False, feed=False)
+    e2.on_event(CH[0], "NEVERREADY1", "WEBSUB", TS)
+    r = wait_state(e2, "NEVERREADY1")
+    assert r["state"] == "FAILED" and r["attempts"] == 3
+    e2.stop()
+
+
+def test_fatal_not_retried(tmp_path, monkeypatch):
+    e = make_engine(tmp_path, CH[:1])
+    calls = []
+    monkeypatch.setattr(e.resolver, "resolve", lambda x, deadline_s=2.5: calls.append(x) or (_ for _ in ()).throw(ws.Fatal("members only")))
+    e.start(websub=False, api=False, feed=False)
+    e.on_event(CH[0], "MEMBERS0001", "WEBSUB", TS)
+    assert wait_state(e, "MEMBERS0001")["state"] == "FAILED" and calls == ["MEMBERS0001"]
+    e.stop()
+
+
+@need_ff
+def test_crash_restart_recovers_and_cleans_partials(tmp_path, gvs, media, monkeypatch):
+    e = make_engine(tmp_path, CH[:1])
+    vid = "CRASHVID001"
+    e.db.x("INSERT INTO videos(video_id, channel_id, url, engine, detected_at, state) VALUES(?,?,?,?,?,?)",
+           (vid, CH[0], ws.video_url(vid), "WEBSUB", ws.iso(), "DOWNLOADING"))
+    e.db.x("INSERT INTO excel_jobs(video_id, channel_id, url, state, created_at) VALUES(?,?,?,?,?)",
+           (vid, CH[0], ws.video_url(vid), "RETRY", ws.iso()))
+    part = tmp_path / "DOWNLOADS" / CH[0] / f".{vid}_360p.part.mp4"
+    part.parent.mkdir(parents=True, exist_ok=True)
+    part.write_bytes(b"half")
+    e.db.con.close()
+    e2 = make_engine(tmp_path, CH[:1])                    # "khởi động lại"
+    monkeypatch.setattr(e2.resolver, "resolve", lambda v, deadline_s=2.5: plan_prog(gvs, media, vid))
+    e2.start(websub=False, api=False, feed=False)
+    assert not part.exists()
+    assert wait_state(e2, vid)["state"] == "DONE"
+    assert wait_excel(e2, vid)["state"] == "DONE"
+    assert e2.on_event(CH[0], vid, "WEBSUB", TS) == "dup"
+    e2.stop()
+
+
+@need_ff
+def test_existing_valid_file_not_redownloaded_corrupt_file_replaced(tmp_path, gvs, media, monkeypatch):
+    e = make_engine(tmp_path, CH[:1])
+    v1, v2 = "EXISTOK0001", "EXISTBAD001"
+    d = tmp_path / "DOWNLOADS" / CH[0]
+    d.mkdir(parents=True)
+    (d / f"{v1}_360p.mp4").write_bytes(media["prog"])
+    (d / f"{v2}_360p.mp4").write_bytes(b"corrupt")
+    monkeypatch.setattr(e.resolver, "resolve", lambda v, deadline_s=2.5: plan_prog(gvs, media, v))
+    e.start(websub=False, api=False, feed=False)
+    e.on_event(CH[0], v1, "WEBSUB", TS)
+    e.on_event(CH[0], v2, "WEBSUB", TS)
+    assert wait_state(e, v1)["state"] == "DONE" and wait_state(e, v2)["state"] == "DONE"
+    assert not gvs.requests_for(f"/vp/{v1}") and len(gvs.requests_for(f"/vp/{v2}")) == 1
+    assert (d / f"{v2}_360p.mp4").read_bytes() == media["prog"]
+    e.stop()
+
+
+def test_truncated_download_never_marked_done(tmp_path, gvs, media, monkeypatch):
+    e = make_engine(tmp_path, CH[:1], retry_schedule_sec=[0.05])
+    v = "TRUNCATED01"
+    monkeypatch.setattr(e.resolver, "resolve", lambda x, deadline_s=2.5: plan_prog(gvs, media, v, data=media["prog"][:5000]))
+    e.start(websub=False, api=False, feed=False)
+    e.on_event(CH[0], v, "WEBSUB", TS)
+    r = wait_state(e, v)
+    assert r["state"] == "FAILED" and "ffprobe" in r["error"]
+    assert not list((tmp_path / "DOWNLOADS").rglob(f"{v}*"))
+    e.stop()
+
+
+# ------------------------------------------------------------------ Excel thêm/xoá kênh, sai kênh, chế độ tắt
+def test_excel_add_remove_channels_resubscribes(tmp_path):
+    hub = FakeHub()
+    try:
+        e = make_engine(tmp_path, CH[:2], hub)
+        e.start(api=False, feed=False, workers=False)
+        e.callback = f"http://127.0.0.1:{e.httpd.server_address[1]}/websub"
+        e.subscribe_all()
+        time.sleep(0.5)
+        make_excel(tmp_path / "check.xlsx", [CH[1], CH[2], "SAI_KENH"])
+        end = time.time() + 6
+        while time.time() < end and CH[2] not in hub.verified:
+            time.sleep(0.1)
+        time.sleep(0.4)
+        assert set(e.channels) == {CH[1], CH[2]}
+        assert hub.verified[CH[2]] == ("subscribe", True)
+        assert hub.verified[CH[0]] == ("unsubscribe", True)
+        assert any("không phải Channel ID" in l for l in e._logs)
+        assert e.on_event(CH[0], "REMOVEDCH01", "WEBSUB", TS) == "foreign"
+        e.stop()
+    finally:
+        hub.close()
+
+
+def test_callback_change_resubscribes(tmp_path):
+    hub = FakeHub()
+    try:
+        e = make_engine(tmp_path, CH[:2], hub)
+        e.start(api=False, feed=False, workers=False, websub=True)
+        port = e.httpd.server_address[1]
+        e.cfg["callback_url"] = f"http://127.0.0.1:{port}/websub"
+        end = time.time() + 6
+        while time.time() < end and len(hub.reqs) < 2:
+            time.sleep(0.1)
+        n1 = len(hub.reqs)
+        e.cfg["callback_url"] = f"http://localhost:{port}/websub"           # callback đổi
+        e.callback = ""
+        e.db.meta_set("websub_callback", f"http://127.0.0.1:{port}/websub")
+        e.stop()
+        e2 = make_engine(tmp_path, CH[:2], hub, callback_url=f"http://localhost:{port + 0}/websub")
+        e2.cfg["listen_port"] = 0
+        e2.start(api=False, feed=False, workers=False)
+        e2.cfg["callback_url"] = f"http://localhost:{e2.httpd.server_address[1]}/websub"
+        end = time.time() + 40
+        while time.time() < end and len(hub.reqs) < n1 + 2:
+            time.sleep(0.2)
+        assert len(hub.reqs) >= n1 + 2 and hub.reqs[-1]["hub.callback"].startswith("http://localhost:")
+        e2.stop()
+    finally:
+        hub.close()
+
+
+def test_download_disabled_still_writes_excel(tmp_path):
+    e = make_engine(tmp_path, CH[:1], download_enabled=False)
+    e.start(websub=False, api=False, feed=False)
+    assert e.on_event(CH[0], "NODOWNLOAD1", "WEBSUB", TS) == "queued"
+    assert wait_excel(e, "NODOWNLOAD1")["state"] == "DONE"
+    assert e.db.one("SELECT state FROM videos WHERE video_id='NODOWNLOAD1'")["state"] == "SKIPPED"
+    e.stop()
+
+
+def test_invalid_ids_rejected(tmp_path):
+    e = make_engine(tmp_path, CH[:1])
+    assert e.on_event("UCshort", "VIDVIDVID01", "WEBSUB") == "invalid"
+    assert e.on_event(CH[0], "bad id!", "WEBSUB") == "invalid"
+    e.db.con.close()
+
+
+# ------------------------------------------------------------------ feed polling (ETag, baseline) qua máy chủ giả
+def test_feed_baseline_then_new_entry_and_etag(tmp_path, monkeypatch):
+    pytest.importorskip("httpx")
+    hits = []
+    state = {"entries": [("OLDFEED0001", TS - timedelta(hours=5))], "etag": '"v1"'}
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            return
+
+        def do_GET(self):
+            hits.append(self.headers.get("If-None-Match"))
+            if self.headers.get("If-None-Match") == state["etag"]:
+                self.send_response(304)
+                self.end_headers()
+                return
+            body = b'<?xml version="1.0"?><feed xmlns:yt="http://www.youtube.com/xml/schemas/2015" xmlns="http://www.w3.org/2005/Atom">'
+            for v, p in state["entries"]:
+                body += (f'<entry><yt:videoId>{v}</yt:videoId><yt:channelId>{CH[0]}</yt:channelId><title>t</title>'
+                         f'<published>{p.isoformat()}</published></entry>').encode()
+            body += b"</feed>"
+            self.send_response(200)
+            self.send_header("ETag", state["etag"])
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    monkeypatch.setattr(ws, "FEED_FMT", f"http://127.0.0.1:{srv.server_address[1]}/feed?c={{}}")
+    e = make_engine(tmp_path, CH[:1], feed_enabled=True, feed_interval_sec=0.3, download_enabled=False, excel_enabled=False)
+    e.start(websub=False, api=False, feed=True, workers=False)
+    time.sleep(1.2)
+    assert e.db.one("SELECT why FROM seen WHERE video_id='OLDFEED0001'")["why"] == "baseline-feed"
+    assert '"v1"' in hits                                   # lần 2 gửi If-None-Match → 304
+    state["entries"].insert(0, ("NEWFEED0001", datetime.now(timezone.utc)))
+    state["etag"] = '"v2"'
+    end = time.time() + 5
+    while time.time() < end and not e.db.one("SELECT 1 FROM videos WHERE video_id='NEWFEED0001'"):
+        time.sleep(0.1)
+    r = e.db.one("SELECT * FROM videos WHERE video_id='NEWFEED0001'")
+    assert r and r["engine"] == "FEED"
+    assert not e.db.one("SELECT 1 FROM videos WHERE video_id='OLDFEED0001'")
+    e.stop()
+    srv.shutdown()
+
+
+# ------------------------------------------------------------------ GUI dựng được (offscreen)
+def test_gui_builds_offscreen(tmp_path, monkeypatch):
+    pytest.importorskip("PySide6")
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from PySide6.QtCore import QTimer
+    app = QApplication.instance() or QApplication([])
+    make_excel(tmp_path / "check.xlsx", CH[:1])
+    QTimer.singleShot(300, app.quit)
+    assert ws.run_gui(dict(ws.DEFAULT_CONFIG), tmp_path) == 0

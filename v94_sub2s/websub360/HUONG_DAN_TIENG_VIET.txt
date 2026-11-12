@@ -1,0 +1,74 @@
+YOUTUBE WEBSUB INSTANT 360P — HƯỚNG DẪN (Windows)
+====================================================
+
+TOOL LÀM GÌ
+-----------
+- Đọc Channel ID ở CỘT K của check.xlsx (cùng thư mục với tool).
+- Theo dõi các kênh bằng 3 nguồn chạy song song:
+    A. WebSub: YouTube/Google tự đẩy thông báo khi kênh có video. Nhanh nhất khi hoạt động, nhưng cần URL công khai.
+    B. YouTube Data API: dự phòng, tốn quota, cần file api_keys.txt.
+    C. Atom feed: dự phòng / bắt bù sau khi mất mạng; thường chậm vì YouTube cache.
+- Có video mới → CÙNG LÚC:
+    * tải bản 360p về DOWNLOADS\<CHANNEL_ID>\<VIDEO_ID>_360p.mp4
+    * ghi link video vào CỘT D của mọi dòng có Channel ID đó.
+  Hai việc chạy độc lập: Excel đang mở/bị khoá thì video vẫn tải xong; link được giữ trong
+  database.sqlite và ghi vào Excel khi ghi được.
+- Không cần tool tải nào khác quét Excel.
+
+CÀI ĐẶT (1 lần)
+---------------
+1. Cài Python 3.10 trở lên (lúc cài nhớ tick "Add python.exe to PATH").
+2. Đặt ffmpeg.exe và ffprobe.exe cạnh tool (hoặc trong PATH). Đã có sẵn từ tool V9 thì chép sang.
+3. Chép check.xlsx vào cùng thư mục với tool.
+4. (Tuỳ chọn) Tạo api_keys.txt, mỗi dòng 1 API key, để bật nguồn B.
+   Không có file này thì nguồn B tự tắt; WebSub và feed vẫn chạy.
+5. Nhấp đúp START.bat. Lần đầu tool tự tạo config.json từ config.example.json và cài thư viện.
+
+BẬT WEBSUB (bắt buộc nếu muốn nguồn A)
+--------------------------------------
+Google phải gọi được vào máy bạn qua internet, nên cần một đường hầm (tunnel):
+1. Đăng ký ngrok.com (miễn phí), lấy "static domain" trong mục Domains, tải ngrok.exe về cạnh tool.
+2. Chạy 1 lần:      ngrok config add-authtoken <TOKEN_CUA_BAN>
+3. Mỗi lần dùng tool, mở thêm 1 cửa sổ CMD và để nguyên:
+                    ngrok http --domain=<ten-cua-ban>.ngrok-free.app 8765
+4. Không cần sửa config: tool tự đọc URL https của ngrok (http://127.0.0.1:4040).
+   Nếu dùng Cloudflare Tunnel hay đường hầm khác thì điền "callback_url" trong config.json,
+   ví dụ: "https://ten-cua-ban.ngrok-free.app/websub".
+5. Trên giao diện, ô "WebSub đã xác minh" phải bằng số kênh.
+   HTTP 202 lúc gửi đăng ký chỉ nghĩa là hub đã nhận yêu cầu. Chỉ khi hub gọi lại và tool trả đúng
+   mã xác minh thì kênh mới tính là "đã xác minh".
+
+KIỂM TRA TRÊN MÁY BẠN (bắt buộc trước khi dùng thật)
+----------------------------------------------------
+- SELFTEST.bat: nhập ID 1 video YouTube công khai bất kỳ. Tool chạy:
+    TEST1 đọc cột K (không sửa file gốc);
+    TEST2 webhook cục bộ + URL công khai + đăng ký hub thật + chờ hub xác minh;
+    TEST3 bơm 1 sự kiện GIẢ LẬP qua đúng đường WebSub → tải 360p + ghi Excel. Bước này ghi vào BẢN SAO
+          check_TEST.xlsx, không đụng check.xlsx.
+  Kết quả nằm ở TEST_REPORT_MAY_BAN.md.
+- BENCHMARK.bat: nhập 2 ID video (1 ngắn, 1 dài). Tool thử các cấu hình 1 GET, Range x4/x8/x12/x16,
+  aria2c (nếu có) và bản V9 cũ (nếu điền "v9_path" trong config.json). Mỗi lần thử đều lấy link mới.
+  Kết quả ghi vào BENCHMARK.csv.
+  Cấu hình nào nhanh nhất và ổn định thì đặt "range_connections" trong config.json:
+  1 = 1 GET (mặc định), 4/8/... = tải nhiều kết nối.
+
+CÁC TRẠNG THÁI TẢI (xem trong database.sqlite, bảng videos)
+------------------------------------------------------------
+DETECTED/QUEUED → RESOLVING → DOWNLOADING → VERIFYING → DONE
+Lỗi tạm thời → RETRY_WAIT (thử lại sau 1,2,3,5,8,13,20,30,45,60 giây; tối đa 10 lần, rồi FAILED).
+Video thành viên, giới hạn tuổi, bị xoá → FAILED ngay, không thử lại.
+Tắt tool đột ngột: lần mở sau tool tự xoá file .part dở dang và tải lại các video chưa xong.
+Chỉ đánh dấu DONE khi ffprobe xác nhận file có hình (và có tiếng nếu nguồn có tiếng).
+
+LƯU Ý QUAN TRỌNG
+----------------
+- Tool chỉ biết video mới khi YouTube phát tín hiệu. Không tool nào bắt được video trước lúc YouTube công khai nó.
+- Video cũ được sửa (đổi tiêu đề…) cũng có thông báo WebSub. Tool chỉ coi là video MỚI khi thời gian
+  đăng còn trong "max_age_minutes" (mặc định 30 phút).
+- Mỗi dòng Excel chỉ có 1 ô D. Nếu một kênh ra 2 video gần như cùng lúc, ô D giữ link video mới nhất;
+  CẢ HAI video vẫn được tải.
+- openpyxl giữ nguyên dữ liệu và định dạng ô của các cột khác, nhưng có thể làm mất hình ảnh/biểu đồ
+  nhúng trong file. check.xlsx của bạn có hình hoặc biểu đồ thì báo tôi.
+- Excel đang mở: tool ghi trực tiếp vào cửa sổ Excel qua pywin32 (COM). Nếu COM lỗi, tool chờ tới khi
+  đóng Excel rồi mới ghi; link không bị mất.
+- Log nằm trong thư mục logs\. Log không chứa API key, secret hay link media có chữ ký.
