@@ -1,74 +1,79 @@
 YOUTUBE WEBSUB INSTANT 360P — HƯỚNG DẪN (Windows)
 ====================================================
 
-TOOL LÀM GÌ
------------
-- Đọc Channel ID ở CỘT K của check.xlsx (cùng thư mục với tool).
-- Theo dõi các kênh bằng 3 nguồn chạy song song:
-    A. WebSub: YouTube/Google tự đẩy thông báo khi kênh có video. Nhanh nhất khi hoạt động, nhưng cần URL công khai.
-    B. YouTube Data API: dự phòng, tốn quota, cần file api_keys.txt.
-    C. Atom feed: dự phòng / bắt bù sau khi mất mạng; thường chậm vì YouTube cache.
-- Có video mới → CÙNG LÚC:
-    * tải bản 360p về DOWNLOADS\<CHANNEL_ID>\<VIDEO_ID>_360p.mp4
-    * ghi link video vào CỘT D của mọi dòng có Channel ID đó.
-  Hai việc chạy độc lập: Excel đang mở/bị khoá thì video vẫn tải xong; link được giữ trong
-  database.sqlite và ghi vào Excel khi ghi được.
-- Không cần tool tải nào khác quét Excel.
+KIẾN TRÚC (duy nhất)
+--------------------
+WebSub (Google/YouTube đẩy thông báo) → nhận Video ID → TẢI 360P NGAY
+                                       → song song: GHI LINK vào cột D
+
+- Tool CHỈ dùng WebSub để biết có video mới. KHÔNG dùng feed polling, KHÔNG dùng YouTube Data API, KHÔNG quét định kỳ.
+- Danh sách kênh: các Channel ID ở CỘT K của check.xlsx (cùng thư mục với tool).
+- Video tải về: DOWNLOADS\<CHANNEL_ID>\<VIDEO_ID>_360p.mp4
+- Link video được ghi vào CỘT D của mọi dòng có Channel ID đó.
+  Excel đang mở hoặc bị khoá thì video vẫn tải; link được giữ lại và ghi khi Excel cho phép.
 
 CÀI ĐẶT (1 lần)
 ---------------
-1. Cài Python 3.10 trở lên (lúc cài nhớ tick "Add python.exe to PATH").
-2. Đặt ffmpeg.exe và ffprobe.exe cạnh tool (hoặc trong PATH). Đã có sẵn từ tool V9 thì chép sang.
+1. Cài Python 3.10 trở lên (lúc cài tick "Add python.exe to PATH").
+2. Để ffmpeg.exe và ffprobe.exe cạnh tool, hoặc trong thư mục ffmpeg\ hay ffmpeg\bin\.
 3. Chép check.xlsx vào cùng thư mục với tool.
-4. (Tuỳ chọn) Tạo api_keys.txt, mỗi dòng 1 API key, để bật nguồn B.
-   Không có file này thì nguồn B tự tắt; WebSub và feed vẫn chạy.
-5. Nhấp đúp START.bat. Lần đầu tool tự tạo config.json từ config.example.json và cài thư viện.
+4. Cài ngrok, lấy static domain (miễn phí) và chạy 1 lần:
+       ngrok config add-authtoken <TOKEN_CUA_BAN>
 
-BẬT WEBSUB (bắt buộc nếu muốn nguồn A)
---------------------------------------
-Google phải gọi được vào máy bạn qua internet, nên cần một đường hầm (tunnel):
-1. Đăng ký ngrok.com (miễn phí), lấy "static domain" trong mục Domains, tải ngrok.exe về cạnh tool.
-2. Chạy 1 lần:      ngrok config add-authtoken <TOKEN_CUA_BAN>
-3. Mỗi lần dùng tool, mở thêm 1 cửa sổ CMD và để nguyên:
-                    ngrok http --domain=<ten-cua-ban>.ngrok-free.app 8765
-4. Không cần sửa config: tool tự đọc URL https của ngrok (http://127.0.0.1:4040).
-   Nếu dùng Cloudflare Tunnel hay đường hầm khác thì điền "callback_url" trong config.json,
-   ví dụ: "https://ten-cua-ban.ngrok-free.app/websub".
-5. Trên giao diện, ô "WebSub đã xác minh" phải bằng số kênh.
-   HTTP 202 lúc gửi đăng ký chỉ nghĩa là hub đã nhận yêu cầu. Chỉ khi hub gọi lại và tool trả đúng
-   mã xác minh thì kênh mới tính là "đã xác minh".
+CHẠY HẰNG NGÀY
+--------------
+1. Mở 1 cửa sổ CMD, chạy và để nguyên:
+       ngrok http --domain=<ten-cua-ban>.ngrok-free.app 8765
+2. Nhấp đúp START.bat. Tool tự đọc URL https từ ngrok (không cần sửa config.json) rồi đăng ký cả danh sách kênh với hub.
+3. Xem trên giao diện:
+   - "WebSub đã xác minh" = số kênh mà hub ĐÃ THẬT SỰ gọi xác minh tới callback và tool đã trả đúng mã.
+     HTTP 202 lúc gửi đăng ký KHÔNG được tính.
+   - Kênh nào chưa được xác minh sẽ tự được gửi lại sau 2, 5, 10, 30, 60 phút, và log ghi rõ.
+   - Mỗi lần hub gọi xác minh đều được log. Nếu tool từ chối thì log có dòng "🚫 XÁC MINH BỊ TỪ CHỐI" kèm lý do.
+   - Lease được tự gia hạn khi đã qua 80% thời hạn. Callback hoặc secret thay đổi thì tool tự đăng ký lại toàn bộ.
 
-KIỂM TRA TRÊN MÁY BẠN (bắt buộc trước khi dùng thật)
-----------------------------------------------------
-- SELFTEST.bat: nhập ID 1 video YouTube công khai bất kỳ. Tool chạy:
-    TEST1 đọc cột K (không sửa file gốc);
-    TEST2 webhook cục bộ + URL công khai + đăng ký hub thật + chờ hub xác minh;
-    TEST3 bơm 1 sự kiện GIẢ LẬP qua đúng đường WebSub → tải 360p + ghi Excel. Bước này ghi vào BẢN SAO
-          check_TEST.xlsx, không đụng check.xlsx.
-  Kết quả nằm ở TEST_REPORT_MAY_BAN.md.
-- BENCHMARK.bat: nhập 2 ID video (1 ngắn, 1 dài). Tool thử các cấu hình 1 GET, Range x4/x8/x12/x16,
-  aria2c (nếu có) và bản V9 cũ (nếu điền "v9_path" trong config.json). Mỗi lần thử đều lấy link mới.
-  Kết quả ghi vào BENCHMARK.csv.
-  Cấu hình nào nhanh nhất và ổn định thì đặt "range_connections" trong config.json:
-  1 = 1 GET (mặc định), 4/8/... = tải nhiều kết nối.
+KÊNH CHƯA XÁC MINH (ví dụ 14/15) → DIAG.bat
+-------------------------------------------
+- Chọn 1: chẩn đoán nhanh, chạy được trong lúc tool chính đang mở.
+- Chọn 2: chẩn đoán + đăng ký lại cả danh sách rồi chờ hub xác minh tối đa 2 phút.
+  Phải TẮT tool chính và BẬT ngrok trước.
+- Kết quả ghi vào DIAG_REPORT.md: mỗi kênh 1 dòng, gồm:
+    trạng thái đăng ký, mã HTTP lúc gửi, số lần gửi, các lần hub gọi xác minh (chấp nhận/từ chối + lý do),
+    trạng thái do chính HUB GOOGLE báo (State / Last verification error / Expiration),
+    trang kênh còn tồn tại hay không (chỉ để kiểm tra Channel ID, không dùng để phát hiện video),
+    và kết luận.
+- Gửi DIAG_REPORT.md cho người hỗ trợ nếu vẫn còn kênh chưa xác minh.
 
-CÁC TRẠNG THÁI TẢI (xem trong database.sqlite, bảng videos)
-------------------------------------------------------------
-DETECTED/QUEUED → RESOLVING → DOWNLOADING → VERIFYING → DONE
-Lỗi tạm thời → RETRY_WAIT (thử lại sau 1,2,3,5,8,13,20,30,45,60 giây; tối đa 10 lần, rồi FAILED).
-Video thành viên, giới hạn tuổi, bị xoá → FAILED ngay, không thử lại.
-Tắt tool đột ngột: lần mở sau tool tự xoá file .part dở dang và tải lại các video chưa xong.
-Chỉ đánh dấu DONE khi ffprobe xác nhận file có hình (và có tiếng nếu nguồn có tiếng).
+KIỂM TRA (SELFTEST.bat) — có phân biệt GIẢ LẬP và THẬT
+------------------------------------------------------
+- Nhập ID hoặc link 1 video công khai bất kỳ.
+- TEST1  đọc cột K (không sửa check.xlsx).
+- TEST2  webhook cục bộ + callback HTTPS công khai + đăng ký hub THẬT + chờ hub xác minh. Kênh nào chưa xác minh
+         được in riêng 1 dòng kèm bằng chứng.
+- TEST3  bơm 1 sự kiện GIẢ LẬP (ghi rõ "SELFTEST (giả lập…)") qua đúng đường WebSub → tải 360p + ghi Excel.
+         Chỉ ghi vào BẢN SAO check_TEST.xlsx, tải vào DOWNLOADS_TEST\.
+- TEST6  video mới THẬT: luôn PENDING cho tới khi một kênh trong Excel thật sự đăng video lúc tool chính đang chạy.
+         Khi đó log có dòng "🔥 [WEBSUB] VIDEO MỚI …" (không có chữ SELFTEST).
+- Tool chính đang mở: SELFTEST dùng cổng / khoá / thư mục riêng và BỎ QUA bài đăng ký hub thật,
+  để không ảnh hưởng tool chính.
+- Mọi chế độ trong cùng thư mục dùng chung 1 secret HMAC (websub_secret.txt). ĐỪNG xoá hay sửa file này.
 
-LƯU Ý QUAN TRỌNG
-----------------
-- Tool chỉ biết video mới khi YouTube phát tín hiệu. Không tool nào bắt được video trước lúc YouTube công khai nó.
-- Video cũ được sửa (đổi tiêu đề…) cũng có thông báo WebSub. Tool chỉ coi là video MỚI khi thời gian
-  đăng còn trong "max_age_minutes" (mặc định 30 phút).
-- Mỗi dòng Excel chỉ có 1 ô D. Nếu một kênh ra 2 video gần như cùng lúc, ô D giữ link video mới nhất;
-  CẢ HAI video vẫn được tải.
-- openpyxl giữ nguyên dữ liệu và định dạng ô của các cột khác, nhưng có thể làm mất hình ảnh/biểu đồ
-  nhúng trong file. check.xlsx của bạn có hình hoặc biểu đồ thì báo tôi.
-- Excel đang mở: tool ghi trực tiếp vào cửa sổ Excel qua pywin32 (COM). Nếu COM lỗi, tool chờ tới khi
-  đóng Excel rồi mới ghi; link không bị mất.
-- Log nằm trong thư mục logs\. Log không chứa API key, secret hay link media có chữ ký.
+BENCHMARK.bat (tuỳ chọn)
+------------------------
+Nhập 2 ID video (1 ngắn, 1 dài). Tool thử 1 GET và Range x4/x8/x12/x16, rồi ghi BENCHMARK.csv.
+Muốn đổi cách tải thì sửa "range_connections" trong config.json. Mặc định là 1 (1 GET), cấu hình đã đạt 1.35 s trong SELFTEST.
+
+TRẠNG THÁI TẢI (database.sqlite, bảng videos)
+---------------------------------------------
+QUEUED → RESOLVING → DOWNLOADING → VERIFYING → DONE
+Lỗi tạm thời → RETRY_WAIT (thử lại 1,2,3,5,8,13,20,30,45,60 s, tối đa 10 lần) → FAILED.
+Video thành viên, giới hạn tuổi, bị xoá → FAILED ngay.
+Chỉ DONE khi ffprobe xác nhận file có hình (và có tiếng nếu nguồn có tiếng).
+
+LƯU Ý
+-----
+- WebSub của YouTube có lúc trễ, từ vài giây tới vài phút. Tool không bù bằng cách khác, vì bạn đã yêu cầu chỉ dùng WebSub.
+- Mỗi dòng chỉ có 1 ô D: kênh ra nhiều video gần nhau thì ô D giữ video MỚI ĐĂNG NHẤT. Mọi video vẫn được tải.
+- Video cũ bị sửa (đổi tiêu đề…) cũng gửi thông báo WebSub. Tool chỉ tải khi giờ đăng còn trong 30 phút
+  (max_age_minutes).
+- Ghi bằng openpyxl (khi Excel đóng) có thể làm mất hình ảnh/biểu đồ nhúng trong file.
