@@ -1,0 +1,82 @@
+WS360 — RACE MODE: WEBSUB + YOUTUBE DATA API CHẠY SONG SONG
+===========================================================
+
+3 CHẾ ĐỘ (chọn ở ô "Nguồn phát hiện" trên giao diện, hoặc "detection_mode" trong config.json)
+  WEBSUB ONLY            : chỉ WebSub (như bản trước).
+  API ONLY               : chỉ quét YouTube Data API (không cần ngrok).
+  WEBSUB + API PARALLEL  : MẶC ĐỊNH. Hai nguồn chạy cùng lúc. Nguồn nào báo video trước thì tải ngay.
+
+Cả hai nguồn đi qua CÙNG MỘT cửa: cùng SQLite, cùng bộ chống trùng, cùng hàng đợi tải, cùng Excel writer,
+cùng hàng đợi TikTok. Một video chỉ được tải 1 lần, ghi cột D 1 lần, đăng TikTok 1 lần, dù 2 nguồn cùng báo.
+Nguồn tới sau chỉ được GHI NHẬN để so sánh tốc độ.
+
+Nếu nguồn thắng báo video nhưng YouTube chưa cho tải (video vừa đăng, link chưa sẵn sàng → tool đang chờ thử lại),
+khi nguồn còn lại cũng báo video đó, tool THỬ LẠI NGAY thay vì chờ hết lịch. Có giới hạn: mỗi nguồn kích tối đa 1 lần,
+không chen khi đang tải, không thử sớm khi YouTube trả 403/429 (phải giãn đúng lịch), không tăng số lần thử tối đa.
+
+CHUẨN BỊ API (chỉ cần cho API ONLY / PARALLEL)
+----------------------------------------------
+1. Đổi tên api_keys.example.txt thành api_keys.txt, điền key. Mỗi dòng:   TEN_PROJECT|KEY
+   QUAN TRỌNG: quota là của PROJECT Google Cloud, không phải của key. Các key CÙNG 1 project phải ghi CÙNG tên project,
+   nếu không tool sẽ tưởng mỗi key có 10.000 đơn vị và tiêu vượt quota thật (Google sẽ báo quotaExceeded).
+2. Không có api_keys.txt: chế độ PARALLEL tự chạy như WEBSUB ONLY (log báo rõ), API ONLY sẽ không có nguồn nào.
+
+QUOTA VÀ NHỊP QUÉT (tự động, không bao giờ vượt quota)
+-------------------------------------------------------
+- Mỗi lần hỏi 1 kênh = 1 đơn vị quota. Mỗi project mặc định 10.000 đơn vị/ngày; Google reset lúc 0h giờ Thái Bình Dương
+  (14h hoặc 15h giờ Việt Nam). Tool đếm theo từng project, lưu vào database.sqlite (khởi động lại không đếm lại từ 0)
+  và chỉ dùng tối đa 95% ("api_quota_safety").
+- Nhịp quét = quota còn lại chia đều tới lúc reset. Ví dụ thật:
+    15 kênh, 1 project  → mỗi kênh được hỏi khoảng 136 giây/lần (KHÔNG thể 0,2 giây).
+    15 kênh, 20 project → khoảng 7 giây/lần.
+  "api_min_interval_sec" (ô "API nhanh nhất", mặc định 1 s) là mức NHANH NHẤT, chỉ đạt khi quota dư.
+- GIỜ VÀNG (khuyến nghị nếu kênh hay đăng đúng giờ, giống ô On/Off của tool cũ): trong config.json
+      "api_hot_windows": ["20:58-21:03", {"time": "08:59-09:01", "channels": ["UCxxxxxxxxxxxxxxxxxxxxxx"]}]
+  Tool dành quota cho giờ vàng trước (quét nhanh nhất có thể trong khung đó), phần còn lại chia cho giờ thường.
+  Quota không đủ → ngoài giờ vàng tạm ngừng quét API (WebSub vẫn chạy nếu chế độ PARALLEL).
+- Google báo hết quota (quotaExceeded) → project đó ngừng tới lúc reset; key sai/bị chặn → loại key, log chỉ ghi
+  dấu vân tay key#xxxxxx, KHÔNG BAO GIỜ in key. Key gửi trong header, không nằm trong URL.
+- Log định kỳ: "📊 API_QUOTA_USED 1234/9500 | project-mot 600/9500 | … | nhịp quét: thường 136.0 s/kênh".
+
+ĐÃ SỬA SO VỚI TOOL QUÉT CŨ (quetphantichid V41)
+-----------------------------------------------
+- Quét TIẾP sau mỗi video (tool cũ dừng kênh sau video đầu tiên).
+- KHÔNG mở trình duyệt YouTube, KHÔNG thêm dòng mới vào Excel (chỉ ghi link vào cột D đúng hàng của kênh như WebSub).
+- Không gọi API lần 2 để lấy tiêu đề: activities.list đã có tiêu đề.
+- Chỉ nhận hoạt động "upload". Hoạt động "playlistItem" (thêm video, có thể là video cũ, vào playlist) bị bỏ qua.
+- Lần hỏi đầu tiên mỗi kênh là "mốc": video cũ không tải; video còn mới (cùng bộ lọc tuổi như WebSub,
+  max_age_minutes) thì tải.
+- Âm báo: điền "alert_wav": "C:\\duong\\dan\\bao.wav" trong config.json (để trống = tắt).
+
+TÊN FILE MỚI
+------------
+  <tiêu đề công khai>_<VIDEO_ID>.mp4      ví dụ: 母が決めたある特殊ルールのせいで小5で100kgを超えたんだが…_TI8R0XUakKw.mp4
+- Tiêu đề lấy từ WebSub hoặc API (nguồn thắng). Không có tiêu đề → lấy tiêu đề do bước lấy link tải trả về (không tốn
+  thêm request). Vẫn không có → <VIDEO_ID>_360p.mp4 như cũ.
+- Ký tự Windows cấm  < > : " / \ | ? *  được đổi thành bản full-width trông giống hệt (：？／…), để tiêu đề giữ nguyên nghĩa.
+- Bỏ ký tự ẩn/điều khiển và emoji 4 byte (ChromeDriver không gõ được đường dẫn có emoji → TikTok không gắn được file).
+- Tiêu đề tối đa 100 ký tự ("filename_title_max"); toàn bộ đường dẫn ≤ 240 ký tự ("filename_max_path").
+- Hai video khác nhau ra cùng tên → thêm " (2)". Tên đã chọn được lưu trong SQLite, khởi động lại vẫn giữ.
+- Video ID luôn ở cuối tên = định danh nội bộ. File tạm vẫn là .<VIDEO_ID>.part.mp4; uploader TikTok nhận đúng
+  đường dẫn file cuối sau khi ffprobe xác minh.
+- Muốn tên kiểu cũ: "filename_mode": "ID_360P".
+- Lưu ý: TikTok thường lấy tên file làm chú thích nháp — vì vậy tên file giờ là tiêu đề.
+
+LOG MỚI
+-------
+  🔥 WEBSUB_DETECTED <ID> | WINNER=WEBSUB | …           nguồn thắng (tải ngay)
+  📡 API_DETECTED <ID> | WINNER=WEBSUB | API chậm hơn 2350 ms   nguồn tới sau (chỉ ghi nhận)
+  🏁 DETECTION_TO_DOWNLOAD_DONE <ID> = 1180 ms (WINNER=WEBSUB) | file: <tên file>
+  🎬 TikTok <profile>: <ID> → CONFIRMED | DOWNLOAD_DONE_TO_TIKTOK_ATTACH=… ms | …
+  📊 API_QUOTA_USED …
+  🔔 <ID>: API cũng báo có video → thử lấy link tải lại NGAY
+
+SO SÁNH WEBSUB ↔ API (BENCHMARK THẬT)
+-------------------------------------
+Chạy chế độ PARALLEL bình thường. Mỗi video mới được ghi giờ phát hiện của TỪNG nguồn (cùng đồng hồ, cùng tiến trình).
+Nhấp đúp BAO_CAO_RACE.bat → RACE_BENCHMARK.md + RACE_BENCHMARK.csv: số lần mỗi nguồn thắng, dẫn trước bao nhiêu ms,
+trễ bao lâu sau giờ đăng, nhịp quét API lúc đó. Cần ít nhất ~10 video cả hai nguồn cùng thấy mới nên kết luận.
+Lưu ý công bằng: tốc độ của API phụ thuộc nhịp quét (tức là số project bạn có). Với 1 project và 15 kênh, API chỉ
+hỏi mỗi kênh ~136 giây/lần, tức là trung bình phải chờ ~68 giây mới hỏi lại đúng kênh vừa đăng — đây là ƯỚC TÍNH từ
+nhịp quét, KHÔNG phải kết quả đo. Muốn API có cơ hội thắng cần nhiều project hoặc giờ vàng. Kết luận nguồn nào nhanh
+hơn chỉ dựa vào RACE_BENCHMARK.md trên máy bạn.

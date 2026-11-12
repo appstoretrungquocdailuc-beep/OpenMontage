@@ -1,0 +1,13 @@
+# FILE KEY YOUTUBE DATA API — đổi tên file này thành api_keys.txt rồi điền key thật.
+# KHÔNG gửi file api_keys.txt cho ai. Tool không bao giờ in key ra log (chỉ in dấu vân tay key#xxxxxx).
+#
+# Mỗi dòng 1 key, dạng:   TEN_PROJECT|KEY
+#   TEN_PROJECT = tên/ID Google Cloud project chứa key đó (đặt gì cũng được, miễn các key CÙNG project ghi CÙNG tên).
+#   Quota 10.000 đơn vị/ngày là của PROJECT, không phải của key: 5 key trong 1 project vẫn chỉ có 10.000/ngày.
+# Nếu project được Google nâng quota:   TEN_PROJECT|KEY|50000
+# Chỉ ghi KEY (không có tên project) → tool coi mỗi key là 1 project riêng (chỉ đúng khi mỗi key nằm ở project khác nhau).
+#
+# Ví dụ:
+# project-mot|AIzaSy................................
+# project-mot|AIzaSy................................
+# project-hai|AIzaSy................................

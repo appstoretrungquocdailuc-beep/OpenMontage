@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-YOUTUBE WEBSUB INSTANT 360P — phát hiện video mới CHỈ bằng WebSub/PubSubHubbub → TẢI 360P NGAY
+YOUTUBE WEBSUB INSTANT 360P — phát hiện video mới bằng WebSub/PubSubHubbub và/hoặc YouTube Data API (RACE MODE:
+                                 WEBSUB_ONLY | API_ONLY | PARALLEL) → TẢI 360P NGAY
                                  và GHI URL VÀO EXCEL (cột D theo Channel ID cột K) SONG SONG.
 
 Đường nóng:  sự kiện hợp lệ → chống trùng (SQLite + RAM) → HÀNG ĐỢI TẢI ƯU TIÊN  ┐  (độc lập)
@@ -15,6 +16,7 @@ Chạy:   python YOUTUBE_WEBSUB_INSTANT_360P.py              (giao diện PySide
         python YOUTUBE_WEBSUB_INSTANT_360P.py --selftest [--video ID]   (TEST 1–3, 5 → TEST_REPORT.md)
         python YOUTUBE_WEBSUB_INSTANT_360P.py --bench ID [ID ...] [--reps 3]  (TEST 4 → BENCHMARK.csv)
         python YOUTUBE_WEBSUB_INSTANT_360P.py --diag [--resubscribe]   (chẩn đoán từng kênh WebSub → DIAG_REPORT.md)
+        python YOUTUBE_WEBSUB_INSTANT_360P.py --race-report  (so sánh WebSub ↔ API trên dữ liệu thật → RACE_BENCHMARK.md)
 
 Không in secret WebSub / URL media có chữ ký ra log.
 """
@@ -38,6 +40,7 @@ import sys
 import threading
 import time
 import traceback
+import unicodedata
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -99,7 +102,7 @@ DEFAULT_CONFIG = {
     "max_concurrent_downloads": 3,
     "v9_path": "",                     # đường dẫn V9_4_SUB2S.py (chỉ dùng để benchmark so sánh)
     "verify_retry_sec": [120, 300, 600, 1800, 3600],   # hub chưa gọi xác minh sau X s → gửi lại (giãn dần)
-    "atomic_rename": False,            # False (theo yêu cầu): tải THẲNG vào VIDEO_ID_360p.mp4, không đổi tên;
+    "atomic_rename": False,            # False (theo yêu cầu): tải THẲNG vào tên file cuối, không đổi tên;
                                        # True: tải vào .part rồi os.replace (chậm hơn trên Windows có Defender)
     "callback_generation": True,
     # ---- TÍCH HỢP ĐĂNG TIKTOK (TAM) — chạy chung tiến trình ----
@@ -111,8 +114,26 @@ DEFAULT_CONFIG = {
     "open_concurrency": 2,             # số profile Genlogin mở CÙNG LÚC khi khởi động
     "max_parallel_uploads": 4,         # số phiên upload TikTok đồng thời tối đa (backpressure)
     "upload_retry_failed_safe": 1,     # lỗi TRƯỚC khi bấm Post (an toàn) → thử lại tối đa N lần
-    "tiktok_dry_run": False,           # True: chạy hết tới khi nút Post sáng rồi DỪNG, KHÔNG bấm Post       # callback = …/websub?g=<dấu vân tay secret>: đổi secret ⇒ thuê bao MỚI hoàn toàn
+    "tiktok_dry_run": False,           # True: chạy hết tới khi nút Post sáng rồi DỪNG, KHÔNG bấm Post
+    # ---- NGUỒN PHÁT HIỆN (RACE MODE) ----
+    "detection_mode": "PARALLEL",      # WEBSUB_ONLY | API_ONLY | PARALLEL (WebSub + API chạy đồng thời, nguồn nào tới trước thắng)
+    "api_keys_file": "api_keys.txt",   # mỗi dòng: TEN_PROJECT|KEY  (hoặc chỉ KEY = 1 project riêng)
+    "api_quota_per_project": 10000,    # quota/ngày của 1 Google Cloud project (mặc định Google cấp 10.000)
+    "api_project_quota": {},           # quota riêng từng project nếu được Google nâng: {"TEN_PROJECT": 50000}
+    "api_quota_safety": 0.95,          # chỉ tiêu tối đa 95% quota (chừa phần cho sai số / dùng tay)
+    "api_min_interval_sec": 1.0,       # nhịp NHANH NHẤT cho 1 kênh (chỉ đạt được khi quota đủ — tool tự giãn)
+    "api_hot_windows": [],             # giờ vàng (giờ máy): ["20:58-21:03", {"time": "08:59-09:01", "channels": ["UC…"]}]
+    "api_concurrency": 8,
+    "api_timeout_sec": 4.0,
+    "api_quota_log_sec": 300,
+    "api_url": "",                     # trống = https://www.googleapis.com/youtube/v3/activities
+    "alert_wav": "",                   # file .wav phát khi có video mới (Windows); trống = tắt
+    # ---- TÊN FILE ----
+    "filename_mode": "TITLE_ID",       # TITLE_ID: '<tiêu đề>_<VIDEO_ID>.mp4' | ID_360P: '<VIDEO_ID>_360p.mp4' (kiểu cũ)
+    "filename_title_max": 100,         # số ký tự tối đa của phần tiêu đề
+    "filename_max_path": 240,          # tổng độ dài đường dẫn tối đa (Windows giới hạn 260)
 }
+MODES = ("WEBSUB_ONLY", "API_ONLY", "PARALLEL")
 
 
 # =============================== TIỆN ÍCH =============================== #
@@ -159,6 +180,47 @@ def extract_vid(v) -> str | None:
         return v
     m = re.search(r"(?:v=|/shorts/|youtu\.be/|/live/|/embed/)([0-9A-Za-z_-]{11})", v)
     return m.group(1) if m else None
+
+
+# ---------------- tên file theo tiêu đề ---------------- #
+_WIN_FORBIDDEN = {'<': '＜', '>': '＞', ':': '：', '"': '＂', '/': '／', '\\': '＼', '|': '｜', '?': '？', '*': '＊'}
+
+
+def safe_title(title, max_len=100) -> str:
+    """Tiêu đề công khai → phần tên file an toàn trên Windows.
+    • 9 ký tự cấm < > : " / \\ | ? * → bản full-width trông giống hệt (giữ nguyên nghĩa tiêu đề);
+    • bỏ ký tự điều khiển, ký tự định dạng ẩn (zero-width, đảo chiều chữ RLO…) và ký tự ngoài BMP (emoji 4 byte:
+      ChromeDriver không gõ được → TikTok không gắn được file);
+    • gộp khoảng trắng/xuống dòng; bỏ dấu chấm/khoảng trắng ở đầu & cuối (đầu '.' = file ẩn/tạm);
+    • cắt theo max_len ký tự."""
+    out = []
+    for c in unicodedata.normalize("NFC", str(title or "")):
+        if c in _WIN_FORBIDDEN:
+            out.append(_WIN_FORBIDDEN[c])
+            continue
+        cat = unicodedata.category(c)
+        if c in "\t\r\n" or cat == "Zs" or cat in ("Zl", "Zp"):
+            out.append(" ")
+        elif cat in ("Cc", "Cf", "Cs", "Co", "Cn") or ord(c) > 0xFFFF:
+            continue
+        else:
+            out.append(c)
+    t = re.sub(r" {2,}", " ", "".join(out)).strip(" .")
+    if max_len > 0 and len(t) > max_len:
+        t = t[:max_len].rstrip(" .")
+    return t
+
+
+def build_filename(title, vid, folder: Path, mode="TITLE_ID", title_max=100, max_path=240, n=1) -> str:
+    """'<tiêu đề>_<VIDEO_ID>.mp4' (Video ID luôn ở cuối = định danh nội bộ). Không có tiêu đề hợp lệ → '<VIDEO_ID>_360p.mp4'."""
+    suffix = f" ({n})" if n > 1 else ""
+    if str(mode).upper() != "TITLE_ID":
+        return f"{vid}_360p{suffix.replace(' ', '')}.mp4"
+    budget = int(max_path) - len(str(folder)) - 1 - len(f"_{vid}.mp4") - len(suffix)
+    t = safe_title(title, max(0, min(int(title_max), budget)))
+    if not t:
+        return f"{vid}_360p{suffix.replace(' ', '')}.mp4"
+    return f"{t}{suffix}_{vid}.mp4"
 
 
 def port_free(host, port) -> bool:
@@ -229,6 +291,19 @@ def find_tool(name):
 FFMPEG = find_tool("ffmpeg")
 FFPROBE = find_tool("ffprobe")
 ARIA2C = find_tool("aria2c")
+
+
+def norm_mode(v) -> str:
+    v = str(v or "").strip().upper().replace(" ", "_").replace("+", "_")
+    if v in MODES:
+        return v
+    if "API" in v and "WEBSUB" in v or v in ("RACE", "BOTH", "PARALLEL_RACE"):
+        return "PARALLEL"
+    if v.startswith("API"):
+        return "API_ONLY"
+    if v.startswith("WEBSUB"):
+        return "WEBSUB_ONLY"
+    return "PARALLEL"
 
 
 def load_config(path: Path) -> dict:
@@ -326,6 +401,10 @@ class DB:
     CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
     CREATE TABLE IF NOT EXISTS hub_events(id INTEGER PRIMARY KEY AUTOINCREMENT, at REAL, channel_id TEXT, kind TEXT,
       mode TEXT, http INTEGER, accepted INTEGER, detail TEXT);
+    CREATE TABLE IF NOT EXISTS detections(video_id TEXT, source TEXT, channel_id TEXT, t_wall REAL, detected_at TEXT,
+      winner INTEGER, lag_ms REAL, published_at TEXT, title TEXT, api_interval_s REAL, baseline INTEGER DEFAULT 0,
+      mode TEXT, PRIMARY KEY(video_id, source));
+    CREATE TABLE IF NOT EXISTS api_quota(project TEXT, day TEXT, used INTEGER, PRIMARY KEY(project, day));
     """
 
     def __init__(self, path: Path):
@@ -344,6 +423,7 @@ class DB:
                 except sqlite3.OperationalError:
                     pass
             for alter in ("ALTER TABLE excel_jobs ADD COLUMN order_key TEXT",     # nâng cấp DB cũ
+                          "ALTER TABLE videos ADD COLUMN target_file TEXT",       # tên file cuối đã chọn (giữ qua khởi động lại)
                           "ALTER TABLE subs ADD COLUMN attempts INTEGER DEFAULT 0",
                           "ALTER TABLE subs ADD COLUMN last_http INTEGER",
                           "ALTER TABLE subs ADD COLUMN secret_fp TEXT",          # secret gửi trong lần subscribe gần nhất
@@ -1121,30 +1201,43 @@ class Engine:
         self.on_excel_reload = None   # TÍCH HỢP TikTok: Excel đổi → cập nhật ánh xạ Profile↔Kênh
         self.tiktok_on = False        # chỉ video phát hiện khi bật tích hợp mới được đăng (không đăng video cũ)
         self._badsig_resub = {}       # kênh → lần cuối đăng ký lại vì chữ ký sai
+        self.mode = norm_mode(cfg.get("detection_mode", "PARALLEL"))
+        self.race = {}                # video → {winner, ns{nguồn}, wall{nguồn}} (đo WebSub ↔ API trong cùng tiến trình)
+        self.retry_gen = {}           # video → thế hệ lần thử lại hiện hành (tín hiệu nguồn thứ 2 → thử lại sớm)
+        self.retry_jobs = {}
+        self.nudged = set()           # (video, nguồn) đã kích thử lại sớm — mỗi nguồn tối đa 1 lần / video
+        self.name_lock = threading.Lock()
+        self.api = None               # ApiScanner khi chế độ có API
+        self.websub_on = False
         self.threads = []
         self.httpd = None
         self.callback = ""
         self.stats = {"detected": 0, "downloading": 0, "done": 0, "failed": 0, "excel_ok": 0, "excel_pending": 0,
                       "excel_err": 0, "websub_verified": 0, "webhook": "OFF",
-                      "last": {}, "speed_mbps": 0.0, "pushes": 0}
+                      "last": {}, "speed_mbps": 0.0, "pushes": 0, "wins_websub": 0, "wins_api": 0, "mode": self.mode}
         self.flags = {"download": bool(cfg.get("download_enabled", True)), "excel": bool(cfg.get("excel_enabled", True)),
 }
         self.dl_dir = base / cfg.get("download_dir", "DOWNLOADS")
         self.dl_dir.mkdir(parents=True, exist_ok=True)
 
     # ---------------- vòng đời ---------------- #
-    def start(self, websub=True, workers=True, excel_watch=True):
+    def start(self, websub=True, workers=True, excel_watch=True, api=None):
+        """websub/api theo detection_mode. api=None: bật API chỉ khi là lần chạy ĐẦY ĐỦ (websub=True) — SELFTEST/DIAG/HUBTEST
+        (websub=False) không bao giờ tiêu quota API."""
+        api = websub if api is None else api
         with self.life_lock:                              # start/stop không bao giờ chạy chồng nhau
             self._acquire_instance_lock()
             self.stop_ev.clear()
             try:
-                self._start_inner(websub, workers, excel_watch)
+                self._start_inner(websub and self.mode != "API_ONLY", workers, excel_watch,
+                                  api and self.mode in ("API_ONLY", "PARALLEL"))
             except Exception:
                 self.stop_ev.set()
                 self._stop_inner()
                 raise
 
-    def _start_inner(self, websub, workers, excel_watch):
+    def _start_inner(self, websub, workers, excel_watch, api=False):
+        self.websub_on = bool(websub)
         self.reload_channels(initial=True)
         self.recover()
         self.resolver.warm()
@@ -1157,6 +1250,15 @@ class Engine:
         if websub:
             self.start_webhook()
             self._spawn(self._websub_subscriber, "WEBSUB-SUB")
+        if api:
+            sys.path.insert(0, str(BASE_DIR))
+            from ws360_api_scanner import ApiScanner
+            self.api = ApiScanner(self, self.cfg, self.log, self.base)
+            if not self.api.start():
+                self.api = None
+        self.log(f"🏁 Chế độ phát hiện: {self.mode} | WebSub {'BẬT' if websub else 'TẮT'} | API {'BẬT' if self.api else 'TẮT'}"
+                 + (" (thiếu key → thực tế chỉ còn WebSub)" if self.mode == "PARALLEL" and api and not self.api else "")
+                 + (" (thiếu key → KHÔNG có nguồn phát hiện nào!)" if self.mode == "API_ONLY" and api and not self.api else ""))
         self._spawn(self._stats_loop, "STATS")
         if workers and FFPROBE:
             self._spawn(self._ff_keepwarm, "FF-WARM")
@@ -1203,6 +1305,12 @@ class Engine:
             self._stop_inner()
 
     def _stop_inner(self):
+        if self.api is not None:                          # ngừng nguồn API trước (không phát hiện thêm khi đang tắt)
+            try:
+                self.api.stop()
+            except Exception:
+                pass
+            self.api = None
         self.stop_ev.set()
         if self.httpd:
             try:
@@ -1275,7 +1383,7 @@ class Engine:
                 if res is None:
                     continue                      # đọc lỗi (file đang ghi dở…) → giữ 'last' cũ, lần sau đọc lại
                 last = s
-                if res[0]:
+                if res[0] and self.websub_on:              # API_ONLY: không đăng ký hub
                     self.subscribe_all(list(res[0]))
                 if self.on_excel_reload is not None:
                     try:
@@ -1289,8 +1397,9 @@ class Engine:
 
     # ---------------- XỬ LÝ SỰ KIỆN (đường nóng) ---------------- #
     def on_event(self, ch: str, vid: str, engine: str, published: datetime | None = None, title="",
-                 t_recv_ns: int | None = None) -> str:
-        """Gọi từ webhook WebSub. KHÔNG chặn: chỉ chống trùng + đưa vào 2 hàng đợi độc lập."""
+                 t_recv_ns: int | None = None, race=True, extra=None) -> str:
+        """Gọi từ webhook WebSub VÀ từ API scanner (cùng 1 hàm = cùng bộ chống trùng nguyên tử). KHÔNG chặn: chỉ chống trùng
+        + đưa vào 2 hàng đợi độc lập. Nguồn tới SAU chỉ được ghi nhận (đo race) và có thể kích thử lại sớm."""
         t_recv_ns = t_recv_ns or time.perf_counter_ns()
         if not VID_RE.match(vid or "") or not norm_channel(ch):
             return "invalid"
@@ -1300,14 +1409,33 @@ class Engine:
             age = (now_utc() - published).total_seconds()
             if not self.is_new_video(published):
                 # KHÔNG đánh dấu 'đã thấy' vĩnh viễn: chỉ ghi nhật ký để có thể xem lại
-                self.hub_event(ch, "push-old", "", None, 0, f"{vid} published {iso(published)} tuổi {int(age)}s")
+                self.hub_event(ch, "push-old", "", None, 0, f"{vid} published {iso(published)} tuổi {int(age)}s ({engine})")
                 with self.seen_lock:
                     self.old_logged.add(vid)
                 return "old"
-        with self.seen_lock:
-            if vid in self.seen:
-                return "dup"
-            self.seen.add(vid)
+        wall = time.time()
+        extra = extra or {}
+        with self.seen_lock:                              # kiểm + đánh dấu trong 1 khoá: 2 nguồn cùng lúc → đúng 1 bên thắng
+            dup = vid in self.seen
+            rec = self.race.get(vid)
+            if not dup:
+                self.seen.add(vid)
+                rec = self.race[vid] = {"winner": engine, "ns": {engine: t_recv_ns}, "wall": {engine: wall}}
+                first_src = True
+            else:
+                if rec is None:
+                    rec = self.race[vid] = {"winner": None, "ns": {}, "wall": {}}
+                first_src = engine not in rec["ns"]
+                if first_src:
+                    rec["ns"][engine] = t_recv_ns
+                    rec["wall"][engine] = wall
+        if dup:
+            if first_src and race:
+                try:
+                    self._second_signal(vid, ch, engine, rec, title, published, wall, t_recv_ns, extra)
+                except Exception as e:  # noqa: BLE001
+                    self.log(f"⚠️ ghi nhận nguồn thứ 2 cho {vid} lỗi: {type(e).__name__}: {e}")
+            return "dup"
         url = video_url(vid)
         meta = {"title": title, "engine": engine, "published": iso(published) if published else None, "detected_at": iso()}
         okey = meta["published"] or meta["detected_at"]  # thứ tự "mới nhất" cho ô D: theo giờ đăng
@@ -1323,17 +1451,77 @@ class Engine:
         stmts = [("INSERT OR IGNORE INTO videos(video_id, channel_id, url, title, engine, detected_at, published_at, state, "
                   "enqueue_ms) VALUES(?,?,?,?,?,?,?,?,?)",
                   (vid, ch, url, title, engine, meta["detected_at"], meta["published"],
-                   "QUEUED" if self.flags["download"] else "SKIPPED", enq_ms))]
+                   "QUEUED" if self.flags["download"] else "SKIPPED", enq_ms)),
+                 ("INSERT OR IGNORE INTO detections(video_id, source, channel_id, t_wall, detected_at, winner, lag_ms, "
+                  "published_at, title, api_interval_s, baseline, mode) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                  (vid, engine, ch, wall, meta["detected_at"], 1, 0.0, meta["published"], title,
+                   extra.get("api_interval_s"), 1 if extra.get("baseline") else 0, self.mode))]
         if self.tiktok_on:
             stmts.append(("UPDATE videos SET tiktok=1 WHERE video_id=?", (vid,)))
         if self.flags["excel"]:
             stmts.append(("INSERT OR IGNORE INTO excel_jobs(video_id, channel_id, url, state, created_at, order_key) "
                           "VALUES(?,?,?,?,?,?)", (vid, ch, url, "PENDING", iso(), okey)))
-        self.db.tx(stmts)                                 # 2 bản ghi cùng 1 giao dịch
+        self.db.tx(stmts)                                 # các bản ghi cùng 1 giao dịch
         self.stats["detected"] += 1
+        self.stats["wins_api" if engine == "API" else "wins_websub"] += 1
+        self._alert()
         age_s = f" | tuổi {(now_utc() - published).total_seconds():.1f}s" if published else ""
-        self.log(f"🔥 [{engine}] VIDEO MỚI {vid} | kênh {ch} | nhận→hàng đợi {enq_ms:.3f} ms{age_s} | {title[:60]}")
+        self.log(f"🔥 {engine}_DETECTED {vid} | WINNER={engine} | [{engine}] VIDEO MỚI | kênh {ch} | nhận→hàng đợi "
+                 f"{enq_ms:.3f} ms{age_s}" + (" | mốc khởi động API" if extra.get("baseline") else "") + f" | {title[:60]}")
         return "queued"
+
+    def _second_signal(self, vid, ch, engine, rec, title, published, wall, t_ns, extra):
+        """Nguồn còn lại cũng thấy video: ghi đo race, bổ sung tiêu đề, và nếu link tải CHƯA sẵn sàng → thử lại sớm."""
+        win = rec.get("winner")
+        lag = None
+        if win and win in rec["ns"] and win != engine:
+            lag = (t_ns - rec["ns"][win]) / 1e6
+        if lag is None:                                   # nguồn thắng ở lần chạy trước → so bằng đồng hồ máy
+            r = self.db.one("SELECT source, t_wall FROM detections WHERE video_id=? AND winner=1", (vid,))
+            if r is not None and r["source"] != engine:
+                win, lag = r["source"], (wall - float(r["t_wall"] or wall)) * 1000
+            elif r is None:
+                v = self.db.one("SELECT engine FROM videos WHERE video_id=?", (vid,))
+                win = v["engine"] if v is not None else None
+        if not win or win == engine:
+            return                                        # cùng 1 nguồn gửi lại (vd WebSub cập nhật) → không phải race
+        rec["winner"] = win
+        self.db.x("INSERT OR IGNORE INTO detections(video_id, source, channel_id, t_wall, detected_at, winner, lag_ms, "
+                  "published_at, title, api_interval_s, baseline, mode) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                  (vid, engine, ch, wall, iso(), 0, None if lag is None else round(lag, 3),
+                   iso(published) if published else None, title, extra.get("api_interval_s"), 0, self.mode))
+        row = self.db.one("SELECT state, title FROM videos WHERE video_id=?", (vid,))
+        if row is not None and title and not (row["title"] or "").strip():
+            self.db.x("UPDATE videos SET title=? WHERE video_id=? AND (title IS NULL OR title='')", (title, vid))
+        self.log(f"📡 {engine}_DETECTED {vid} | WINNER={win} | {engine} chậm hơn "
+                 + (f"{lag:.0f} ms" if lag is not None else "? ms") + f" | trạng thái tải: {row['state'] if row else '?'}")
+        if row is not None and row["state"] == "RETRY_WAIT":
+            self._nudge(vid, engine)
+
+    def _nudge(self, vid, src):
+        """Có kiểm soát: mỗi nguồn tối đa 1 lần/video, chỉ khi đang CHỜ thử lại (không chen lúc đang tải), không tăng số lần
+        thử tối đa. Lần chờ cũ bị huỷ nhờ 'thế hệ' (không chạy 2 lần)."""
+        with self.active_lock:
+            if (vid, src) in self.nudged or vid in self.active or vid not in self.retry_jobs:
+                return
+            self.nudged.add((vid, src))
+            g = self.retry_gen.get(vid, 0) + 1
+            self.retry_gen[vid] = g
+            job = dict(self.retry_jobs[vid], not_before=0, gen=g, nudged_by=src)
+        self.dlq.put((time.time(), next(self.seq), job))
+        self.log(f"🔔 {vid}: {src} cũng báo có video → thử lấy link tải lại NGAY (không chờ hết lịch thử lại)")
+
+    def _alert(self):
+        wav = str(self.cfg.get("alert_wav") or "")
+        if not wav or os.name != "nt":
+            return
+        try:
+            import winsound
+            p = Path(wav) if Path(wav).is_absolute() else self.base / wav
+            if p.is_file():
+                winsound.PlaySound(str(p), winsound.SND_FILENAME | winsound.SND_ASYNC)
+        except Exception:
+            pass
 
     def _db_insert_video(self, vid, ch, meta, state, enq_ms=None):
         self.db.x("INSERT OR IGNORE INTO videos(video_id, channel_id, url, title, engine, detected_at, published_at, state, enqueue_ms)"
@@ -1375,7 +1563,9 @@ class Engine:
             self.xlq.put({"vid": r["video_id"], "ch": r["channel_id"], "url": r["url"], "t_enq_ns": time.perf_counter_ns(),
                           "okey": r["order_key"] or r["created_at"] or ""})
             m += 1
-        for p in self.dl_dir.rglob("*.part*"):
+        for p in self.dl_dir.rglob(".*"):              # CHỈ file tạm của tool (luôn bắt đầu bằng '.'): tiêu đề có
+            if not p.is_file() or ".part" not in p.name.lower():   # chữ '.Part' KHÔNG bao giờ bị xoá nhầm
+                continue
             try:
                 p.unlink()
             except OSError:
@@ -1389,6 +1579,8 @@ class Engine:
             _, _, job = self.dlq.get()
             if job is None:
                 return
+            if "gen" in job and self.retry_gen.get(job["vid"]) != job["gen"]:
+                continue                                  # lần chờ cũ đã được thay bằng lần thử sớm (tín hiệu nguồn thứ 2)
             nt = job.get("not_before", 0)
             if nt and time.time() < nt:
                 # chưa tới giờ thử lại: đặt lại hàng đợi theo thời điểm, ngủ ngắn (không chặn sự kiện mới vì priority theo thời gian)
@@ -1414,6 +1606,9 @@ class Engine:
             if vid in self.active:                        # không bao giờ 2 worker cùng 1 video
                 return "BUSY"
             self.active.add(vid)
+            self.retry_jobs.pop(vid, None)                # đang chạy → không còn 'đang chờ thử lại'
+            if "gen" in job:
+                self.retry_gen[vid] = job["gen"] + 1      # mọi bản sao cũ của job trong hàng đợi đều hết hiệu lực
         attempts = 0
         parts = []
         cancel = threading.Event()
@@ -1426,27 +1621,36 @@ class Engine:
             if row and row["state"] in ("DONE", "FAILED", "SKIPPED"):
                 return row["state"]
             attempts = int(row["attempts"] if row else 0)
-            final = self.dl_dir / ch / f"{vid}_360p.mp4"
-            if final.exists():
-                v = ffprobe_info(final)
+            title = ((row["title"] if row else "") or job.get("title") or "").strip()
+            legacy = self.dl_dir / ch / f"{vid}_360p.mp4"
+            final = Path(row["target_file"]) if row is not None and row["target_file"] else \
+                (self._choose_target(vid, ch, title) if title else None)       # tiêu đề từ WebSub/API: KHÔNG gọi API thêm
+            for cand in dict.fromkeys(c for c in (final, legacy) if c is not None):
+                if not cand.exists():
+                    continue
+                v = ffprobe_info(cand)
                 exp = row["expected_size"] if row and "expected_size" in row.keys() else None
-                if exp and final.stat().st_size != int(exp):   # file dở do tắt giữa chừng (tải thẳng, không .part)
+                if exp and cand.stat().st_size != int(exp):    # file dở do tắt giữa chừng (tải thẳng, không .part)
                     v = dict(v, ok=False)
                 if v["ok"]:
-                    self.db.upd(vid, state="DONE", file=str(final), size=final.stat().st_size, error=None)
-                    self.log(f"✅ {vid} đã có file hợp lệ — không tải lại")
+                    self.db.upd(vid, state="DONE", file=str(cand), size=cand.stat().st_size, error=None)
+                    self.log(f"✅ {vid} đã có file hợp lệ ({cand.name}) — không tải lại")
                     return "DONE"
-                final.unlink(missing_ok=True)
-            final.parent.mkdir(parents=True, exist_ok=True)
+                cand.unlink(missing_ok=True)
+            (self.dl_dir / ch).mkdir(parents=True, exist_ok=True)
             t_start = time.perf_counter_ns()
             k = {}
             if job.get("t_recv_ns"):
                 k["resolver_start_ms"] = ms(job["t_recv_ns"], t_start)
             db_res = self.db.upd(vid, state="RESOLVING", attempts=attempts + 1, **k)
             tag = f"{vid}.a{attempts + 1}"                # tên tạm RIÊNG cho từng lần thử
-            tmpdir = final.parent
             plan = self.resolver.resolve(vid)
             t_res = time.perf_counter_ns()
+            if final is None:                             # WebSub/API không có tiêu đề → dùng tiêu đề resolver vừa trả (miễn phí)
+                if plan.get("title") and not title:
+                    self.db.x("UPDATE videos SET title=? WHERE video_id=? AND (title IS NULL OR title='')", (plan["title"], vid))
+                final = self._choose_target(vid, ch, plan.get("title") or "")
+            tmpdir = final.parent
             pick = plan["pick"]
             exp_size = int(pick["video"].get("clen") or 0) if pick["kind"] == "progressive" else 0
             db_dl = self.db.upd(vid, state="DOWNLOADING", resolver_ms=ms(t_start, t_res), kind=pick["kind"],
@@ -1541,6 +1745,10 @@ class Engine:
             self.stats["last"] = {"vid": vid, "resolver_ms": ms(t_start, t_res), "download_ms": dl_ms, "mux_ms": mux_ms,
                                   "verify_ms": verify_ms, "total_ms": total}
             itags = ",".join(str(f["itag"]) for f in (pick["video"], pick["audio"]) if f)
+            det = self.race.get(vid) or {}
+            self.log(f"🏁 DETECTION_TO_DOWNLOAD_DONE {vid} = "
+                     + (f"{total:.0f} ms (WINNER={det.get('winner') or job.get('engine') or '?'})" if job.get("t_recv_ns")
+                        else "không đo (job khôi phục sau khởi động lại)") + f" | file: {final.name}")
             self.log(f"✅ DONE {vid} | {pick['kind']} itag {itags} | {size / 1e6:.2f} MB | resolver {ms(t_start, t_res):.0f} ms "
                      f"({plan.get('source')}) | TTFB {info_v.get('ttfb_ms')} ms | tải {dl_ms:.0f} ms ≈{mbps} Mbps | "
                      f"mux {mux_ms or 0:.0f} ms | verify {verify_ms:.0f} ms | TỔNG {total:.0f} ms | "
@@ -1563,9 +1771,16 @@ class Engine:
             wait = sched[min(attempts, len(sched) - 1)]
             if isinstance(e, HttpStatus) and e.code == 429:
                 wait = max(wait, float(e.retry_after or 0), 10.0)
+            with self.active_lock:
+                if isinstance(e, HttpStatus) and e.code in (403, 429):
+                    self.nudged |= {(vid, "API"), (vid, "WEBSUB")}   # 403/429: tôn trọng giãn cách, không thử sớm
+                g = self.retry_gen.get(vid, 0) + 1
+                self.retry_gen[vid] = g
+                job = dict(job, not_before=time.time() + wait, gen=g)
+                self.retry_jobs[vid] = job
             self.db.upd(vid, state="RETRY_WAIT", next_try=time.time() + wait, error=f"{type(e).__name__}: {str(e)[:200]}")
-            self.log(f"⏳ {vid}: {type(e).__name__}: {redact(str(e))[:160]} → thử lại sau {wait}s (lần {attempts + 1}/{len(sched)})")
-            job = dict(job, not_before=time.time() + wait)
+            self.log(f"⏳ {vid}: {type(e).__name__}: {redact(str(e))[:160]} → thử lại sau {wait}s (lần {attempts + 1}/{len(sched)})"
+                     + (" — nếu nguồn phát hiện còn lại báo video này, thử lại ngay" if self.mode == "PARALLEL" else ""))
             self.dlq.put((job["not_before"], next(self.seq), job))
             return "RETRY_WAIT"
         finally:
@@ -1581,6 +1796,26 @@ class Engine:
                     pass
             with self.active_lock:
                 self.active.discard(vid)
+
+    def _choose_target(self, vid, ch, title) -> Path:
+        """Chọn TÊN FILE CUỐI 1 lần rồi lưu SQLite (khởi động lại vẫn đúng tên). Chống trùng: tên đã thuộc video KHÁC
+        (so không phân biệt hoa/thường như Windows) → thêm ' (2)', ' (3)'…"""
+        folder = self.dl_dir / ch
+        with self.name_lock:
+            r = self.db.one("SELECT target_file FROM videos WHERE video_id=?", (vid,))
+            if r is not None and r["target_file"]:
+                return Path(r["target_file"])
+            p = None
+            for n in range(1, 100):
+                name = build_filename(title, vid, folder, self.cfg.get("filename_mode", "TITLE_ID"),
+                                      int(self.cfg.get("filename_title_max", 100)), int(self.cfg.get("filename_max_path", 240)), n)
+                p = folder / name
+                clash = self.db.one("SELECT video_id FROM videos WHERE video_id<>? AND (lower(target_file)=lower(?) "
+                                    "OR lower(file)=lower(?))", (vid, str(p), str(p)))
+                if clash is None:
+                    break
+            self.db.upd(vid, target_file=str(p))
+            return p
 
     def _fetch(self, fmt, dest, info, n, cancel=None):
         size = int(fmt.get("clen") or 0)
@@ -2278,6 +2513,11 @@ class Engine:
                     self.db.meta_set("last_alive", time.time())     # đo thời gian tắt cho cửa sổ 'video mới'
                 except Exception:
                     pass
+            if n % 600 == 0:                                         # bỏ dữ liệu race cũ hơn 3 giờ khỏi RAM
+                lim = time.time() - 10800
+                with self.seen_lock:
+                    for v in [v for v, r in self.race.items() if max(r["wall"].values() or [0]) < lim]:
+                        self.race.pop(v, None)
             if self.on_stats:
                 try:
                     s = dict(self.stats)
@@ -2285,6 +2525,8 @@ class Engine:
                     br = getattr(self, "bridge", None)
                     if br is not None:
                         s["tiktok"] = br.snapshot()
+                    if self.api is not None:
+                        s["api"] = self.api.snapshot()
                     self.on_stats(s)
                 except Exception:
                     pass
@@ -2311,7 +2553,8 @@ def attach_tiktok(engine, cfg, log, tam=None):
 def run_gui(cfg, base):
     from PySide6.QtCore import QObject, Signal, Qt
     from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
-                                   QPlainTextEdit, QCheckBox, QComboBox, QSpinBox, QTableWidget, QTableWidgetItem)
+                                   QPlainTextEdit, QCheckBox, QComboBox, QSpinBox, QDoubleSpinBox, QTableWidget,
+                                   QTableWidgetItem)
 
     class Bridge(QObject):
         line = Signal(str)
@@ -2337,6 +2580,25 @@ def run_gui(cfg, base):
         top.addWidget(c)
     top.addStretch(1)
     lay.addLayout(top)
+    # ---- hàng NGUỒN PHÁT HIỆN (RACE MODE) ----
+    det = QHBoxLayout()
+    cb_det = QComboBox()
+    det_labels = {"WEBSUB_ONLY": "WEBSUB ONLY", "API_ONLY": "API ONLY", "PARALLEL": "WEBSUB + API PARALLEL"}
+    for k, t in det_labels.items():
+        cb_det.addItem(t, k)
+    cb_det.setCurrentIndex(list(det_labels).index(norm_mode(cfg.get("detection_mode", "PARALLEL"))))
+    sp_iv = QDoubleSpinBox()
+    sp_iv.setRange(0.2, 600.0)
+    sp_iv.setDecimals(1)
+    sp_iv.setSuffix(" s")
+    sp_iv.setValue(float(cfg.get("api_min_interval_sec", 1.0)))
+    sp_iv.setToolTip("Nhịp NHANH NHẤT mỗi kênh. Tool tự giãn theo quota thật (không bao giờ vượt quota).")
+    kf = Path(cfg.get("api_keys_file") or "api_keys.txt")
+    lb_keys = QLabel(f"File key: {kf.name}" + ("" if (kf if kf.is_absolute() else base / kf).exists() else " (CHƯA CÓ)"))
+    for wdg in (QLabel("Nguồn phát hiện:"), cb_det, QLabel("API nhanh nhất:"), sp_iv, lb_keys):
+        det.addWidget(wdg)
+    det.addStretch(1)
+    lay.addLayout(det)
     # ---- hàng TikTok (TAM) ----
     tt = QHBoxLayout()
     c_tt = QCheckBox("Tự đăng TikTok")
@@ -2360,6 +2622,8 @@ def run_gui(cfg, base):
              ("pushes", "Push WebSub nhận"), ("detected", "Video mới"), ("downloading", "Đang tải"),
              ("done", "Tải xong"), ("failed", "Lỗi tải"), ("speed_mbps", "Tốc độ (Mbps)"), ("resolver_ms", "Resolver (ms)"),
              ("download_ms", "Tải (ms)"), ("mux_ms", "Mux (ms)"), ("total_ms", "Tổng (ms)"), ("excel", "Excel"),
+             ("mode", "Chế độ phát hiện"), ("wins", "Thắng: WebSub / API"), ("api_status", "API"),
+             ("api_quota", "API_QUOTA_USED"), ("api_interval", "Nhịp quét API"), ("api_polls", "API gọi / lỗi / ms"),
              ("tt_genlogin", "Genlogin/Selenium"), ("tt_opened", "Profile đã mở"), ("tt_ready", "Profile READY"),
              ("tt_waiting", "Job chờ đăng"), ("tt_uploading", "Đang đăng"), ("tt_confirmed", "POST_CONFIRMED"),
              ("tt_bad", "UNKNOWN/FAILED"), ("tt_held", "Giữ lại (thiếu profile/file)"), ("tt_last", "Lần đăng gần nhất")]
@@ -2394,6 +2658,14 @@ def run_gui(cfg, base):
                  "tt_bad": t.get("unknown_failed"), "tt_held": t.get("held"),
                  "tt_last": (f"{tl.get('vid')} {tl.get('result')} | DONE→gắn {tl.get('done_to_attach_ms')} ms | "
                              f"WebSub→xác nhận {tl.get('websub_to_confirm_ms')} ms") if tl else None}
+        a = s.get("api") or {}
+        extra.update({"mode": det_labels.get(s.get("mode"), s.get("mode")),
+                      "wins": f"{s.get('wins_websub', 0)} / {s.get('wins_api', 0)}",
+                      "api_status": (f"{a.get('status')} | {a.get('keys')} key / {a.get('projects')} project | "
+                                     f"phát hiện {a.get('detected')}") if a else "TẮT",
+                      "api_quota": a.get("quota"), "api_interval": (f"{a.get('interval')}" + (
+                          f" | giờ vàng {a.get('hot_interval')}" if a.get("hot_interval") not in (None, "-") else "")) if a else None,
+                      "api_polls": f"{a.get('polls')} / {a.get('errors')} / {a.get('last_ms')}" if a else None})
         for k in labels:
             v = extra[k] if k in extra else s.get(k, last.get(k))
             if k == "excel":
@@ -2413,6 +2685,10 @@ def run_gui(cfg, base):
         cfg["tiktok_dry_run"] = c_dry.isChecked()
         cfg["prewarm_mode"] = cb_mode.currentText()
         cfg["open_concurrency"] = sp_open.value()
+        cfg["detection_mode"] = cb_det.currentData()
+        cfg["api_min_interval_sec"] = sp_iv.value()
+        cb_det.setEnabled(False)
+        sp_iv.setEnabled(False)
         e = Engine(cfg, base, log, on_stats=br.stats.emit)
         state["eng"] = e
         if cfg["tiktok_enabled"]:
@@ -2449,7 +2725,7 @@ def run_gui(cfg, base):
             finally:
                 br.stopped.emit()
         threading.Thread(target=_bg, daemon=True).start()
-    br.stopped.connect(lambda: (b_start.setEnabled(True), b_stop.setEnabled(False)))
+    br.stopped.connect(lambda: (b_start.setEnabled(True), b_stop.setEnabled(False), cb_det.setEnabled(True), sp_iv.setEnabled(True)))
     br.started.connect(lambda: b_stop.setEnabled(True))
     b_start.clicked.connect(start)
     b_stop.clicked.connect(stop)
@@ -3033,6 +3309,69 @@ def bench(cfg, base, ids, reps=3):
     log(f"📄 Đã ghi {out}")
 
 
+def race_report(db: "DB", out_dir: Path | None = None) -> dict:
+    """So sánh WebSub ↔ API trên dữ liệu THẬT trong database.sqlite (bảng detections). Không suy diễn: video chỉ 1 nguồn
+    thấy được ghi riêng; không đủ dữ liệu → PENDING."""
+    rows = db.all("SELECT * FROM detections WHERE baseline=0 ORDER BY t_wall")
+    by = {}
+    for r in rows:
+        by.setdefault(r["video_id"], {})[r["source"]] = r
+    both, only = [], {"WEBSUB": [], "API": []}
+    for vid, d in by.items():
+        if "WEBSUB" in d and "API" in d:
+            w, a = d["WEBSUB"], d["API"]
+            win = "WEBSUB" if w["winner"] else ("API" if a["winner"] else ("WEBSUB" if w["t_wall"] <= a["t_wall"] else "API"))
+            lag = (a if win == "WEBSUB" else w)["lag_ms"]
+            if lag is None:
+                lag = abs(a["t_wall"] - w["t_wall"]) * 1000
+            pub = parse_time(w["published_at"] or a["published_at"])
+            both.append({"video_id": vid, "channel_id": w["channel_id"], "published_at": iso(pub) if pub else "",
+                         "websub_at": w["detected_at"], "api_at": a["detected_at"], "winner": win, "lead_ms": round(lag, 1),
+                         "websub_after_publish_s": round(w["t_wall"] - pub.timestamp(), 1) if pub else None,
+                         "api_after_publish_s": round(a["t_wall"] - pub.timestamp(), 1) if pub else None,
+                         "api_interval_s": a["api_interval_s"], "mode": w["mode"] or a["mode"]})
+        else:
+            for src in d:
+                if d[src]["mode"] == "PARALLEL":
+                    only[src].append(vid)
+    ws_w = [x for x in both if x["winner"] == "WEBSUB"]
+    ap_w = [x for x in both if x["winner"] == "API"]
+    res = {"pairs": len(both), "websub_wins": len(ws_w), "api_wins": len(ap_w),
+           "websub_lead_ms_p50": pct([x["lead_ms"] for x in ws_w], 50), "websub_lead_ms_p90": pct([x["lead_ms"] for x in ws_w], 90),
+           "api_lead_ms_p50": pct([x["lead_ms"] for x in ap_w], 50), "api_lead_ms_p90": pct([x["lead_ms"] for x in ap_w], 90),
+           "websub_after_publish_p50_s": pct([x["websub_after_publish_s"] for x in both], 50),
+           "api_after_publish_p50_s": pct([x["api_after_publish_s"] for x in both], 50),
+           "only_websub": len(only["WEBSUB"]), "only_api": len(only["API"]), "rows": both,
+           "verdict": "PENDING (chưa có video nào được CẢ HAI nguồn phát hiện ở chế độ PARALLEL)" if not both else
+           (f"Trên {len(both)} video thật: WebSub tới trước {len(ws_w)} lần, API tới trước {len(ap_w)} lần"
+            + (" — ÍT DỮ LIỆU, chưa đủ để kết luận" if len(both) < 10 else ""))}
+    if out_dir is not None:
+        with open(out_dir / "RACE_BENCHMARK.csv", "w", newline="", encoding="utf-8-sig") as f:
+            cols = ["video_id", "channel_id", "published_at", "websub_at", "api_at", "winner", "lead_ms",
+                    "websub_after_publish_s", "api_after_publish_s", "api_interval_s", "mode"]
+            w_ = csv.DictWriter(f, fieldnames=cols)
+            w_.writeheader()
+            for x in both:
+                w_.writerow(x)
+        md = ["# RACE BENCHMARK — WebSub ↔ YouTube Data API (dữ liệu THẬT từ database.sqlite)", "",
+              f"Tạo lúc {iso()} | {VERSION}", "", f"**Kết luận: {res['verdict']}**", "",
+              "| Chỉ số | Giá trị |", "|---|---|",
+              f"| Video cả 2 nguồn cùng thấy | {res['pairs']} |",
+              f"| WebSub tới trước | {res['websub_wins']} (dẫn p50 {res['websub_lead_ms_p50']} ms, p90 {res['websub_lead_ms_p90']} ms) |",
+              f"| API tới trước | {res['api_wins']} (dẫn p50 {res['api_lead_ms_p50']} ms, p90 {res['api_lead_ms_p90']} ms) |",
+              f"| WebSub: trễ sau giờ đăng (p50) | {res['websub_after_publish_p50_s']} s |",
+              f"| API: trễ sau giờ đăng (p50) | {res['api_after_publish_p50_s']} s |",
+              f"| Chỉ WebSub thấy (PARALLEL) | {res['only_websub']} |", f"| Chỉ API thấy (PARALLEL) | {res['only_api']} |", "",
+              "Ghi chú: 'trễ sau giờ đăng' dùng giờ đăng YouTube (độ chính xác ~1 s) so với đồng hồ máy — lệch giờ máy làm "
+              "sai số này; còn 'dẫn trước' (ms) đo bằng CÙNG đồng hồ trong 1 tiến trình nên chính xác. Tốc độ API phụ thuộc "
+              "nhịp quét lúc đó (cột api_interval_s): quota ít → nhịp thưa → API chậm hơn.", "",
+              "| Video | Kênh | Thắng | Dẫn (ms) | WebSub sau đăng (s) | API sau đăng (s) | Nhịp API (s) |", "|---|---|---|---|---|---|---|"]
+        md += [f"| {x['video_id']} | {x['channel_id']} | {x['winner']} | {x['lead_ms']} | {x['websub_after_publish_s']} | "
+               f"{x['api_after_publish_s']} | {x['api_interval_s']} |" for x in both[-200:]]
+        (out_dir / "RACE_BENCHMARK.md").write_text("\n".join(md) + "\n", encoding="utf-8")
+    return res
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=f"YouTube WebSub Instant 360P {VERSION}")
     ap.add_argument("--headless", action="store_true")
@@ -3048,6 +3387,8 @@ def main(argv=None):
     ap.add_argument("--bench360", nargs="*", help="đo đường tải thật N lượt/video → BENCH360.csv (median/p90 từng bước)")
     ap.add_argument("--integrated", action="store_true", help="bật sẵn tự đăng TikTok (TAM) khi mở giao diện / headless")
     ap.add_argument("--dry-run-post", action="store_true", help="tích hợp: chạy tới khi nút Post sáng rồi DỪNG, không bấm")
+    ap.add_argument("--mode", default="", help="WEBSUB_ONLY | API_ONLY | PARALLEL (ghi đè detection_mode trong config.json)")
+    ap.add_argument("--race-report", action="store_true", help="so sánh WebSub ↔ API trên dữ liệu thật → RACE_BENCHMARK.md/.csv")
     a = ap.parse_args(argv)
     base = BASE_DIR
     os.chdir(base)
@@ -3056,6 +3397,12 @@ def main(argv=None):
         cfg["tiktok_enabled"] = True
     if a.dry_run_post:
         cfg["tiktok_dry_run"] = True
+    if a.mode:
+        cfg["detection_mode"] = norm_mode(a.mode)
+    if a.race_report:
+        r = race_report(DB(base / "database.sqlite"), base)
+        print(f"{r['verdict']}\n→ RACE_BENCHMARK.md / RACE_BENCHMARK.csv")
+        return 0
     if a.selftest:
         vid = extract_vid(a.video) if a.video else None
         if a.video and not vid:

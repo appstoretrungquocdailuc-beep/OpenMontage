@@ -309,7 +309,7 @@ def test_websub_subscribe_verify_push_download_and_excel_parallel(tmp_path, gvs,
         x = e.db.one("SELECT * FROM excel_jobs WHERE video_id=?", (vid,))
         assert x["state"] != "DONE"                           # Excel vẫn đang chờ — download KHÔNG chờ Excel
         f = Path(r["file"])
-        assert f.name == f"{vid}_360p.mp4" and f.parent.name == CH[0] and ws.ffprobe_info(f)["audio"]
+        assert f.name == f"video mới_{vid}.mp4" and f.parent.name == CH[0] and ws.ffprobe_info(f)["audio"]
         assert r["engine"] == "WEBSUB" and r["enqueue_ms"] < 100 and r["resolver_start_ms"] < 100
         lock.unlink()
         x = wait_excel(e, vid)
@@ -840,20 +840,22 @@ class MockYT:
 
 
 def test_websub_only_architecture_no_polling_no_api(tmp_path):
-    """Kiến trúc duy nhất: WebSub → tải. Không còn feed polling / Data API / quét định kỳ."""
+    """Chế độ WEBSUB_ONLY: chỉ WebSub → tải. Không feed polling (ở mọi chế độ), không có luồng API.
+    Data API chỉ nằm trong module riêng ws360_api_scanner (chỉ chạy ở API_ONLY / PARALLEL)."""
     assert ws.TOPIC_FMT == "https://www.youtube.com/xml/feeds/videos.xml?channel_id={}"
     for name in ("FEED_FMT", "FEED_PLAYLIST_FMT"):
         assert not hasattr(ws, name)
     for name in ("_api_loop", "_feed_main", "_feed_one", "_feed_thread"):
         assert not hasattr(ws.Engine, name)
     src = (HERE.parent / "YOUTUBE_WEBSUB_INSTANT_360P.py").read_text(encoding="utf-8")
-    assert "googleapis.com/youtube/v3" not in src and "feeds/videos.xml?channel_id" not in src.replace(ws.TOPIC_FMT, "")
-    e = make_engine(tmp_path, CH[:2])
+    assert "feeds/videos.xml?channel_id" not in src.replace(ws.TOPIC_FMT, "")
+    (tmp_path / "api_keys.txt").write_text("P1|AIza" + "x" * 35 + "\n")      # có key nhưng chế độ WEBSUB_ONLY → không quét
+    e = make_engine(tmp_path, CH[:2], detection_mode="WEBSUB_ONLY")
     before = {t.name for t in threading.enumerate()}
     e.start()
     names = {t.name for t in threading.enumerate()} - before
     assert not [n for n in names if any(k in n.upper() for k in ("FEED", "API", "POLL"))], names
-    assert "WEBSUB-SUB" in names and "WEBHOOK" in names
+    assert "WEBSUB-SUB" in names and "WEBHOOK" in names and e.api is None
     e.stop()
 
 

@@ -8,3 +8,5 @@ DOWNLOADS*/
 config.json
 check*.xlsx
 __pycache__/
+api_keys.txt
+RACE_BENCHMARK.*

@@ -352,7 +352,8 @@ class TikTokBridge:
 
     def _check_file(self, job) -> str:
         p = Path(job["path"])
-        if p.name.startswith(".") or ".part" in p.name.lower():
+        if p.name.startswith(".") or p.name.lower().endswith((".part", ".part.mp4", ".part.v", ".part.a")):
+            # file tạm của WS360 LUÔN bắt đầu bằng '.' — tiêu đề có chữ 'Part' (vd 'Vol.Part 2_<ID>.mp4') vẫn hợp lệ
             return "file tạm (.part) — không bao giờ upload"
         if not p.is_file():
             return "file không tồn tại"
@@ -456,7 +457,8 @@ class TikTokBridge:
                         self._set(job, "FAILED", reason=str(res.reason)[:300], **timing)
                         self.stats["unknown_failed"] += 1
                 self.stats["last"] = dict(timing, vid=job["vid"], pid=s.pid, result=st)
-                self.log(f"🎬 TikTok {s.pid}: {job['vid']} → {st} | DONE→gắn file {timing.get('done_to_attach_ms')} ms "
+                self.log(f"🎬 TikTok {s.pid}: {job['vid']} → {st} | DOWNLOAD_DONE_TO_TIKTOK_ATTACH={timing.get('done_to_attach_ms')} ms "
+                         f"| file {Path(job['path']).name} | DONE→gắn file {timing.get('done_to_attach_ms')} ms "
                          f"(DONE→hàng đợi {timing.get('done_to_enqueue_ms')}, →worker nhận {timing.get('enqueue_to_received_ms')}, "
                          f"→gắn {timing.get('received_to_attach_ms')}) | gắn→POST_READY {timing.get('attach_to_post_ready_ms')} | "
                          f"click→xác nhận {timing.get('click_to_confirm_ms')} | WebSub→xác nhận {timing.get('websub_to_confirm_ms')} ms"

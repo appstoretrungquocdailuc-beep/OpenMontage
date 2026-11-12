@@ -4,8 +4,8 @@ HỆ THỐNG TÍCH HỢP: WS360 (YouTube WebSub → tải 360p) + TAM (đăng Ti
 NHẤN START MỘT LẦN → tool tự làm:
   đọc Excel (cột K = Channel ID YouTube, cột C = PROFILE ID TikTok, cùng hàng)
   → mở sẵn đúng các profile Genlogin + vào trang TikTok Studio Upload
-  → theo dõi YouTube bằng WebSub (CHỈ WebSub, không quét)
-  → có video mới: tải 360p (file tạm .<VIDEO_ID>.part.mp4 → kiểm tra → đổi tên <VIDEO_ID>_360p.mp4)
+  → theo dõi YouTube bằng WebSub và/hoặc YouTube Data API (chế độ RACE — xem HUONG_DAN_RACE_API.txt)
+  → có video mới: tải 360p (file tạm .<VIDEO_ID>.part.mp4 → kiểm tra → đổi tên <tiêu đề>_<VIDEO_ID>.mp4)
   → giao NGAY cho đúng profile (không MOVE, không quét thư mục, không đọc lại Excel, không mở lại profile)
   → gắn file → chờ nút Post sáng → bấm → chỉ báo THÀNH CÔNG khi TikTok xác nhận (POST_CONFIRMED).
   Song song: ghi link YouTube vào cột D như trước.

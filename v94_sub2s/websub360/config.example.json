@@ -47,5 +47,20 @@
   "open_concurrency": 2,
   "max_parallel_uploads": 4,
   "upload_retry_failed_safe": 1,
-  "tiktok_dry_run": false
+  "tiktok_dry_run": false,
+  "detection_mode": "PARALLEL",
+  "api_keys_file": "api_keys.txt",
+  "api_quota_per_project": 10000,
+  "api_project_quota": {},
+  "api_quota_safety": 0.95,
+  "api_min_interval_sec": 1.0,
+  "api_hot_windows": [],
+  "api_concurrency": 8,
+  "api_timeout_sec": 4.0,
+  "api_quota_log_sec": 300,
+  "api_url": "",
+  "alert_wav": "",
+  "filename_mode": "TITLE_ID",
+  "filename_title_max": 100,
+  "filename_max_path": 240
 }

@@ -1,14 +1,15 @@
 YOUTUBE WEBSUB INSTANT 360P — HƯỚNG DẪN (Windows)
 ====================================================
 
-KIẾN TRÚC (duy nhất)
---------------------
+KIẾN TRÚC
+---------
 WebSub (Google/YouTube đẩy thông báo) → nhận Video ID → TẢI 360P NGAY
                                        → song song: GHI LINK vào cột D
 
-- Tool CHỈ dùng WebSub để biết có video mới. KHÔNG dùng feed polling, KHÔNG dùng YouTube Data API, KHÔNG quét định kỳ.
+- Nguồn phát hiện: WEBSUB ONLY | API ONLY | WEBSUB + API PARALLEL (mặc định) — xem HUONG_DAN_RACE_API.txt.
+  Không có api_keys.txt → chỉ WebSub như trước. KHÔNG dùng feed polling.
 - Danh sách kênh: các Channel ID ở CỘT K của check.xlsx (cùng thư mục với tool).
-- Video tải về: DOWNLOADS\<CHANNEL_ID>\<VIDEO_ID>_360p.mp4
+- Video tải về: DOWNLOADS\<CHANNEL_ID>\<tiêu đề>_<VIDEO_ID>.mp4 (không có tiêu đề → <VIDEO_ID>_360p.mp4). Xem HUONG_DAN_RACE_API.txt
 - Link video được ghi vào CỘT D của mọi dòng có Channel ID đó.
   Excel đang mở hoặc bị khoá thì video vẫn tải; link được giữ lại và ghi khi Excel cho phép.
 
@@ -119,7 +120,7 @@ in median/p90 từng bước, ghi BENCH360.csv. Không đụng Excel, database h
 
 KHÔNG ĐỔI TÊN FILE (atomic_rename = false, mặc định theo yêu cầu)
 ----------------------------------------------------------------
-Video được tải THẲNG vào DOWNLOADS\<kênh>\<video>_360p.mp4. Chỉ đánh dấu DONE khi ffprobe đạt VÀ dung lượng đúng bằng
+Video được tải THẲNG vào DOWNLOADS\<kênh>\<tiêu đề>_<video>.mp4. Chỉ đánh dấu DONE khi ffprobe đạt VÀ dung lượng đúng bằng
 dung lượng YouTube báo. Lỗi → xoá file. Tắt giữa chừng → lần sau phát hiện file thiếu dung lượng và tải lại.
 Lưu ý: trong lúc tải (khoảng 1 giây), file đã xuất hiện nhưng chưa đủ. Tool đăng TikTok của bạn có bước chờ file
 "đứng yên" (TAM_STABLE_MS) nên không đăng file dở. Muốn file chỉ xuất hiện khi đã đủ: đặt "atomic_rename": true.
