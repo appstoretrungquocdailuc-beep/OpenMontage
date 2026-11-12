@@ -255,7 +255,7 @@ class DB:
     CREATE TABLE IF NOT EXISTS excel_jobs(
       id INTEGER PRIMARY KEY AUTOINCREMENT, video_id TEXT, channel_id TEXT, url TEXT, state TEXT,
       attempts INTEGER DEFAULT 0, next_try REAL DEFAULT 0, error TEXT, created_at TEXT, done_at TEXT,
-      write_ms REAL, rows TEXT, UNIQUE(video_id, channel_id));
+      write_ms REAL, rows TEXT, order_key TEXT, UNIQUE(video_id, channel_id));
     CREATE TABLE IF NOT EXISTS seen(video_id TEXT PRIMARY KEY, channel_id TEXT, why TEXT, at TEXT);
     CREATE TABLE IF NOT EXISTS subs(channel_id TEXT PRIMARY KEY, callback TEXT, requested_at REAL,
       verified_at REAL, lease_seconds INTEGER, state TEXT, last_push REAL, error TEXT);
@@ -270,6 +270,22 @@ class DB:
         with self.lock:
             self.con.executescript(self.SCHEMA)
             self.con.execute("PRAGMA synchronous=NORMAL")
+            try:                                          # nâng cấp DB cũ
+                self.con.execute("ALTER TABLE excel_jobs ADD COLUMN order_key TEXT")
+            except sqlite3.OperationalError:
+                pass
+
+    def tx(self, stmts):
+        """Nhiều câu lệnh trong MỘT giao dịch (không bao giờ ghi nửa chừng)."""
+        with self.lock:
+            self.con.execute("BEGIN IMMEDIATE")
+            try:
+                for sql, args in stmts:
+                    self.con.execute(sql, args)
+                self.con.execute("COMMIT")
+            except Exception:
+                self.con.execute("ROLLBACK")
+                raise
 
     def x(self, sql, args=()):
         with self.lock:
@@ -325,7 +341,20 @@ class ExcelBook:
         return self.path.with_name("~$" + self.path.name)
 
     def is_open_in_excel(self) -> bool:
-        return self.lock_file().exists()
+        """~$file tồn tại VÀ file đang bị giữ (Excel mở file với chế độ cấm ghi chung).
+        ~$file sót lại sau khi Excel crash (file không bị giữ) → coi như KHÔNG mở."""
+        if not self.lock_file().exists():
+            return False
+        if os.name != "nt":
+            return True                                    # ngoài Windows: tin file khoá (dùng cho test)
+        try:
+            fd = os.open(str(self.path), os.O_RDWR | getattr(os, "O_BINARY", 0))
+            os.close(fd)
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return True
 
     def _ws(self, wb):
         return wb[self.sheet] if self.sheet and self.sheet in wb.sheetnames else wb.worksheets[0]
@@ -359,9 +388,12 @@ class ExcelBook:
         return self._write_openpyxl(mapping)
 
     def _write_openpyxl(self, mapping):
+        if self.path.suffix.lower() == ".xlsb":
+            raise ExcelLocked("file .xlsb không ghi được bằng openpyxl — mở bằng Excel để tool ghi qua COM")
         tmp = self.path.with_name(f".{self.path.stem}.ws360-{os.getpid()}.tmp{self.path.suffix}")
         try:
-            wb = openpyxl.load_workbook(self.path)
+            sig0 = self.sig()
+            wb = openpyxl.load_workbook(self.path, keep_vba=self.path.suffix.lower() == ".xlsm")
             ws = self._ws(wb)
             out = {ch: [] for ch in mapping}
             for r in range(1, ws.max_row + 1):
@@ -376,6 +408,8 @@ class ExcelBook:
             wb.save(tmp)
             if self.is_open_in_excel():          # người dùng vừa mở Excel trong lúc ta ghi → không ghi đè
                 raise ExcelLocked("Excel vừa được mở")
+            if self.sig() != sig0:               # người dùng vừa lưu file trong lúc ta ghi → làm lại từ bản mới
+                raise ExcelLocked("file vừa được lưu bởi người khác — ghi lại từ bản mới")
             os.replace(tmp, self.path)
             self.own_sig = self.sig()
             return out
@@ -396,7 +430,14 @@ class ExcelBook:
             raise ExcelLocked("Excel đang mở và không có pywin32 để ghi qua COM — sẽ ghi khi Excel đóng")
         pythoncom.CoInitialize()
         try:
-            wb = win32com.client.GetObject(str(self.path.resolve()))
+            try:
+                xl = win32com.client.GetActiveObject("Excel.Application")
+            except Exception:
+                raise ExcelLocked("không thấy Excel đang chạy để ghi qua COM")
+            want = str(self.path.resolve()).lower()
+            wb = next((b for b in xl.Workbooks if str(b.FullName).lower() == want), None)
+            if wb is None:
+                raise ExcelLocked("file không mở trong Excel của phiên này (có thể máy/người khác đang mở) — chờ")
             ws = wb.Worksheets(self.sheet) if self.sheet else wb.Worksheets(1)
             last = ws.UsedRange.Row + ws.UsedRange.Rows.Count - 1
             vals = ws.Range(ws.Cells(1, self.ck), ws.Cells(last, self.ck)).Value
@@ -415,6 +456,8 @@ class ExcelBook:
                 wb.Save()
             self.own_sig = self.sig()
             return out
+        except ExcelLocked:
+            raise
         except Exception as e:
             raise ExcelLocked(f"COM lỗi: {type(e).__name__}: {e}")
         finally:
@@ -525,13 +568,22 @@ def _innertube_formats(data: dict) -> tuple[list, list]:
 def classify_playability(ps: dict, has_streams: bool) -> str:
     """'ok' | 'notready' | 'fatal' — video mới có thể tạm 'unavailable'/'processing' vài giây."""
     st = str(ps.get("status") or "").upper()
-    reason = (str(ps.get("reason") or "") + " " + json.dumps(ps.get("errorScreen") or {}, ensure_ascii=False)[:400]).lower()
+    es = ps.get("errorScreen") or {}
+    sub = ""
+    try:
+        r0 = (es.get("playerErrorMessageRenderer") or {})
+        sub = " ".join(str(x.get("text") or "") for k in ("reason", "subreason")
+                       for x in ((r0.get(k) or {}).get("runs") or [])) + " " + str((r0.get("subreason") or {}).get("simpleText") or "")
+    except Exception:
+        sub = ""
+    reason = (str(ps.get("reason") or "") + " " + sub).lower()
     if st == "OK":
         return "ok" if has_streams else "notready"
     if st in ("LIVE_STREAM_OFFLINE",) or "premiere" in reason or "processing" in reason or "upcoming" in reason:
         return "notready"
-    if any(k in reason for k in ("members", "thành viên", "payment", "purchase", "copyright", "terminated",
-                                  "removed", "đã bị xóa", "age", "sign in to confirm your age", "drm")):
+    if any(k in reason for k in ("members-only", "members only", "join this channel", "thành viên", "payment",
+                                  "purchase", "copyright", "terminated", "has been removed", "đã bị xóa",
+                                  "confirm your age", "age-restricted", "age restricted", "drm")):
         return "fatal"
     if st in ("ERROR", "UNPLAYABLE", "LOGIN_REQUIRED", "CONTENT_CHECK_REQUIRED"):
         return "notready"   # video vừa đăng hay tạm báo unavailable/private → thử lại có giới hạn
@@ -660,6 +712,7 @@ def _follow(url, headers=None, method="GET", preload=False, timeout=None):
                            retries=False, timeout=timeout or urllib3.Timeout(connect=2.0, read=8.0))
         if r.status in (301, 302, 303, 307, 308):
             loc = r.headers.get("Location")
+            r.drain_conn()
             r.release_conn()
             if not loc:
                 raise HttpStatus(r.status)
@@ -667,7 +720,7 @@ def _follow(url, headers=None, method="GET", preload=False, timeout=None):
             continue
         if r.status >= 400:
             ra = r.headers.get("Retry-After")
-            r.release_conn()
+            r.close()
             raise HttpStatus(r.status, float(ra) if ra and ra.isdigit() else None)
         return r, cur
     raise HttpStatus(310)
@@ -704,9 +757,15 @@ def download_ranges(url: str, dest: Path, size: int, n: int, info: dict, cancel=
     t0 = time.perf_counter_ns()
     if size <= 0 or n <= 1:
         return download_single(url, dest, info, cancel)
-    # dò 302 một lần
-    r, final = _follow(url, headers={"Range": "bytes=0-0"}, preload=True)
-    r.release_conn()
+    # dò 302 một lần (không đọc thân; bắt buộc 206 — server bỏ qua Range thì về 1 GET)
+    r, final = _follow(url, headers={"Range": "bytes=0-0"}, preload=False)
+    st = r.status
+    if st == 206:
+        r.drain_conn()                                    # đọc hết 1 byte → kết nối dùng lại được an toàn
+        r.release_conn()
+    else:
+        r.close()                                         # server bỏ qua Range (200 cả file) → đóng, không đọc
+        raise HttpStatus(st)
     with open(dest, "wb") as f:
         f.truncate(size)
     step = -(-size // n)
@@ -777,10 +836,21 @@ def ffprobe_info(path: Path) -> dict:
             "acodec": (a[0].get("codec_name") if a else None)}
 
 
-def ffmpeg_mux(vfile: Path, afile: Path, out: Path) -> float:
+class _AnyEvent:
+    """is_set() đúng khi BẤT KỲ event nào được đặt (huỷ theo job hoặc dừng toàn tool)."""
+
+    def __init__(self, *evs):
+        self.evs = [e for e in evs if e is not None]
+
+    def is_set(self):
+        return any(e.is_set() for e in self.evs)
+
+
+def ffmpeg_mux(vfile: Path, afile: Path | None, out: Path) -> float:
+    """-c copy (không encode). afile=None → chỉ đóng gói lại video vào MP4 (không đổi tên webm thành .mp4)."""
     t0 = time.perf_counter_ns()
-    p = subprocess.run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-i", str(vfile), "-i", str(afile),
-                        "-map", "0:v:0", "-map", "1:a:0", "-c", "copy", "-f", "mp4", str(out)],
+    args = ["-i", str(vfile)] + (["-i", str(afile), "-map", "0:v:0", "-map", "1:a:0"] if afile else ["-map", "0:v:0"])
+    p = subprocess.run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", *args, "-c", "copy", "-f", "mp4", str(out)],
                        capture_output=True, text=True, timeout=120, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if p.returncode != 0:
         raise IOError(f"ffmpeg mux lỗi: {(p.stderr or '')[-300:]}")
@@ -806,6 +876,10 @@ class Engine:
         self.xlq: queue.Queue = queue.Queue()
         self.seq = itertools.count()
         self.sem = threading.Semaphore(max(1, int(cfg.get("max_concurrent_downloads", 3))))
+        self.active = set()
+        self.active_lock = threading.Lock()
+        self.pending_hub = {}                 # channel → (mode, thời điểm) yêu cầu ta THỰC SỰ gửi tới hub
+        self.hub_lock = threading.Lock()
         self.resolver = Resolver(log)
         self.secret = self.db.meta_get("websub_secret") or secrets.token_hex(24)
         self.db.meta_set("websub_secret", self.secret)
@@ -825,6 +899,7 @@ class Engine:
 
     # ---------------- vòng đời ---------------- #
     def start(self, websub=True, api=True, feed=True, workers=True, excel_watch=True):
+        self._acquire_instance_lock()
         self.stop_ev.clear()
         self.reload_channels(initial=True)
         self.recover()
@@ -846,6 +921,34 @@ class Engine:
         self.log(f"✅ {VERSION} chạy | {len(self.channels)} kênh | workers={self.cfg.get('workers')} | "
                  f"ffmpeg={'có' if FFMPEG else 'KHÔNG'} | ffprobe={'có' if FFPROBE else 'KHÔNG'} | yt-dlp={'có' if yt_dlp else 'KHÔNG'}")
 
+    def _acquire_instance_lock(self):
+        self._lockfh = open(self.base / "ws360.lock", "a+")
+        try:
+            if os.name == "nt":
+                import msvcrt
+                self._lockfh.seek(0)
+                msvcrt.locking(self._lockfh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self._lockfh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self._lockfh.close()
+            self._lockfh = None
+            raise RuntimeError("Tool đang chạy ở cửa sổ khác trong cùng thư mục — chỉ được chạy 1 bản")
+
+    def _release_instance_lock(self):
+        fh = getattr(self, "_lockfh", None)
+        if fh:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+            fh.close()
+            self._lockfh = None
+
     def stop(self):
         self.stop_ev.set()
         if self.httpd:
@@ -860,7 +963,11 @@ class Engine:
         self.xlq.put(None)
         for t in self.threads:
             t.join(timeout=5)
+        end = time.time() + 120                           # chờ các lần tải/ghép dở dang trả về
+        while self.active and time.time() < end:
+            time.sleep(0.1)
         self.threads = []
+        self._release_instance_lock()
         self.log("⏹ đã dừng")
 
     def _spawn(self, fn, name):
@@ -889,10 +996,10 @@ class Engine:
             chans, bad = self.excel.read_channels()
         except FileNotFoundError:
             self.log(f"❌ Không thấy {self.excel.path.name} trong thư mục tool")
-            return
+            return None
         except Exception as e:
             self.log(f"❌ Đọc Excel lỗi: {type(e).__name__}: {e}")
-            return
+            return None
         with self.ch_lock:
             old = set(self.channels)
             self.channels = chans
@@ -914,11 +1021,11 @@ class Engine:
         while not self.stop_ev.wait(2.0):
             s = self.excel.sig()
             if s and s != last:
+                res = self.reload_channels()      # đọc lại cả khi do chính ta ghi (người dùng có thể sửa cùng lúc)
+                if res is None:
+                    continue                      # đọc lỗi (file đang ghi dở…) → giữ 'last' cũ, lần sau đọc lại
                 last = s
-                if s == self.excel.own_sig:      # do chính ta ghi cột D → không cần đọc lại
-                    continue
-                res = self.reload_channels()
-                if res and res[0]:
+                if res[0]:
                     self.subscribe_all(list(res[0]))
 
     def monitored(self, ch):
@@ -945,18 +1052,23 @@ class Engine:
             self.seen.add(vid)
         url = video_url(vid)
         meta = {"title": title, "engine": engine, "published": iso(published) if published else None, "detected_at": iso()}
+        okey = meta["published"] or meta["detected_at"]  # thứ tự "mới nhất" cho ô D: theo giờ đăng
         # 1) đưa NGAY vào 2 hàng đợi độc lập (worker tự tạo dòng DB nếu tới trước), 2) rồi ghi bền vững SQLite (WAL).
         #    Cửa sổ mất việc khi tắt đột ngột chỉ là vài micro-giây giữa 2 bước.
         t_enq = time.perf_counter_ns()
         if self.flags["download"]:
             self.dlq.put((time.time(), next(self.seq), {"vid": vid, "ch": ch, "t_recv_ns": t_recv_ns, "t_enq_ns": t_enq, **meta}))
         if self.flags["excel"]:
-            self.xlq.put({"vid": vid, "ch": ch, "url": url, "t_enq_ns": t_enq})
+            self.xlq.put({"vid": vid, "ch": ch, "url": url, "t_enq_ns": t_enq, "okey": okey})
         enq_ms = ms(t_recv_ns, t_enq)
-        self._db_insert_video(vid, ch, meta, "QUEUED" if self.flags["download"] else "SKIPPED", enq_ms)
+        stmts = [("INSERT OR IGNORE INTO videos(video_id, channel_id, url, title, engine, detected_at, published_at, state, "
+                  "enqueue_ms) VALUES(?,?,?,?,?,?,?,?,?)",
+                  (vid, ch, url, title, engine, meta["detected_at"], meta["published"],
+                   "QUEUED" if self.flags["download"] else "SKIPPED", enq_ms))]
         if self.flags["excel"]:
-            self.db.x("INSERT OR IGNORE INTO excel_jobs(video_id, channel_id, url, state, created_at) VALUES(?,?,?,?,?)",
-                      (vid, ch, url, "PENDING", iso()))
+            stmts.append(("INSERT OR IGNORE INTO excel_jobs(video_id, channel_id, url, state, created_at, order_key) "
+                          "VALUES(?,?,?,?,?,?)", (vid, ch, url, "PENDING", iso(), okey)))
+        self.db.tx(stmts)                                 # 2 bản ghi cùng 1 giao dịch
         self.stats["detected"] += 1
         age_s = f" | tuổi {(now_utc() - published).total_seconds():.1f}s" if published else ""
         self.log(f"🔥 [{engine}] VIDEO MỚI {vid} | kênh {ch} | nhận→hàng đợi {enq_ms:.3f} ms{age_s} | {title[:60]}")
@@ -968,6 +1080,12 @@ class Engine:
                                                  meta.get("detected_at") or iso(), meta.get("published"), state, enq_ms))
         if enq_ms is not None:
             self.db.upd(vid, enqueue_ms=enq_ms)
+
+    def _is_recent(self, published) -> bool:
+        """Video đăng trong cửa sổ max_age_minutes → coi là MỚI (kể cả lúc lấy mốc ban đầu)."""
+        if published is None:
+            return False
+        return (now_utc() - published).total_seconds() <= float(self.cfg.get("max_age_minutes", 30)) * 60
 
     def _mark_seen(self, vid, ch, why):
         with self.seen_lock:
@@ -984,9 +1102,15 @@ class Engine:
                                                          "t_recv_ns": None, "t_enq_ns": time.perf_counter_ns(), "recovered": True}))
             n += 1
         m = 0
-        for r in self.db.all("SELECT * FROM excel_jobs WHERE state != 'DONE'"):
+        if self.flags["excel"]:
+            for r in self.db.all("SELECT v.* FROM videos v LEFT JOIN excel_jobs x ON x.video_id=v.video_id "
+                                 "WHERE x.video_id IS NULL"):
+                self.db.x("INSERT OR IGNORE INTO excel_jobs(video_id, channel_id, url, state, created_at, order_key) "
+                          "VALUES(?,?,?,?,?,?)", (r["video_id"], r["channel_id"], r["url"], "PENDING", iso(),
+                                                  r["published_at"] or r["detected_at"]))
+        for r in self.db.all("SELECT * FROM excel_jobs WHERE state IN ('PENDING','RETRY')"):
             self.xlq.put({"vid": r["video_id"], "ch": r["channel_id"], "url": r["url"], "t_enq_ns": time.perf_counter_ns(),
-                          "job_id": r["id"]})
+                          "okey": r["order_key"] or r["created_at"] or ""})
             m += 1
         for p in self.dl_dir.rglob("*.part*"):
             try:
@@ -1011,34 +1135,50 @@ class Engine:
             with self.sem:
                 self.stats["downloading"] += 1
                 try:
-                    self.process(job)
+                    r = self.process(job)
+                    if r == "BUSY":                       # đang có worker khác xử lý đúng video này
+                        self.dlq.put((time.time() + 1, next(self.seq), dict(job, not_before=time.time() + 1)))
+                except Exception as e:  # noqa: BLE001 — không bao giờ để mất việc vì lỗi bất ngờ
+                    self.log(f"❌ worker lỗi bất ngờ với {job.get('vid')}: {type(e).__name__}: {e} → thử lại sau 5s")
+                    self.dlq.put((time.time() + 5, next(self.seq), dict(job, not_before=time.time() + 5)))
                 finally:
                     self.stats["downloading"] -= 1
 
     def process(self, job) -> str:
+        """Một lần thử cho 1 video. MỌI lỗi (kể cả trước khi tải) đi qua cùng logic thử lại có giới hạn / FAILED."""
         vid, ch = job["vid"], job["ch"]
-        row = self.db.one("SELECT * FROM videos WHERE video_id=?", (vid,))
-        if row is None:                                   # worker tới trước lần ghi DB của on_event
-            self._db_insert_video(vid, ch, job, "QUEUED")
-            row = self.db.one("SELECT * FROM videos WHERE video_id=?", (vid,))
-        attempts = int(row["attempts"] if row else 0)
-        final = self.dl_dir / ch / f"{vid}_360p.mp4"
-        if final.exists():
-            v = ffprobe_info(final)
-            if v["ok"]:
-                self.db.upd(vid, state="DONE", file=str(final), size=final.stat().st_size, error=None)
-                self.log(f"✅ {vid} đã có file hợp lệ — không tải lại")
-                return "DONE"
-            final.unlink(missing_ok=True)
-        final.parent.mkdir(parents=True, exist_ok=True)
-        t_start = time.perf_counter_ns()
-        k = {}
-        if job.get("t_recv_ns"):
-            k["resolver_start_ms"] = ms(job["t_recv_ns"], t_start)
-        self.db.upd(vid, state="RESOLVING", attempts=attempts + 1, **k)
-        tmpdir = final.parent
+        with self.active_lock:
+            if vid in self.active:                        # không bao giờ 2 worker cùng 1 video
+                return "BUSY"
+            self.active.add(vid)
+        attempts = 0
         parts = []
+        cancel = threading.Event()
+        th = None
         try:
+            row = self.db.one("SELECT * FROM videos WHERE video_id=?", (vid,))
+            if row is None:                               # worker tới trước lần ghi DB của on_event
+                self._db_insert_video(vid, ch, job, "QUEUED")
+                row = self.db.one("SELECT * FROM videos WHERE video_id=?", (vid,))
+            if row and row["state"] in ("DONE", "FAILED", "SKIPPED"):
+                return row["state"]
+            attempts = int(row["attempts"] if row else 0)
+            final = self.dl_dir / ch / f"{vid}_360p.mp4"
+            if final.exists():
+                v = ffprobe_info(final)
+                if v["ok"]:
+                    self.db.upd(vid, state="DONE", file=str(final), size=final.stat().st_size, error=None)
+                    self.log(f"✅ {vid} đã có file hợp lệ — không tải lại")
+                    return "DONE"
+                final.unlink(missing_ok=True)
+            final.parent.mkdir(parents=True, exist_ok=True)
+            t_start = time.perf_counter_ns()
+            k = {}
+            if job.get("t_recv_ns"):
+                k["resolver_start_ms"] = ms(job["t_recv_ns"], t_start)
+            self.db.upd(vid, state="RESOLVING", attempts=attempts + 1, **k)
+            tag = f"{vid}.a{attempts + 1}"                # tên tạm RIÊNG cho từng lần thử
+            tmpdir = final.parent
             plan = self.resolver.resolve(vid)
             t_res = time.perf_counter_ns()
             pick = plan["pick"]
@@ -1048,37 +1188,33 @@ class Engine:
             info_v, info_a = {}, {}
             mux_ms = None
             n = int(self.cfg.get("range_connections", 1))
+            out_tmp = tmpdir / f".{tag}.part.mp4"
+            parts.append(out_tmp)
             if pick["kind"] == "progressive":
-                out_tmp = tmpdir / f".{vid}_360p.part.mp4"
-                parts.append(out_tmp)
-                self._fetch(pick["video"], out_tmp, info_v, n)
+                self._fetch(pick["video"], out_tmp, info_v, n, cancel)
             else:
-                vtmp = tmpdir / f".{vid}.part.v"
-                atmp = tmpdir / f".{vid}.part.a"
-                out_tmp = tmpdir / f".{vid}_360p.part.mp4"
-                parts += [vtmp, atmp, out_tmp]
-                th = None
+                vtmp = tmpdir / f".{tag}.part.v"
+                atmp = tmpdir / f".{tag}.part.a"
+                parts += [vtmp, atmp]
                 errs = []
                 if pick["audio"]:
                     def _a():
                         try:
-                            self._fetch(pick["audio"], atmp, info_a, 1)
+                            self._fetch(pick["audio"], atmp, info_a, 1, cancel)
                         except Exception as e:  # noqa: BLE001
                             errs.append(e)
-                    th = threading.Thread(target=_a, daemon=True)
+                    th = threading.Thread(target=_a, daemon=True, name=f"audio-{vid}")
                     th.start()
-                self._fetch(pick["video"], vtmp, info_v, n)
+                self._fetch(pick["video"], vtmp, info_v, n, cancel)
                 if th:
                     th.join()
+                    th = None
                     if errs:
                         raise errs[0]
                 self.db.upd(vid, state="VERIFYING")
-                if pick["audio"]:
-                    if not FFMPEG:
-                        raise Fatal("cần ffmpeg để ghép 360p video + audio")
-                    mux_ms = ffmpeg_mux(vtmp, atmp, out_tmp)
-                else:
-                    os.replace(vtmp, out_tmp)
+                if not FFMPEG:
+                    raise Fatal("cần ffmpeg để ghép/đóng gói 360p DASH")
+                mux_ms = ffmpeg_mux(vtmp, atmp if pick["audio"] else None, out_tmp)
             t_dl = time.perf_counter_ns()
             self.db.upd(vid, state="VERIFYING")
             t_v0 = time.perf_counter_ns()
@@ -1086,8 +1222,8 @@ class Engine:
             verify_ms = ms(t_v0, time.perf_counter_ns())
             if not v["ok"]:
                 raise IOError(f"ffprobe: file hỏng ({v})")
-            if pick["kind"] == "progressive" and not v.get("audio"):
-                self.log(f"⚠️ {vid}: nguồn progressive không có tiếng")
+            if not v.get("audio"):
+                self.log(f"⚠️ {vid}: nguồn không có luồng tiếng ({pick['kind']}) — giữ file chỉ có hình")
             if pick["kind"] == "dash" and pick["audio"] and not v.get("audio"):
                 raise IOError("ghép xong nhưng không có audio")
             os.replace(out_tmp, final)
@@ -1102,17 +1238,13 @@ class Engine:
             self.stats["speed_mbps"] = mbps
             self.stats["last"] = {"vid": vid, "resolver_ms": ms(t_start, t_res), "download_ms": dl_ms, "mux_ms": mux_ms,
                                   "verify_ms": verify_ms, "total_ms": total}
-            self.log(f"✅ DONE {vid} | {pick['kind']} itag {self.db.one('SELECT itags FROM videos WHERE video_id=?', (vid,))['itags']} | "
-                     f"{size / 1e6:.2f} MB | resolver {ms(t_start, t_res):.0f} ms ({plan.get('source')}) | TTFB {info_v.get('ttfb_ms')} ms | "
-                     f"tải {dl_ms:.0f} ms ≈{mbps} Mbps | mux {mux_ms or 0:.0f} ms | verify {verify_ms:.0f} ms | "
-                     f"TỔNG {total:.0f} ms | {v.get('height')}p {v.get('vcodec')}/{v.get('acodec')}")
+            itags = ",".join(str(f["itag"]) for f in (pick["video"], pick["audio"]) if f)
+            self.log(f"✅ DONE {vid} | {pick['kind']} itag {itags} | {size / 1e6:.2f} MB | resolver {ms(t_start, t_res):.0f} ms "
+                     f"({plan.get('source')}) | TTFB {info_v.get('ttfb_ms')} ms | tải {dl_ms:.0f} ms ≈{mbps} Mbps | "
+                     f"mux {mux_ms or 0:.0f} ms | verify {verify_ms:.0f} ms | TỔNG {total:.0f} ms | "
+                     f"{v.get('height')}p {v.get('vcodec')}/{v.get('acodec')}")
             return "DONE"
-        except (NotReady, HttpStatus, IOError, OSError, Exception) as e:  # noqa: BLE001
-            for p in parts:
-                try:
-                    p.unlink()
-                except OSError:
-                    pass
+        except Exception as e:  # noqa: BLE001
             if isinstance(e, InterruptedError) or self.stop_ev.is_set():
                 self.db.upd(vid, state="QUEUED", error="dừng giữa chừng")
                 return "STOPPED"
@@ -1123,7 +1255,7 @@ class Engine:
                 self.stats["failed"] += 1
                 self.log(f"❌ FAILED {vid} sau {attempts + 1} lần: {type(e).__name__}: {redact(str(e))[:200]}")
                 return "FAILED"
-            wait = sched[attempts]
+            wait = sched[min(attempts, len(sched) - 1)]
             if isinstance(e, HttpStatus) and e.code == 429:
                 wait = max(wait, float(e.retry_after or 0), 10.0)
             self.db.upd(vid, state="RETRY_WAIT", next_try=time.time() + wait, error=f"{type(e).__name__}: {str(e)[:200]}")
@@ -1131,25 +1263,48 @@ class Engine:
             job = dict(job, not_before=time.time() + wait)
             self.dlq.put((job["not_before"], next(self.seq), job))
             return "RETRY_WAIT"
+        finally:
+            cancel.set()                                  # luồng audio (nếu còn) dừng ngay
+            if th is not None:
+                th.join(timeout=30)
+            for p in parts:                               # luôn dọn file tạm của lần thử này
+                try:
+                    p.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    pass
+            with self.active_lock:
+                self.active.discard(vid)
 
-    def _fetch(self, fmt, dest, info, n):
+    def _fetch(self, fmt, dest, info, n, cancel=None):
         size = int(fmt.get("clen") or 0)
+        cancel = cancel or self.stop_ev
         if n > 1 and size > 0:
             try:
-                return download_ranges(fmt["url"], dest, size, n, info, self.stop_ev)
-            except (HttpStatus, IOError) as e:
-                if isinstance(e, HttpStatus) and e.code in (403, 429):
+                return download_ranges(fmt["url"], dest, size, n, info, _AnyEvent(cancel, self.stop_ev))
+            except InterruptedError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                if isinstance(e, HttpStatus) and e.code in (403, 404, 410, 429):
                     raise
-                self.log(f"   ↩️ Range x{n} lỗi ({e}) → 1 GET")
-        return download_single(fmt["url"], dest, info, self.stop_ev)
+                self.log(f"   ↩️ Range x{n} lỗi ({type(e).__name__}: {redact(str(e))[:80]}) → 1 GET")
+        return download_single(fmt["url"], dest, info, _AnyEvent(cancel, self.stop_ev))
 
     # ---------------- EXCEL WRITER (độc lập với download) ---------------- #
+    def _excel_newer_done(self, ch, okey) -> bool:
+        r = self.db.one("SELECT MAX(order_key) k FROM excel_jobs WHERE channel_id=? AND state='DONE'", (ch,))
+        return bool(r and r["k"] and okey and r["k"] > okey)
+
     def _excel_worker(self):
-        """Gom mọi việc đến hạn → MỘT lần mở/lưu Excel. Excel khoá → giữ (SQLite + RAM) và thử lại có giãn cách."""
+        """Gom việc đến hạn → MỘT lần mở/lưu Excel. Mỗi kênh chỉ ghi URL có giờ đăng MỚI NHẤT (không bao giờ ghi đè
+        link mới bằng link cũ, kể cả sau khi khởi động lại). Excel khoá → giữ (SQLite + RAM), thử lại giãn cách.
+        Lỗi khác (không phải khoá) → tách từng kênh để 1 dòng lỗi không chặn cả lô; quá 10 lần → FAILED."""
         delays = [0.5, 1, 2, 5, 10, 20, 30]
         pending = []
         fails = 0
         next_ok = 0.0
+        single = False
         while not self.stop_ev.is_set():
             try:
                 item = self.xlq.get(timeout=0.25)
@@ -1159,7 +1314,7 @@ class Engine:
                 return
             if item != "tick":
                 pending.append(item)
-            while True:                                   # gom thêm việc đang chờ trong hàng đợi
+            while True:
                 try:
                     it2 = self.xlq.get_nowait()
                 except queue.Empty:
@@ -1171,50 +1326,69 @@ class Engine:
             now = time.time()
             if not pending or now < next_ok:
                 continue
-            mapping, latest = {}, {}
-            for it in pending:                            # mỗi kênh: URL mới nhất thắng (1 ô D / dòng)
-                mapping[it["ch"]] = it["url"]
-                latest[it["ch"]] = it
-            t0 = time.perf_counter_ns()
-            try:
-                res = self.excel.write_urls(mapping)
-            except ExcelLocked as e:
-                next_ok = now + delays[min(fails, len(delays) - 1)]
-                if fails in (0, 3, 6) or fails % 20 == 0:
-                    self.log(f"🔒 Excel bận ({e}) → {len(pending)} URL giữ trong SQLite, thử lại sau {next_ok - now:.1f}s")
-                fails += 1
-                for it in pending:
-                    self.db.x("UPDATE excel_jobs SET attempts=attempts+1, error=?, state='RETRY' WHERE video_id=? AND channel_id=?",
-                              (str(e)[:200], it["vid"], it["ch"]))
-                continue
-            except Exception as e:  # noqa: BLE001
-                next_ok = now + delays[min(fails, len(delays) - 1)]
-                fails += 1
-                self.stats["excel_err"] += 1
-                self.log(f"❌ Excel lỗi {type(e).__name__}: {e} → thử lại sau {next_ok - now:.1f}s")
-                for it in pending:
-                    self.db.x("UPDATE excel_jobs SET attempts=attempts+1, error=?, state='RETRY' WHERE video_id=? AND channel_id=?",
-                              (f"{type(e).__name__}: {e}"[:200], it["vid"], it["ch"]))
-                continue
-            fails = 0
-            wms = ms(t0, time.perf_counter_ns())
+            # chọn bản mới nhất theo giờ đăng cho từng kênh; bản cũ hơn → SUPERSEDED (không ghi)
+            latest = {}
             for it in pending:
-                rows = res.get(it["ch"]) or []
-                if not rows:
-                    self.db.x("UPDATE excel_jobs SET state='NO_ROW', error=?, done_at=? WHERE video_id=? AND channel_id=?",
-                              ("không còn dòng nào có Channel ID này", iso(), it["vid"], it["ch"]))
-                    self.log(f"⚠️ Excel: không còn dòng có kênh {it['ch']} — bỏ ghi {it['vid']}")
+                cur = latest.get(it["ch"])
+                if cur is None or (it.get("okey") or "") >= (cur.get("okey") or ""):
+                    latest[it["ch"]] = it
+            for it in pending:
+                if latest[it["ch"]] is not it or self._excel_newer_done(it["ch"], it.get("okey")):
+                    self.db.x("UPDATE excel_jobs SET state='SUPERSEDED', done_at=?, error=? WHERE video_id=? AND channel_id=?",
+                              (iso(), "kênh đã có link video mới hơn ở cột D", it["vid"], it["ch"]))
+            todo = [it for it in latest.values() if not self._excel_newer_done(it["ch"], it.get("okey"))]
+            pending = []
+            batches = [[it] for it in todo] if single else ([todo] if todo else [])
+            retry = []
+            for batch in batches:
+                mapping = {it["ch"]: it["url"] for it in batch}
+                t0 = time.perf_counter_ns()
+                try:
+                    res = self.excel.write_urls(mapping)
+                except ExcelLocked as e:
+                    if fails in (0, 3, 6) or fails % 20 == 0:
+                        self.log(f"🔒 Excel bận ({e}) → {len(batch)} URL giữ trong SQLite, thử lại")
+                    for it in batch:
+                        self.db.x("UPDATE excel_jobs SET attempts=attempts+1, error=?, state='RETRY' WHERE video_id=? AND channel_id=?",
+                                  (str(e)[:200], it["vid"], it["ch"]))
+                    retry += batch
                     continue
-                superseded = latest[it["ch"]] is not it
-                self.db.x("UPDATE excel_jobs SET state=?, done_at=?, write_ms=?, rows=?, error=? WHERE video_id=? AND channel_id=?",
-                          ("SUPERSEDED" if superseded else "DONE", iso(), wms, ",".join(map(str, rows)),
-                           "kênh có video mới hơn trong cùng lần ghi" if superseded else None, it["vid"], it["ch"]))
-                if not superseded:
+                except Exception as e:  # noqa: BLE001
+                    self.stats["excel_err"] += 1
+                    self.log(f"❌ Excel lỗi {type(e).__name__}: {e}" + (" → tách từng kênh" if len(batch) > 1 else ""))
+                    for it in batch:
+                        it["errs"] = it.get("errs", 0) + (1 if len(batch) == 1 else 0)
+                        if it["errs"] >= 10:
+                            self.db.x("UPDATE excel_jobs SET state='FAILED', error=?, done_at=? WHERE video_id=? AND channel_id=?",
+                                      (f"{type(e).__name__}: {e}"[:200], iso(), it["vid"], it["ch"]))
+                            self.log(f"❌ Excel: bỏ ghi {it['vid']} sau 10 lần lỗi ({type(e).__name__})")
+                            continue
+                        self.db.x("UPDATE excel_jobs SET attempts=attempts+1, error=?, state='RETRY' WHERE video_id=? AND channel_id=?",
+                                  (f"{type(e).__name__}: {e}"[:200], it["vid"], it["ch"]))
+                        retry.append(it)
+                    single = True
+                    continue
+                wms = ms(t0, time.perf_counter_ns())
+                for it in batch:
+                    rows = res.get(it["ch"]) or []
+                    if not rows:
+                        self.db.x("UPDATE excel_jobs SET state='NO_ROW', error=?, done_at=? WHERE video_id=? AND channel_id=?",
+                                  ("không còn dòng nào có Channel ID này", iso(), it["vid"], it["ch"]))
+                        self.log(f"⚠️ Excel: không còn dòng có kênh {it['ch']} — bỏ ghi {it['vid']}")
+                        continue
+                    self.db.x("UPDATE excel_jobs SET state='DONE', done_at=?, write_ms=?, rows=?, error=NULL "
+                              "WHERE video_id=? AND channel_id=?", (iso(), wms, ",".join(map(str, rows)), it["vid"], it["ch"]))
                     self.stats["excel_ok"] += 1
                     self.log(f"📝 Excel: {it['url']} → cột {self.cfg['col_url']} dòng {rows} | ghi {wms:.0f} ms | "
                              f"từ lúc vào hàng đợi {ms(it['t_enq_ns'], time.perf_counter_ns()):.0f} ms")
-            pending = []
-            self.stats["excel_pending"] = 0
+            if retry:
+                next_ok = now + delays[min(fails, len(delays) - 1)]
+                fails += 1
+                pending = retry
+            else:
+                fails = 0
+                single = False
+            self.stats["excel_pending"] = len(pending)
 
     # ---------------- WEBSUB ---------------- #
     def start_webhook(self):
@@ -1224,6 +1398,7 @@ class Engine:
         class H(BaseHTTPRequestHandler):
             server_version = "WS360"
             protocol_version = "HTTP/1.1"
+            timeout = 10                                      # chống kết nối treo / gửi chậm (slowloris)
 
             def log_message(self, *a):
                 return
@@ -1247,18 +1422,30 @@ class Engine:
                     return self._reply(200, b"WS360 OK")          # kiểm tra sống (health)
                 ch = norm_channel(q.get("hub.topic", ""))
                 mode = q.get("hub.mode", "")
-                ch_ok = ch and (mode == "unsubscribe" or eng.monitored(ch))
-                if mode in ("subscribe", "unsubscribe") and ch_ok and len(q["hub.challenge"]) <= 512:
+                # chỉ xác nhận yêu cầu mà CHÍNH TOOL đã gửi (chống giả mạo trạng thái đăng ký từ internet)
+                asked = eng.hub_asked(ch, mode) if ch else False
+                if mode == "subscribe":
+                    ok_mode = asked and eng.monitored(ch)
+                elif mode == "unsubscribe":
+                    ok_mode = asked and not eng.monitored(ch)    # không để lệnh huỷ cũ cắt đăng ký mới
+                else:
+                    ok_mode = False
+                if ok_mode and len(q["hub.challenge"]) <= 512:
                     if mode == "subscribe":
-                        lease = int(q.get("hub.lease_seconds") or eng.cfg.get("lease_seconds", 432000))
+                        try:
+                            lease = int(q.get("hub.lease_seconds") or eng.cfg.get("lease_seconds", 432000))
+                        except ValueError:
+                            lease = int(eng.cfg.get("lease_seconds", 432000))
+                        lease = max(60, min(lease, int(eng.cfg.get("lease_seconds", 432000)), 10 * 86400))
                         eng.db.x("INSERT INTO subs(channel_id, callback, verified_at, lease_seconds, state) VALUES(?,?,?,?,'VERIFIED') "
-                                 "ON CONFLICT(channel_id) DO UPDATE SET verified_at=excluded.verified_at, "
+                                 "ON CONFLICT(channel_id) DO UPDATE SET verified_at=excluded.verified_at, callback=excluded.callback, "
                                  "lease_seconds=excluded.lease_seconds, state='VERIFIED', error=NULL",
                                  (ch, eng.callback, time.time(), lease))
                     else:
                         eng.db.x("UPDATE subs SET state='UNSUBSCRIBED' WHERE channel_id=?", (ch,))
+                    eng.hub_done(ch, mode)
                     return self._reply(200, q["hub.challenge"].encode())
-                if mode == "denied":
+                if mode == "denied" and ch and eng.hub_asked(ch, "subscribe"):
                     eng.db.x("UPDATE subs SET state='DENIED', error=? WHERE channel_id=?", (q.get("hub.reason", ""), ch))
                     eng.log(f"⚠️ WebSub hub TỪ CHỐI kênh {ch}: {q.get('hub.reason', '')}")
                     return self._reply(200)
@@ -1268,9 +1455,12 @@ class Engine:
                 t_recv = time.perf_counter_ns()
                 if urlparse(self.path).path != path:
                     return self._reply(404)
-                n = int(self.headers.get("Content-Length") or 0)
-                if n <= 0 or n > 1_000_000:
-                    return self._reply(413 if n else 400)
+                try:
+                    n = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    n = -1
+                if n <= 0 or n > 256 * 1024:                  # push thật chỉ vài KB
+                    return self._reply(413 if n > 0 else 400)
                 raw = self.rfile.read(n)
                 sig = (self.headers.get("X-Hub-Signature") or "").strip()
                 ok = False
@@ -1285,8 +1475,24 @@ class Engine:
                     return
                 eng.handle_push(raw, t_recv)
 
-        self.httpd = ThreadingHTTPServer((self.cfg.get("listen_host", "0.0.0.0"), int(self.cfg.get("listen_port", 8765))), H)
-        self.httpd.daemon_threads = True
+        slots = threading.BoundedSemaphore(32)
+
+        class Srv(ThreadingHTTPServer):
+            daemon_threads = True
+
+            def process_request(self, request, client_address):      # tối đa 32 kết nối đồng thời
+                if not slots.acquire(blocking=False):
+                    self.shutdown_request(request)
+                    return
+                super().process_request(request, client_address)
+
+            def process_request_thread(self, request, client_address):
+                try:
+                    super().process_request_thread(request, client_address)
+                finally:
+                    slots.release()
+
+        self.httpd = Srv((self.cfg.get("listen_host", "0.0.0.0"), int(self.cfg.get("listen_port", 8765))), H)
         threading.Thread(target=self.httpd.serve_forever, kwargs={"poll_interval": 0.2}, daemon=True, name="WEBHOOK").start()
         self.stats["webhook"] = f"LOCAL :{self.httpd.server_address[1]}{path}"
         self.log(f"📡 Webhook lắng nghe {self.cfg.get('listen_host')}:{self.httpd.server_address[1]}{path}")
@@ -1328,7 +1534,19 @@ class Engine:
             cb = cb.rstrip("/") + self.cfg.get("websub_path", "/websub")
         return cb
 
+    def hub_asked(self, ch, mode) -> bool:
+        with self.hub_lock:
+            t = self.pending_hub.get((ch, mode))
+        return bool(t and time.time() - t < 6 * 3600)
+
+    def hub_done(self, ch, mode):
+        with self.hub_lock:
+            self.pending_hub.pop((ch, mode), None)
+
     def _hub(self, mode, ch, cb):
+        with self.hub_lock:
+            self.pending_hub[(ch, mode)] = time.time()
+            self.pending_hub.pop((ch, "unsubscribe" if mode == "subscribe" else "subscribe"), None)
         data = {"hub.mode": mode, "hub.topic": TOPIC_FMT.format(ch), "hub.callback": cb, "hub.verify": "async"}
         if mode == "subscribe":
             data["hub.secret"] = self.secret
@@ -1390,15 +1608,22 @@ class Engine:
             for r in self.db.all("SELECT * FROM subs"):
                 if r["channel_id"] not in self.channels:
                     continue
-                if r["state"] == "VERIFIED" and r["verified_at"] and now > r["verified_at"] + 0.8 * (r["lease_seconds"] or 432000):
+                lease = r["lease_seconds"] or 432000
+                since_req = now - (r["requested_at"] or 0)
+                if r["state"] == "VERIFIED" and r["verified_at"] and now > r["verified_at"] + lease:
+                    self.db.x("UPDATE subs SET state='EXPIRED' WHERE channel_id=?", (r["channel_id"],))
                     renew.append(r["channel_id"])
-                elif r["state"] in ("REQUESTED", "ERROR", "STALE") and now - (r["requested_at"] or 0) > 600:
+                elif r["state"] == "VERIFIED" and r["verified_at"] and now > r["verified_at"] + 0.8 * lease and since_req > 600:
+                    renew.append(r["channel_id"])          # gia hạn ở 80% lease, không gửi lại quá 1 lần / 10 phút
+                elif r["state"] in ("REQUESTED", "ERROR", "STALE", "EXPIRED", "UNSUBSCRIBED", "REMOVED", "DENIED") \
+                        and since_req > 600:
                     renew.append(r["channel_id"])
             missing = [c for c in self.channels if not self.db.one("SELECT 1 FROM subs WHERE channel_id=?", (c,))]
             if renew or missing:
                 self.subscribe_all(renew + missing)
             self.stats["websub_verified"] = self.db.one(
-                "SELECT COUNT(*) c FROM subs WHERE state='VERIFIED' AND callback=?", (self.callback,))["c"]
+                "SELECT COUNT(*) c FROM subs WHERE state='VERIFIED' AND callback=? AND verified_at + lease_seconds > ?",
+                (self.callback, time.time()))["c"]
             self.stats["webhook"] = f"{self.callback}"
             self.stop_ev.wait(30)
 
@@ -1443,7 +1668,7 @@ class Engine:
                             cd = it.get("contentDetails") or {}
                             vid = cd.get("videoId")
                             pub = parse_time(cd.get("videoPublishedAt"))
-                            if ch not in baseline:
+                            if ch not in baseline and not self._is_recent(pub):
                                 self._mark_seen(vid, ch, "baseline-api")
                                 continue
                             self.on_event(ch, vid, "API", pub, "", t_send)
@@ -1523,7 +1748,7 @@ class Engine:
         for e in entries:
             if not e["video_id"]:
                 continue
-            if not st["base"]:
+            if not st["base"] and not self._is_recent(e["published"]):
                 self._mark_seen(e["video_id"], ch, "baseline-feed")
                 continue
             self.on_event(ch, e["video_id"], "FEED", e["published"], e["title"], t_send)
@@ -1549,6 +1774,7 @@ def run_gui(cfg, base):
     class Bridge(QObject):
         line = Signal(str)
         stats = Signal(dict)
+        stopped = Signal()
 
     app = QApplication.instance() or QApplication(sys.argv)
     w = QWidget()
@@ -1613,10 +1839,19 @@ def run_gui(cfg, base):
         b_stop.setEnabled(True)
 
     def stop():
-        if state["eng"]:
-            threading.Thread(target=state["eng"].stop, daemon=True).start()
-        b_start.setEnabled(True)
+        # START chỉ bật lại khi engine cũ đã dừng HẲN (mọi worker xong) → không bao giờ 2 engine cùng 1 database
         b_stop.setEnabled(False)
+        b_start.setEnabled(False)
+        eng = state["eng"]
+
+        def _bg():
+            try:
+                if eng:
+                    eng.stop()
+            finally:
+                br.stopped.emit()
+        threading.Thread(target=_bg, daemon=True).start()
+    br.stopped.connect(lambda: b_start.setEnabled(True))
     b_start.clicked.connect(start)
     b_stop.clicked.connect(stop)
     w.show()
@@ -1661,6 +1896,8 @@ def selftest(cfg, base, video_id=None, wait_verify=90):
         import urllib.request
         ok_local = False
         if ch0:
+            with eng.hub_lock:
+                eng.pending_hub[(ch0, "subscribe")] = time.time()     # mô phỏng: tool vừa gửi yêu cầu đăng ký
             q = urlencode({"hub.mode": "subscribe", "hub.topic": TOPIC_FMT.format(ch0), "hub.challenge": "xyz123", "hub.lease_seconds": "60"})
             with urllib.request.urlopen(f"http://127.0.0.1:{port}{cfg['websub_path']}?{q}", timeout=3) as r:
                 ok_local = r.read() == b"xyz123"
@@ -1671,6 +1908,8 @@ def selftest(cfg, base, video_id=None, wait_verify=90):
             rec("TEST2c đăng ký hub thật + xác minh", "BLOCKED", "cần callback công khai")
         else:
             try:
+                with eng.hub_lock:
+                    eng.pending_hub[(ch0, "subscribe")] = time.time()
                 q = urlencode({"hub.mode": "subscribe", "hub.topic": TOPIC_FMT.format(ch0), "hub.challenge": "pub456"})
                 req = urllib.request.Request(f"{cb}?{q}", headers={"ngrok-skip-browser-warning": "1"})
                 with urllib.request.urlopen(req, timeout=8) as r:

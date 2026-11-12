@@ -142,8 +142,9 @@ def mkfmt(url, itag, height, mime, clen, **kw):
     return d
 
 
-def make_engine(tmp, chans, hub=None, **cfg_over):
-    make_excel(tmp / "check.xlsx", chans)
+def make_engine(tmp, chans, hub=None, keep_excel=False, **cfg_over):
+    if not (keep_excel and (tmp / "check.xlsx").exists()):
+        make_excel(tmp / "check.xlsx", chans)
     cfg = dict(ws.DEFAULT_CONFIG, listen_host="127.0.0.1", listen_port=0, api_enabled=False, feed_enabled=False,
                retry_schedule_sec=[0.1, 0.2, 0.3], workers=3)
     if hub:
@@ -389,7 +390,7 @@ def test_progressive_without_audio_is_kept_with_warning(tmp_path, gvs, media, mo
     e.on_event(CH[0], vid, "WEBSUB", TS)
     r = wait_state(e, vid)
     assert r["state"] == "DONE" and not ws.ffprobe_info(Path(r["file"]))["audio"]
-    assert any("không có tiếng" in l for l in e._logs)
+    assert any("không có luồng tiếng" in l for l in e._logs)
     e.stop()
 
 
@@ -644,3 +645,156 @@ def test_gui_builds_offscreen(tmp_path, monkeypatch):
     make_excel(tmp_path / "check.xlsx", CH[:1])
     QTimer.singleShot(300, app.quit)
     assert ws.run_gui(dict(ws.DEFAULT_CONFIG), tmp_path) == 0
+
+
+# ------------------------------------------------------------------ hồi quy cho các lỗi review đã sửa
+def test_baseline_keeps_recent_video_as_new(tmp_path, monkeypatch):
+    pytest.importorskip("httpx")
+    fresh = datetime.now(timezone.utc) - timedelta(seconds=20)
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            return
+
+        def do_GET(self):
+            body = (f'<?xml version="1.0"?><feed xmlns:yt="http://www.youtube.com/xml/schemas/2015" xmlns="http://www.w3.org/2005/Atom">'
+                    f'<entry><yt:videoId>FRESHVID001</yt:videoId><yt:channelId>{CH[0]}</yt:channelId><title>t</title>'
+                    f'<published>{fresh.isoformat()}</published></entry>'
+                    f'<entry><yt:videoId>OLDVIDEO001</yt:videoId><yt:channelId>{CH[0]}</yt:channelId><title>t</title>'
+                    f'<published>{(fresh - timedelta(days=2)).isoformat()}</published></entry></feed>').encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    monkeypatch.setattr(ws, "FEED_FMT", f"http://127.0.0.1:{srv.server_address[1]}/f?c={{}}")
+    e = make_engine(tmp_path, CH[:1], feed_enabled=True, download_enabled=False, excel_enabled=False)
+    e.start(websub=False, api=False, feed=True, workers=False)
+    end = time.time() + 5
+    while time.time() < end and not e.db.one("SELECT 1 FROM videos WHERE video_id='FRESHVID001'"):
+        time.sleep(0.1)
+    assert e.db.one("SELECT engine FROM videos WHERE video_id='FRESHVID001'")["engine"] == "FEED"
+    assert e.db.one("SELECT why FROM seen WHERE video_id='OLDVIDEO001'")["why"] == "baseline-feed"
+    # WebSub push tới sau cho cùng video → dup (đã đang tải), không bị mất
+    assert e.on_event(CH[0], "FRESHVID001", "WEBSUB", fresh) == "dup"
+    e.stop()
+    srv.shutdown()
+
+
+def test_excel_never_overwrites_newer_url_with_older_even_after_restart(tmp_path, monkeypatch):
+    e = make_engine(tmp_path, CH[:1], download_enabled=False)
+    e.start(websub=False, api=False, feed=False)
+    t_new = datetime.now(timezone.utc)
+    t_old = t_new - timedelta(minutes=5)
+    lock = tmp_path / "~$check.xlsx"
+    lock.write_text("x")                                     # Excel khoá → cả 2 cùng chờ trong 1 lô
+    e.on_event(CH[0], "NEWERVID001", "WEBSUB", t_new)          # tới TRƯỚC nhưng đăng SAU
+    e.on_event(CH[0], "OLDERVID001", "API", t_old)
+    time.sleep(0.6)
+    lock.unlink()
+    assert wait_excel(e, "NEWERVID001")["state"] == "DONE"
+    assert wait_excel(e, "OLDERVID001")["state"] == "SUPERSEDED"
+    assert load_workbook(tmp_path / "check.xlsx").active["D2"].value == ws.video_url("NEWERVID001")
+    e.stop()
+    # khởi động lại: job SUPERSEDED/NO_ROW không được chạy lại; job cũ còn PENDING cũng không ghi đè link mới hơn
+    e.db.x("UPDATE excel_jobs SET state='PENDING' WHERE video_id='OLDERVID001'")
+    e.db.con.close()
+    e2 = make_engine(tmp_path, CH[:1], keep_excel=True, download_enabled=False)
+    e2.start(websub=False, api=False, feed=False)
+    assert wait_excel(e2, "OLDERVID001")["state"] == "SUPERSEDED"
+    assert load_workbook(tmp_path / "check.xlsx").active["D2"].value == ws.video_url("NEWERVID001")
+    e2.stop()
+
+
+def test_forged_verification_and_late_unsubscribe_refused(tmp_path):
+    e = make_engine(tmp_path, CH[:2])
+    e.start(api=False, feed=False, workers=False)
+    port = e.httpd.server_address[1]
+
+    def get(mode, ch, chal="zz9"):
+        q = urlencode({"hub.mode": mode, "hub.topic": ws.TOPIC_FMT.format(ch), "hub.challenge": chal, "hub.lease_seconds": "99999999"})
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/websub?{q}", timeout=3) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as err:
+            return err.code, b""
+    import urllib.error
+    assert get("subscribe", CH[0])[0] == 404                 # tool chưa từng gửi yêu cầu → không xác nhận
+    assert get("unsubscribe", CH[0])[0] == 404               # kênh đang theo dõi → không chấp nhận huỷ
+    with e.hub_lock:
+        e.pending_hub[(CH[0], "subscribe")] = time.time()
+    assert get("subscribe", CH[0]) == (200, b"zz9")
+    assert e.db.one("SELECT lease_seconds FROM subs WHERE channel_id=?", (CH[0],))["lease_seconds"] <= 432000
+    big = b"x" * (300 * 1024)
+    try:
+        urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{port}/websub", data=big), timeout=3)
+        code = 200
+    except urllib.error.HTTPError as err:
+        code = err.code
+    assert code == 413
+    e.stop()
+
+
+@need_ff
+def test_dash_without_audio_is_remuxed_to_real_mp4_and_temps_cleaned(tmp_path, gvs, media, monkeypatch):
+    e = make_engine(tmp_path, CH[:1])
+    vid = "DASHNOAUD01"
+    webm = tmp_path / "v.webm"
+    subprocess.run([FF, "-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=10", "-t", "3",
+                    "-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "8", str(webm)], check=True)
+    vu = gvs.add("/dw", webm.read_bytes())
+    plan = {"pick": {"kind": "dash", "video": mkfmt(vu, 243, 360, 'video/webm; codecs="vp9"', webm.stat().st_size, adaptive=True),
+                     "audio": None}}
+    monkeypatch.setattr(e.resolver, "resolve", lambda v, deadline_s=2.5: plan)
+    e.start(websub=False, api=False, feed=False)
+    e.on_event(CH[0], vid, "WEBSUB", TS)
+    r = wait_state(e, vid)
+    assert r["state"] == "DONE"
+    f = Path(r["file"])
+    fmt = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=format_name", "-of", "csv=p=0", str(f)],
+                         capture_output=True, text=True).stdout
+    assert "mp4" in fmt
+    assert not [p for p in f.parent.iterdir() if ".part" in p.name]
+    e.stop()
+
+
+@need_ff
+def test_unexpected_exception_before_download_is_retried(tmp_path, gvs, media, monkeypatch):
+    e = make_engine(tmp_path, CH[:1])
+    vid = "EARLYERR001"
+    monkeypatch.setattr(e.resolver, "resolve", lambda v, deadline_s=2.5: plan_prog(gvs, media, vid))
+    real = e.dl_dir.mkdir
+    n = {"c": 0}
+    orig_db_upd = e.db.upd
+
+    def flaky_upd(v, **kw):
+        if kw.get("state") == "RESOLVING" and n["c"] == 0:
+            n["c"] += 1
+            raise sqlite3_err()
+        return orig_db_upd(v, **kw)
+    import sqlite3
+    sqlite3_err = lambda: sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(e.db, "upd", flaky_upd)
+    e.start(websub=False, api=False, feed=False)
+    e.on_event(CH[0], vid, "WEBSUB", TS)
+    assert wait_state(e, vid)["state"] == "DONE"
+    e.stop()
+
+
+def test_second_instance_in_same_folder_refused(tmp_path):
+    e = make_engine(tmp_path, CH[:1])
+    e.start(websub=False, api=False, feed=False, workers=False)
+    e2 = make_engine(tmp_path, CH[:1])
+    with pytest.raises(RuntimeError):
+        e2.start(websub=False, api=False, feed=False, workers=False)
+    e.stop()
+
+
+def test_range_probe_leaves_pool_connections_reusable(tmp_path, gvs, media):
+    url = gvs.add("/rr", media["prog"])
+    for i in range(6):
+        info = {}
+        d = tmp_path / f"o{i}.mp4"
+        ws.download_ranges(url, d, len(media["prog"]), 4, info)
+        assert d.read_bytes() == media["prog"]
