@@ -315,7 +315,8 @@ def test_websub_subscribe_verify_push_download_and_excel_parallel(tmp_path, gvs,
         assert hub.push(e.callback, CH[5], "FOREIGN0001", secret=e.secret) == 204
         time.sleep(0.5)
         assert e.db.one("SELECT COUNT(*) c FROM videos")["c"] == 1
-        assert e.db.one("SELECT why FROM seen WHERE video_id='OLDVID00001'")["why"].startswith("old:")
+        assert e.db.one("SELECT 1 FROM hub_events WHERE kind='push-old' AND detail LIKE 'OLDVID00001%'")
+        assert "OLDVID00001" not in e.seen                   # không đánh dấu vĩnh viễn → hub gửi lại muộn vẫn xét lại được
         assert len(gvs.requests_for(f"/vp/{vid}")) == 1
         e.stop()
     finally:
@@ -957,3 +958,129 @@ def test_secret_change_forces_full_resubscribe(tmp_path):
         e.stop()
     finally:
         hub.close()
+
+
+# ------------------------------------------------------------------ hồi quy review vòng 3 (WebSub-only)
+def _free_port():
+    import socket
+    so = socket.socket()
+    so.bind(("127.0.0.1", 0))
+    p = so.getsockname()[1]
+    so.close()
+    return p
+
+
+def test_verified_count_only_monitored_and_removed_rows_unsubscribed(tmp_path):
+    hub = FakeHub()
+    port = _free_port()
+    cb = f"http://127.0.0.1:{port}/websub"
+    try:
+        e = make_engine(tmp_path, [CH[0], CH[1], CH[3]], hub, listen_port=port, callback_url=cb, websub_loop_sec=0.3)
+        e.start(workers=False)
+        end = time.time() + 5
+        while time.time() < end and e.stats["websub_verified"] < 3:
+            time.sleep(0.1)
+        assert e.stats["websub_verified"] == 3
+        e.stop()
+        make_excel(tmp_path / "check.xlsx", [CH[0], CH[1], CH[2]])     # lúc tool TẮT: thay kênh 3 (CH3 → CH2)
+        orig = hub._verify
+        hub._verify = lambda q: None if ws.norm_channel(q["hub.topic"]) == CH[2] and q["hub.mode"] == "subscribe" else orig(q)
+        e2 = make_engine(tmp_path, [CH[0], CH[1], CH[2]], hub, keep_excel=True, listen_port=port, callback_url=cb,
+                         websub_loop_sec=0.3)
+        e2.start(workers=False)
+        end = time.time() + 5
+        while time.time() < end and hub.verified.get(CH[3], ("",))[0] != "unsubscribe":
+            time.sleep(0.1)
+        time.sleep(0.5)
+        assert e2.stats["websub_verified"] == 2                         # KHÔNG phải 3/3
+        assert e2.db.one("SELECT state FROM subs WHERE channel_id=?", (CH[3],))["state"] in ("REMOVED", "UNSUBSCRIBED")
+        assert hub.verified[CH[3]] == ("unsubscribe", True)
+        e2.stop()
+    finally:
+        hub.close()
+
+
+def test_selftest_reports_real_verification_only_and_never_touches_original_excel(tmp_path):
+    hub = FakeHub()
+    orig = hub._verify
+    hub._verify = lambda q: None if ws.norm_channel(q["hub.topic"]) == CH[0] else orig(q)   # hub KHÔNG xác minh kênh đầu
+    port = _free_port()
+    try:
+        make_excel(tmp_path / "check.xlsx", CH[:3])
+        h0 = hashlib.sha256((tmp_path / "check.xlsx").read_bytes()).hexdigest()
+        cfg = dict(ws.DEFAULT_CONFIG, listen_host="127.0.0.1", listen_port=port, hub_url=hub.url,
+                   callback_url=f"http://127.0.0.1:{port}/websub")
+        res = {n: (st, d) for n, st, d in ws.selftest(cfg, tmp_path, None, wait_verify=3)}
+        assert res["TEST2a webhook cục bộ trả hub.challenge"][0] == "PASS"
+        st, d = res["TEST2c đăng ký hub thật + xác minh"]
+        assert st == "PARTIAL" and "2/3" in d                           # giả lập của TEST2a/2b KHÔNG được tính
+        assert res[f"TEST2c-kênh {CH[0]}"][0] == "FAIL"
+        assert res["TEST2d POST sai chữ ký bị chặn, POST đúng chữ ký (video cũ) nhận nhưng không tải"][0] == "PASS"
+        assert hashlib.sha256((tmp_path / "check.xlsx").read_bytes()).hexdigest() == h0
+    finally:
+        hub.close()
+
+
+def test_selftest_with_main_running_sends_nothing_to_hub(tmp_path):
+    hub = FakeHub()
+    port = _free_port()
+    try:
+        cfg = dict(ws.DEFAULT_CONFIG, listen_host="127.0.0.1", listen_port=port, hub_url=hub.url,
+                   callback_url=f"http://127.0.0.1:{port}/websub")
+        make_excel(tmp_path / "check.xlsx", CH[:2])
+        main = ws.Engine(cfg, tmp_path, ws.Log(tmp_path / "logs"))
+        main.start(workers=False)                                       # tool chính giữ cổng
+        end = time.time() + 5
+        while time.time() < end and len(hub.verified) < 2:              # chờ tool chính tự đăng ký xong
+            time.sleep(0.1)
+        n0 = len(hub.reqs)
+        assert n0 == 2
+        res = {n: st for n, st, d in ws.selftest(cfg, tmp_path, None, wait_verify=1)}
+        assert res["TEST2c đăng ký hub thật + xác minh"] == "BLOCKED"
+        time.sleep(0.5)
+        assert len(hub.reqs) == n0                                      # SELFTEST không đăng ký gì lên hub
+        main.stop()
+    finally:
+        hub.close()
+
+
+def test_real_push_during_selftest_is_handed_to_main_tool(tmp_path):
+    make_excel(tmp_path / "check.xlsx", CH[:1])
+    cfg = dict(ws.DEFAULT_CONFIG, listen_host="127.0.0.1", listen_port=0)
+    t = ws.Engine(dict(cfg, excel_file="check.xlsx", download_dir="DOWNLOADS_TEST"), tmp_path, ws.Log(tmp_path / "logs"),
+                  db_name="database_TEST.sqlite", lock_name="ws360_selftest.lock")
+    t.channels = {CH[0]: [2]}
+    t.inbox_db = ws.DB(tmp_path / "database.sqlite")
+    t.handle_push(atom(CH[0], "REALPUSH001", datetime.now(timezone.utc)), time.perf_counter_ns())
+    assert not t.db.one("SELECT 1 FROM videos WHERE video_id='REALPUSH001'")
+    main = ws.Engine(cfg, tmp_path, ws.Log(tmp_path / "logs"))
+    r = main.db.one("SELECT * FROM videos WHERE video_id='REALPUSH001'")
+    assert r and r["state"] == "QUEUED" and r["engine"] == "WEBSUB"
+    assert main.db.one("SELECT state FROM excel_jobs WHERE video_id='REALPUSH001'")["state"] == "PENDING"
+
+
+def test_late_hub_retry_after_downtime_is_still_downloaded(tmp_path):
+    make_excel(tmp_path / "check.xlsx", CH[:1])
+    db = ws.DB(tmp_path / "database.sqlite")
+    db.meta_set("last_alive", time.time() - 3 * 3600)                  # tool tắt 3 giờ
+    db.con.close()
+    e = make_engine(tmp_path, CH[:1], keep_excel=True)
+    e.channels = {CH[0]: [2]}
+    pub = datetime.now(timezone.utc) - timedelta(minutes=50)             # video đăng lúc tool tắt, hub gửi lại muộn
+    assert e.on_event(CH[0], "LATERETRY01", "WEBSUB", pub) == "queued"
+    assert e.on_event(CH[0], "REALLYOLD01", "WEBSUB", datetime.now(timezone.utc) - timedelta(days=3)) == "old"
+
+
+def test_verification_replay_after_window_is_rejected(tmp_path):
+    e = make_engine(tmp_path, CH[:1])
+    e.start(workers=False)
+    port = e.httpd.server_address[1]
+    with e.hub_lock:
+        e.pending_hub[(CH[0], "subscribe")] = time.time()
+    q = urlencode({"hub.mode": "subscribe", "hub.topic": ws.TOPIC_FMT.format(CH[0]), "hub.challenge": "ok1"})
+    assert urllib.request.urlopen(f"http://127.0.0.1:{port}/websub?{q}", timeout=3).read() == b"ok1"
+    with e.hub_lock:
+        e.pending_ok[(CH[0], "subscribe")] = time.time() - 300           # 5 phút sau lần chấp nhận
+    with pytest.raises(urllib.request.HTTPError):
+        urllib.request.urlopen(f"http://127.0.0.1:{port}/websub?{q}", timeout=3)
+    e.stop()

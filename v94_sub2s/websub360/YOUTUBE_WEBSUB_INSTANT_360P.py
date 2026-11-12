@@ -925,7 +925,17 @@ def load_shared_secret(base: Path, db: "DB | None" = None) -> str:
             return v
     except OSError:
         pass
-    v = (db.meta_get("websub_secret") if db is not None else None) or secrets.token_hex(24)   # giữ secret cũ nếu có
+    v = None
+    main_db = base / "database.sqlite"                     # ưu tiên secret CŨ của tool chính (hub đang giữ secret này)
+    if main_db.exists():
+        try:
+            con = sqlite3.connect(f"file:{main_db}?mode=ro", uri=True, timeout=5)
+            row = con.execute("SELECT v FROM meta WHERE k='websub_secret'").fetchone()
+            con.close()
+            v = row[0] if row else None
+        except sqlite3.Error:
+            v = None
+    v = v or (db.meta_get("websub_secret") if db is not None else None) or secrets.token_hex(24)
     tmp = f.with_suffix(".tmp")
     tmp.write_text(v, encoding="utf-8")
     os.replace(tmp, f)
@@ -955,11 +965,24 @@ class Engine:
         self.active = set()
         self.active_lock = threading.Lock()
         self.life_lock = threading.Lock()
-        self.pending_hub = {}                 # channel → (mode, thời điểm) yêu cầu ta THỰC SỰ gửi tới hub
+        self.pending_hub = {}                 # (channel, mode) → thời điểm yêu cầu ta THỰC SỰ gửi tới hub
+        self.pending_ok = {}                  # (channel, mode) → thời điểm đã chấp nhận xác minh
         self.hub_lock = threading.Lock()
         self.resolver = Resolver(log)
+        old_secret = self.db.meta_get("websub_secret")
         self.secret = load_shared_secret(base, self.db)
+        if old_secret and old_secret != self.secret and self.db.meta_get("subs_secret_sig") is None:
+            # DB này từng đăng ký với secret cũ → buộc vòng WebSub coi là 'secret đổi' và đăng ký lại toàn bộ
+            self.db.meta_set("subs_secret_sig", hashlib.sha256(old_secret.encode()).hexdigest()[:16])
         self.db.meta_set("websub_secret", self.secret)
+        try:
+            last_alive = float(self.db.meta_get("last_alive") or 0)
+        except ValueError:
+            last_alive = 0.0
+        self.offline_gap_s = max(0.0, time.time() - last_alive) if last_alive else 0.0
+        self.old_logged = set()
+        self.inbox_db = None          # SELFTEST: push THẬT nhận nhầm → chuyển vào database.sqlite của tool chính
+        self.sim_vids = set()         # SELFTEST: video id của sự kiện giả lập
         self.threads = []
         self.httpd = None
         self.callback = ""
@@ -1126,8 +1149,11 @@ class Engine:
             return "foreign"
         if published is not None:
             age = (now_utc() - published).total_seconds()
-            if age > float(self.cfg.get("max_age_minutes", 30)) * 60:
-                self._mark_seen(vid, ch, f"old:{int(age)}s")
+            if age > self.max_age_window():
+                # KHÔNG đánh dấu 'đã thấy' vĩnh viễn: chỉ ghi nhật ký để có thể xem lại
+                self.hub_event(ch, "push-old", "", None, 0, f"{vid} published {iso(published)} tuổi {int(age)}s")
+                with self.seen_lock:
+                    self.old_logged.add(vid)
                 return "old"
         with self.seen_lock:
             if vid in self.seen:
@@ -1163,6 +1189,13 @@ class Engine:
                                                  meta.get("detected_at") or iso(), meta.get("published"), state, enq_ms))
         if enq_ms is not None:
             self.db.upd(vid, enqueue_ms=enq_ms)
+
+    def max_age_window(self) -> float:
+        """Cửa sổ 'video MỚI' = max(max_age_minutes, thời gian tool/webhook đã tắt trước lần chạy này + 10 phút), tối đa 24h.
+        Nhờ vậy push mà hub GỬI LẠI sau khi tool/ngrok tắt một lúc (video đăng trong lúc tắt) vẫn được tải."""
+        base = float(self.cfg.get("max_age_minutes", 30)) * 60
+        gap = getattr(self, "offline_gap_s", 0.0)
+        return min(max(base, gap + 600), 86400.0)
 
     def _mark_seen(self, vid, ch, why):
         with self.seen_lock:
@@ -1528,10 +1561,12 @@ class Engine:
                                  "lease_seconds=excluded.lease_seconds, state='VERIFIED', error=NULL, attempts=0",
                                  (ch, eng.callback, time.time(), lease))
                         eng.hub_event(ch, "verify", mode, 200, 1, f"lease {lease}s")
+                        eng.hub_accepted(ch, mode)
                         eng.log(f"✅ Hub XÁC MINH kênh {ch} | lease {lease}s")
                     else:
                         eng.db.x("UPDATE subs SET state='UNSUBSCRIBED' WHERE channel_id=?", (ch,))
                         eng.hub_event(ch, "verify", mode, 200, 1, "huỷ")
+                        eng.hub_accepted(ch, mode)
                     return self._reply(200, q["hub.challenge"].encode())   # giữ pending: hub có thể gửi lại xác minh
                 eng.hub_event(ch or "", "verify", mode, 404, 0, "hub.challenge quá dài")
                 return self._reply(404)
@@ -1557,6 +1592,11 @@ class Engine:
                 self._reply(204)                              # ACK ngay — xử lý sau, không bắt hub chờ
                 if not ok:
                     eng.log("🚫 WebSub POST sai/thiếu chữ ký HMAC — bỏ qua")
+                    try:
+                        ids = [(x["channel_id"], x["video_id"]) for x in parse_atom(raw)][:3]
+                    except Exception:  # noqa: BLE001
+                        ids = []
+                    eng.hub_event(ids[0][0] if ids else "", "push-badsig", "", None, 0, str(ids))
                     return
                 eng.handle_push(raw, t_recv)
 
@@ -1607,11 +1647,32 @@ class Engine:
             ch = e["channel_id"]
             if ch:
                 self.db.x("UPDATE subs SET last_push=? WHERE channel_id=?", (time.time(), ch))
+            if self.inbox_db is not None and e["video_id"] not in self.sim_vids:
+                self._divert_to_main(e)
+                continue
             r = self.on_event(ch, e["video_id"], "WEBSUB", e["published"], e["title"], t_recv_ns)
             if r == "old":
                 self.log(f"↩️ WebSub: {e['video_id']} là CẬP NHẬT video cũ (published {e['published']}) — không tải")
             elif r == "foreign":
                 self.log(f"↩️ WebSub: kênh {ch} không còn trong Excel — bỏ qua")
+
+    def _divert_to_main(self, e):
+        """SELFTEST đang giữ cổng chính mà nhận PUSH THẬT → không tải ở môi trường test; ghi vào database.sqlite của tool
+        chính (QUEUED + Excel PENDING) để tool chính tải + ghi check.xlsx ngay khi mở lại (recover)."""
+        ch, vid = e["channel_id"], e["video_id"]
+        if not VID_RE.match(vid or "") or not self.monitored(ch):
+            return
+        pub = iso(e["published"]) if e["published"] else None
+        okey = pub or iso()
+        try:
+            self.inbox_db.tx([
+                ("INSERT OR IGNORE INTO videos(video_id, channel_id, url, title, engine, detected_at, published_at, state) "
+                 "VALUES(?,?,?,?,?,?,?,?)", (vid, ch, video_url(vid), e["title"], "WEBSUB", iso(), pub, "QUEUED")),
+                ("INSERT OR IGNORE INTO excel_jobs(video_id, channel_id, url, state, created_at, order_key) VALUES(?,?,?,?,?,?)",
+                 (vid, ch, video_url(vid), "PENDING", iso(), okey))])
+            self.log(f"📥 PUSH THẬT trong lúc SELFTEST: {vid} (kênh {ch}) → chuyển cho tool chính (sẽ tải khi mở START.bat)")
+        except Exception as ex:  # noqa: BLE001
+            self.log(f"❌ không chuyển được push thật {vid} cho tool chính: {type(ex).__name__}: {ex}")
 
     def resolve_callback(self) -> str:
         cb = str(self.cfg.get("callback_url") or "").strip()
@@ -1630,6 +1691,16 @@ class Engine:
             cb = cb.rstrip("/") + self.cfg.get("websub_path", "/websub")
         return cb
 
+    def verified_count(self, since=None) -> int:
+        """Chỉ đếm kênh ĐANG theo dõi, đã được hub xác minh THẬT cho callback hiện tại và lease còn hạn."""
+        chans = list(self.channels)
+        if not chans or not self.callback:
+            return 0
+        q = (f"SELECT COUNT(*) c FROM subs WHERE state='VERIFIED' AND callback=? AND verified_at + lease_seconds > ? "
+             f"AND channel_id IN ({','.join('?' * len(chans))})" + (" AND verified_at > ?" if since else ""))
+        args = [self.callback, time.time(), *chans] + ([since] if since else [])
+        return self.db.one(q, args)["c"]
+
     def hub_event(self, ch, kind, mode, http, accepted, detail=""):
         try:
             self.db.x("INSERT INTO hub_events(at, channel_id, kind, mode, http, accepted, detail) VALUES(?,?,?,?,?,?,?)",
@@ -1638,9 +1709,20 @@ class Engine:
             pass
 
     def hub_asked(self, ch, mode) -> bool:
+        """Chỉ chấp nhận xác minh trong 30 phút sau khi tool THỰC SỰ gửi yêu cầu; sau khi đã chấp nhận 1 lần,
+        chỉ cho hub gửi lại thêm trong 2 phút (phản hồi đầu bị mất) → challenge giả mạo/phát lại về sau bị từ chối."""
         with self.hub_lock:
             t = self.pending_hub.get((ch, mode))
-        return bool(t and time.time() - t < 6 * 3600)
+            ok_at = self.pending_ok.get((ch, mode))
+        if not t:
+            return False
+        if ok_at:
+            return time.time() - ok_at < 120
+        return time.time() - t < 1800
+
+    def hub_accepted(self, ch, mode):
+        with self.hub_lock:
+            self.pending_ok.setdefault((ch, mode), time.time())
 
     def hub_done(self, ch, mode):
         with self.hub_lock:
@@ -1649,6 +1731,7 @@ class Engine:
     def _hub(self, mode, ch, cb):
         with self.hub_lock:
             self.pending_hub[(ch, mode)] = time.time()
+            self.pending_ok.pop((ch, mode), None)
             self.pending_hub.pop((ch, "unsubscribe" if mode == "subscribe" else "subscribe"), None)
         data = {"hub.mode": mode, "hub.topic": TOPIC_FMT.format(ch), "hub.callback": cb, "hub.verify": "async"}
         if mode == "subscribe":
@@ -1678,8 +1761,11 @@ class Engine:
                     self.log(f"❌ Hub trả HTTP {code} khi đăng ký kênh {ch}: {body[:120]}")
                 ok += st != "ERROR"
             except Exception as e:  # noqa: BLE001
-                self.db.x("INSERT INTO subs(channel_id, callback, requested_at, state, error) VALUES(?,?,?,?,?) "
+                self.log(f"❌ Gửi đăng ký kênh {ch} tới hub lỗi mạng: {type(e).__name__}: {str(e)[:120]} → sẽ gửi lại theo lịch")
+                self.hub_event(ch, "subscribe", "subscribe", None, 0, f"{type(e).__name__}: {str(e)[:150]}")
+                self.db.x("INSERT INTO subs(channel_id, callback, requested_at, state, error, attempts, last_http) VALUES(?,?,?,?,?,1,NULL) "
                           "ON CONFLICT(channel_id) DO UPDATE SET error=excluded.error, requested_at=excluded.requested_at, "
+                          "attempts=COALESCE(subs.attempts,0)+1, last_http=NULL, "
                           "state=CASE WHEN subs.state='VERIFIED' AND subs.callback=excluded.callback "
                           "AND subs.verified_at + subs.lease_seconds > excluded.requested_at THEN 'VERIFIED' ELSE 'ERROR' END",
                           (ch, cb, time.time(), "ERROR", f"{type(e).__name__}"))
@@ -1740,9 +1826,10 @@ class Engine:
             missing = [c for c in self.channels if not self.db.one("SELECT 1 FROM subs WHERE channel_id=?", (c,))]
             if renew or missing:
                 self.subscribe_all(renew + missing)
-            self.stats["websub_verified"] = self.db.one(
-                "SELECT COUNT(*) c FROM subs WHERE state='VERIFIED' AND callback=? AND verified_at + lease_seconds > ?",
-                (self.callback, time.time()))["c"]
+            for r in self.db.all("SELECT channel_id, state FROM subs WHERE state NOT IN ('REMOVED','UNSUBSCRIBED')"):
+                if r["channel_id"] not in self.channels:          # kênh đã rời cột K (kể cả lúc tool tắt)
+                    self._unsubscribe(r["channel_id"])
+            self.stats["websub_verified"] = self.verified_count()
             self.stats["webhook"] = f"{self.callback}"
             self.stop_ev.wait(float(self.cfg.get("websub_loop_sec", 30)))
 
@@ -1770,7 +1857,14 @@ class Engine:
             self.stop_ev.wait(20)
 
     def _stats_loop(self):
+        n = 0
         while not self.stop_ev.wait(1.0):
+            n += 1
+            if n % 15 == 0:
+                try:
+                    self.db.meta_set("last_alive", time.time())     # đo thời gian tắt cho cửa sổ 'video mới'
+                except Exception:
+                    pass
             if self.on_stats:
                 try:
                     s = dict(self.stats)
@@ -1923,7 +2017,10 @@ def selftest(cfg, base, video_id=None, wait_verify=90):
             pass
     eng = Engine(tcfg, base, log, db_name=db_test.name, lock_name="ws360_selftest.lock")
     try:
-        eng.start(websub=True)
+        eng.start(websub=False)          # KHÔNG chạy vòng đăng ký nền: chỉ đăng ký tường minh ở TEST2c (khi tool chính tắt)
+        eng.start_webhook()
+        if not main_busy:
+            eng.inbox_db = DB(base / "database.sqlite")   # push THẬT tới trong lúc test → chuyển cho tool chính
     except Exception as e:  # noqa: BLE001
         rec("SELFTEST khởi động", "FAIL", f"{type(e).__name__}: {e}")
         _write_selftest_report(base, res, log)
@@ -1958,21 +2055,24 @@ def selftest(cfg, base, video_id=None, wait_verify=90):
                 rec("TEST2b callback HTTPS công khai", "PASS" if okp and cb.startswith("https://") else "FAIL", cb)
             except Exception as e:
                 rec("TEST2b callback HTTPS công khai", "FAIL", f"{cb}: {type(e).__name__}: {e}")
+            eng.db.x("DELETE FROM subs")                 # xoá dấu vết xác minh GIẢ LẬP của TEST2a/2b trước khi đo thật
+            eng.db.x("DELETE FROM hub_events")
             eng.callback = cb
+            t_send = time.time()
             n = eng.subscribe_all()
             t_end = time.time() + wait_verify
             while time.time() < t_end:
-                v = eng.db.one("SELECT COUNT(*) c FROM subs WHERE state='VERIFIED'")["c"]
-                if v >= len(chans):
+                if eng.verified_count(since=t_send) >= len(chans):
                     break
                 time.sleep(2)
-            v = eng.db.one("SELECT COUNT(*) c FROM subs WHERE state='VERIFIED'")["c"]
-            lease = eng.db.one("SELECT MIN(lease_seconds) a, MAX(lease_seconds) b FROM subs WHERE state='VERIFIED'")
+            v = eng.verified_count(since=t_send)        # chỉ xác minh THẬT từ hub, sau lần gửi này
+            lease = eng.db.one("SELECT MIN(lease_seconds) a, MAX(lease_seconds) b FROM subs WHERE state='VERIFIED' AND verified_at > ?",
+                               (t_send,))
             rec("TEST2c đăng ký hub thật + xác minh", "PASS" if v == len(chans) else ("FAIL" if v == 0 else "PARTIAL"),
                 f"gửi {n}/{len(chans)} (HTTP 202) | hub GỌI XÁC MINH {v}/{len(chans)} | lease {lease['a']}–{lease['b']}s")
             for chx in chans:                                         # từng kênh CHƯA xác minh: in đủ bằng chứng
                 rr = eng.db.one("SELECT * FROM subs WHERE channel_id=?", (chx,))
-                if rr and rr["state"] == "VERIFIED":
+                if rr and rr["state"] == "VERIFIED" and (rr["verified_at"] or 0) > t_send:
                     continue
                 ev = eng.db.all("SELECT * FROM hub_events WHERE channel_id=? ORDER BY id DESC LIMIT 3", (chx,))
                 hd = hub_details(cfg, cb, chx, eng.secret)
@@ -1985,6 +2085,7 @@ def selftest(cfg, base, video_id=None, wait_verify=90):
                 f'xmlns="http://www.w3.org/2005/Atom"><entry><yt:videoId>AAAAAAAAAAA</yt:videoId>'
                 f'<yt:channelId>{ch0}</yt:channelId><title>t</title><published>2000-01-01T00:00:00+00:00</published>'
                 f'</entry></feed>').encode()
+        eng.sim_vids.add("AAAAAAAAAAA")
         bad_req = urllib.request.Request(f"http://127.0.0.1:{port}{cfg['websub_path']}", data=body,
                                          headers={"X-Hub-Signature": "sha1=deadbeef", "Content-Type": "application/atom+xml"})
         with urllib.request.urlopen(bad_req, timeout=3):
@@ -1997,7 +2098,9 @@ def selftest(cfg, base, video_id=None, wait_verify=90):
         with urllib.request.urlopen(good, timeout=3):
             pass
         time.sleep(0.3)
-        old_ok = eng.db.one("SELECT why FROM seen WHERE video_id='AAAAAAAAAAA'")
+        old_ok = eng.db.one("SELECT detail FROM hub_events WHERE kind='push-old' AND detail LIKE 'AAAAAAAAAAA%'")
+        bad_ok = bad_ok and bool(eng.db.one("SELECT 1 FROM hub_events WHERE kind='push-badsig'")) and \
+            not eng.db.one("SELECT 1 FROM videos WHERE video_id='AAAAAAAAAAA'")
         rec("TEST2d POST sai chữ ký bị chặn, POST đúng chữ ký (video cũ) nhận nhưng không tải", "PASS" if bad_ok and old_ok else "FAIL",
             f"chặn={bad_ok}, cập-nhật-cũ={dict(old_ok) if old_ok else None}")
         # TEST 3
@@ -2010,6 +2113,7 @@ def selftest(cfg, base, video_id=None, wait_verify=90):
                     f'xmlns="http://www.w3.org/2005/Atom"><entry><yt:videoId>{video_id}</yt:videoId>'
                     f'<yt:channelId>{ch0}</yt:channelId><title>SELFTEST (giả lập, không phải video mới thật)</title>'
                     f'<published>{iso()}</published></entry></feed>').encode()
+            eng.sim_vids.add(video_id)
             sig = hmac.new(eng.secret.encode(), body, hashlib.sha1).hexdigest()
             rq = urllib.request.Request(f"http://127.0.0.1:{port}{cfg['websub_path']}", data=body,
                                         headers={"X-Hub-Signature": f"sha1={sig}"})
@@ -2130,8 +2234,11 @@ def diag(cfg, base, resubscribe=False, wait_s=120):
         pc, ptxt = http_status(CHANNEL_PAGE_FMT.format(ch))
         page_ok = pc == 200 and ch in (ptxt or "") and "This channel doesn" not in (ptxt or "")
         state = r["state"] if r else "CHƯA ĐĂNG KÝ"
-        if state == "VERIFIED":
-            concl = "OK — đã xác minh"
+        if state == "VERIFIED" and r["callback"] == cb and (r["verified_at"] or 0) + (r["lease_seconds"] or 0) > time.time():
+            concl = f"OK — hub đã xác minh, lease tới {datetime.fromtimestamp(r['verified_at'] + r['lease_seconds']):%d/%m %H:%M}"
+        elif state == "VERIFIED":
+            concl = ("VERIFIED nhưng cho CALLBACK CŨ " + str(r["callback"]) if r["callback"] != cb else "VERIFIED nhưng LEASE ĐÃ HẾT") + \
+                " → mở tool chính để đăng ký lại"
         elif pc is not None and not page_ok:
             concl = f"Trang kênh trả HTTP {pc} / không thấy kênh → Channel ID có thể SAI hoặc kênh bị xoá/ẩn; kiểm tra ô cột K"
         elif r is None:
