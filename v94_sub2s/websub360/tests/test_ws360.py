@@ -86,6 +86,14 @@ class FakeHub:
                 n = int(self.headers.get("Content-Length") or 0)
                 q = {k: v[0] for k, v in parse_qs(self.rfile.read(n).decode()).items()}
                 hub.reqs.append(q)
+                if q.get("hub.verify") == "sync":
+                    ok = hub._verify(q)
+                    body = b"" if ok else b"Error trying to confirm subscription"
+                    self.send_response(204 if ok else 409)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 self.send_response(202)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
@@ -98,7 +106,7 @@ class FakeHub:
     def _verify(self, q):
         time.sleep(0.05)
         chal = "c" + os.urandom(6).hex()
-        u = q["hub.callback"] + "?" + urlencode({"hub.mode": q["hub.mode"], "hub.topic": q["hub.topic"],
+        u = q["hub.callback"] + ("&" if "?" in q["hub.callback"] else "?") + urlencode({"hub.mode": q["hub.mode"], "hub.topic": q["hub.topic"],
                                                   "hub.challenge": chal, "hub.lease_seconds": "432000"})
         try:
             with urllib.request.urlopen(u, timeout=3) as r:
@@ -109,6 +117,7 @@ class FakeHub:
         self.verified[ch] = (q["hub.mode"], ok)
         if q.get("hub.secret"):
             self.secret[ch] = q["hub.secret"]
+        return ok
 
     def push(self, callback, ch, vid, published=None, title="t", sign=True, secret=None):
         body = atom(ch, vid, published or datetime.now(timezone.utc), title)
@@ -953,7 +962,8 @@ def test_secret_change_forces_full_resubscribe(tmp_path):
         end = time.time() + 5
         while time.time() < end and len(hub.verified) < 3:
             time.sleep(0.1)
-        assert any("secret HMAC đổi" in l for l in e._logs)
+        assert any("đăng ký lại TOÀN BỘ" in l for l in e._logs)
+        assert e.callback.endswith("g=" + ws.secret_fp(e.secret))          # callback mang thế hệ của secret hiện tại
         assert {q["hub.secret"] for q in hub.reqs} == {e.secret} and len(hub.verified) == 3
         e.stop()
     finally:
@@ -1137,8 +1147,8 @@ def test_failed_first_excel_read_never_unsubscribes(tmp_path):
 
 
 # ------------------------------------------------------------------ HMAC (điều tra 14:43 POST sai chữ ký)
-def _post(port, body, headers):
-    req = urllib.request.Request(f"http://127.0.0.1:{port}/websub", data=body, headers=headers)
+def _post(port, body, headers, query=""):
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/websub{query}", data=body, headers=headers)
     return urllib.request.urlopen(req, timeout=3).status
 
 
@@ -1263,19 +1273,24 @@ def test_post_classification_codes_and_queues(tmp_path, gvs, media, monkeypatch)
         assert _post(port, ok, dict(ffg, **{"X-Hub-Signature": sign(ok)})) == 204
         foreign = atom("UCAqQb0yK6XkD8WS_0CKNXCQ", "tTN8iaYHO98", now)            # kênh KHÔNG có trong cột K
         assert _post(port, foreign, dict(ffg, **{"X-Hub-Signature": sign(foreign, "x" * 48)})) == 204
-        bad = atom(CH[1], "INVALIDSIG1", now)                                     # kênh có thuê bao xác minh, chữ ký sai
-        assert _post(port, bad, dict(ffg, **{"X-Hub-Signature": sign(bad, "y" * 48)})) == 204
+        gq = "?g=" + ws.secret_fp(e.secret)
+        bad = atom(CH[1], "INVALIDSIG1", now)              # kênh có thuê bao xác minh, ĐÚNG callback hiện tại, chữ ký sai
+        assert _post(port, bad, dict(ffg, **{"X-Hub-Signature": sign(bad, "y" * 48)}), gq) == 204
+        oldgen = atom(CH[1], "OLDGENPOST1", now)           # POST tới callback thế hệ cũ (không có g) → thuê bao cũ
+        assert _post(port, oldgen, dict(ffg, **{"X-Hub-Signature": sign(oldgen, "y" * 48)})) == 204
         miss = atom(CH[1], "MISSINGSIG1", now)
         assert _post(port, miss, ffg) == 204
         r = wait_state(e, "VALIDSIG001")
         assert r["state"] == "DONE" and wait_excel(e, "VALIDSIG001")["state"] == "DONE"
         kinds = {r["kind"] for r in e.db.all("SELECT kind FROM hub_events WHERE kind LIKE 'push-%'")}
-        assert {"push-VALID_SIGNATURE", "push-UNKNOWN_CHANNEL", "push-INVALID_SIGNATURE", "push-MISSING_SIGNATURE"} <= kinds
+        assert {"push-VALID_SIGNATURE", "push-UNKNOWN_CHANNEL", "push-INVALID_SIGNATURE", "push-MISSING_SIGNATURE",
+                "push-UNKNOWN_SUBSCRIPTION"} <= kinds
+        assert "THẾ HỆ CŨ" in e.db.one("SELECT detail FROM hub_events WHERE kind='push-UNKNOWN_SUBSCRIPTION'")["detail"]
         assert {r["video_id"] for r in e.db.all("SELECT video_id FROM videos")} == {"VALIDSIG001"}   # chỉ POST hợp lệ vào hàng đợi
         time.sleep(0.5)
         assert any(q["hub.mode"] == "unsubscribe" and "UCAqQb0yK6XkD8WS_0CKNXCQ" in q["hub.topic"] for q in hub.reqs)
         saved = sorted((tmp_path / "logs" / "rejected_posts").glob("*.json"))
-        assert len(saved) == 3 and any("UNKNOWN_CHANNEL_tTN8iaYHO98" in p.name for p in saved)
+        assert len(saved) == 4 and any("UNKNOWN_CHANNEL_tTN8iaYHO98" in p.name for p in saved)
         logs = "\n".join(e._logs)
         assert "🚫 UNKNOWN_CHANNEL" in logs and "🚫 INVALID_SIGNATURE" in logs and "🚫 MISSING_SIGNATURE" in logs
         assert e.secret not in logs
@@ -1324,3 +1339,97 @@ def test_verify_post_cli_on_saved_request(tmp_path, capsys):
     assert e.secret not in out
     (tmp_path / "websub_secret_history.txt").write_text(f"{'9a' * 24} {int(time.time())}\n")   # nếu secret đó là secret cũ của tool
     assert "KHỚP secret CŨ" in ws.verify_post(dict(ws.DEFAULT_CONFIG), tmp_path, str(f))["ket_luan"]
+
+
+# ------------------------------------------------------------------ chẩn đoán hub (DIAG chỉ hiện "Error")
+def test_hub_details_returns_full_message_and_scrubs_secret(tmp_path):
+    sec = "ab" * 24
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            return
+
+        def do_GET(self):
+            from urllib.parse import urlparse as up
+            q = parse_qs(up(self.path).query)
+            has = "hub.secret" in q
+            body = (f"<html><h1>Error</h1><p>Could not find any record for topic URL: x</p>"
+                    f"<p>echo secret={q.get('hub.secret', [''])[0]}</p></html>").encode()
+            self.send_response(404 if has else 200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        cfg = dict(ws.DEFAULT_CONFIG, hub_url=f"http://127.0.0.1:{srv.server_address[1]}/subscribe")
+        hd = ws.hub_details(cfg, "https://x/websub", CH[0], sec, save_dir=tmp_path / "hd")
+        short = ws.hub_details_short(hd)
+        assert "HTTP 404" in short and "Could not find any record" in short and "không secret" in short
+        assert sec not in short and sec not in (tmp_path / "hd" / f"{CH[0]}_sec.html").read_text(encoding="utf-8")
+    finally:
+        srv.shutdown()
+
+
+def test_health_get_vs_real_verification_are_distinguished(tmp_path):
+    e = make_engine(tmp_path, CH[:1])
+    e.start(workers=False)
+    port = e.httpd.server_address[1]
+    assert urllib.request.urlopen(f"http://127.0.0.1:{port}/websub", timeout=3).read() == b"WS360 OK"
+    with e.hub_lock:
+        e.pending_hub[(CH[0], "subscribe")] = time.time()
+    q = urlencode({"hub.mode": "subscribe", "hub.topic": ws.TOPIC_FMT.format(CH[0]), "hub.challenge": "cc"})
+    assert urllib.request.urlopen(f"http://127.0.0.1:{port}/websub?{q}", timeout=3).read() == b"cc"
+    kinds = [r["kind"] for r in e.db.all("SELECT kind FROM hub_events ORDER BY id")]
+    assert kinds.count("health-get") == 1 and kinds.count("verify") == 1
+    e.stop()
+
+
+def test_secret_generation_in_callback_and_old_generation_verification_rejected(tmp_path):
+    e = make_engine(tmp_path, CH[:1], callback_url="https://abc.ngrok-free.dev/websub")
+    cb = e.resolve_callback()
+    assert cb == "https://abc.ngrok-free.dev/websub?g=" + ws.secret_fp(e.secret)
+    e.start(workers=False)
+    port = e.httpd.server_address[1]
+    with e.hub_lock:
+        e.pending_hub[(CH[0], "subscribe")] = time.time()
+    q = urlencode({"g": "00000000", "hub.mode": "subscribe", "hub.topic": ws.TOPIC_FMT.format(CH[0]), "hub.challenge": "cc"})
+    with pytest.raises(urllib.request.HTTPError):
+        urllib.request.urlopen(f"http://127.0.0.1:{port}/websub?{q}", timeout=3)
+    assert "THẾ HỆ CŨ" in e.db.one("SELECT detail FROM hub_events WHERE kind='verify'")["detail"]
+    e.stop()
+
+
+def test_hubtest_sync_and_probe_against_spec_hub(tmp_path):
+    hub = FakeHub()
+    port = _free_port()
+    try:
+        make_excel(tmp_path / "check.xlsx", CH[:2])
+        cfg = dict(ws.DEFAULT_CONFIG, listen_host="127.0.0.1", listen_port=port, hub_url=hub.url,
+                   callback_url=f"http://127.0.0.1:{port}/websub")
+        out = "\n".join(ws.hubtest(cfg, tmp_path, n_channels=1, wait_s=3))
+        assert "HTTP 204" in out and "hub xác minh ĐỒNG BỘ thành công" in out
+        assert "hub GỌI ĐƯỢC tới máy bạn với callback mới" in out
+        assert (tmp_path / "HUBTEST_REPORT.md").exists()
+        reqs = [q for q in hub.reqs if q.get("hub.verify") == "sync"]
+        assert any("ws360probe" in q["hub.callback"] and q["hub.mode"] == "unsubscribe" for q in reqs)   # đăng ký thử được huỷ
+        db = ws.DB(tmp_path / "database.sqlite")
+        assert db.one("SELECT state FROM subs WHERE channel_id=?", (CH[0],))["state"] == "VERIFIED"
+        assert not db.one("SELECT 1 FROM subs WHERE callback LIKE '%ws360probe%'")                       # thử không đụng subs
+    finally:
+        hub.close()
+
+
+def test_hubtest_reports_when_hub_cannot_reach_callback(tmp_path):
+    hub = FakeHub()
+    hub._verify = lambda q: False                                         # hub không gọi tới được máy bạn
+    port = _free_port()
+    try:
+        make_excel(tmp_path / "check.xlsx", CH[:1])
+        cfg = dict(ws.DEFAULT_CONFIG, listen_host="127.0.0.1", listen_port=port, hub_url=hub.url,
+                   callback_url=f"http://127.0.0.1:{port}/websub")
+        out = "\n".join(ws.hubtest(cfg, tmp_path, n_channels=1, wait_s=1))
+        assert "HTTP 409" in out and "Error trying to confirm subscription" in out
+        assert "hub KHÔNG gọi tới máy bạn kể cả với callback mới" in out
+    finally:
+        hub.close()

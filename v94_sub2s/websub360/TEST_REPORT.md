@@ -80,6 +80,35 @@ Bản này giúp xác định nguyên nhân NGAY TRÊN MÁY BẠN:
 - `hub.secret` gửi khi subscribe luôn là secret trong `websub_secret.txt`. Dấu vân tay của nó được lưu theo từng kênh
   (`subs.secret_fp`), và lúc hub xác minh thì lưu thêm (`subs.verified_secret_fp`).
 
+## DIAG: 15/15 REQUESTED, hub không gọi xác minh, cột hub chỉ hiện "Error"
+
+**Vì sao chỉ hiện "Error" (lỗi code chẩn đoán, đã sửa):** `hub_details()` chỉ giữ những dòng chứa một số từ khoá
+(state/verif/error…). Trang của hub có tiêu đề "Error", còn câu giải thích nằm ở dòng khác không chứa từ khoá nào,
+nên bị lọc mất. Hàm cũng không ghi mã HTTP. Bản mới ghi: mã HTTP, toàn bộ thông điệp (đã xoá secret và chữ ký), thử cả
+có và không có `hub.secret`, và lưu trang gốc (đã xoá bí mật) vào `logs/hub_details/`.
+
+**Yêu cầu đăng ký được ghi CHÍNH XÁC** vào `hub_events` cho từng lần gửi: hub_url, hub.mode, hub.topic
+(`/xml/feeds/videos.xml?channel_id=…`), hub.callback, hub.verify=async, hub.lease_seconds, hub.secret
+(chỉ ghi dấu vân tay và độ dài).
+
+**Phân biệt rõ:** `subscribe` HTTP 202 (hub nhận yêu cầu) / `verify` (GET xác minh THẬT, chỉ tính khi đã trả đúng
+hub.challenge) / `health-get` (GET không có challenge, ví dụ DIAG hay trình duyệt) / `denied` (hub từ chối) /
+`verify` bị tool từ chối (kèm lý do) / `verify-probe` (đăng ký thử của --hubtest, không đụng dữ liệu thật).
+
+**Dữ liệu thật của bạn cho thấy gì:**
+- Bảng request của ngrok có GET /websub lúc 13:39–13:40 (hub xác minh thuê bao lúc đó, secret cũ). Sau đó **không có GET
+  nào**, dù có 7–10 lần gửi 202 cho mỗi kênh.
+- Hai POST lúc 14:43:36 và 15:00:28 bị từ chối vì ký bằng secret cũ, đã mất khi `database.sqlite` bị ghi đè.
+- Nghĩa là các thuê bao CŨ vẫn hoạt động. Hub nhận yêu cầu mới (202) nhưng chưa gọi xác minh.
+
+**Đã sửa:** callback giờ mang thế hệ secret (`?g=<dấu vân tay>`). Lần đăng ký tới là thuê bao MỚI hoàn toàn trên hub
+(callback khác), nên hub phải xác minh như lần đầu, không còn là "đăng ký lại một thuê bao đã có".
+
+**Chưa chứng minh được từ máy test** (không có mạng tới hub Google). Việc phân biệt các khả năng còn lại:
+(1) hub không xác minh lại thuê bao đã có, (2) hub không gọi tới được callback, (3) hub đang trì hoãn,
+được làm bằng **DIAG.bat → 3 (`--hubtest`)** trên máy bạn. Test với hub giả theo đặc tả: sync thành công thì 204;
+hub không gọi tới được thì 409 kèm lý do, và báo cáo kết luận đúng.
+
 ## Review đối kháng
 
 Riêng các thay đổi WebSub đã qua 2 vòng review: vòng 3 xác nhận 13 lỗi, vòng 4 xác nhận thêm 3 lỗi do chính các bản sửa gây ra. **Đã sửa cả 16, mỗi lỗi có test hồi quy.**
@@ -88,7 +117,7 @@ Riêng các thay đổi WebSub đã qua 2 vòng review: vòng 3 xác nhận 13 l
 
 | # | Bài test | Kết quả | Ghi chú |
 |---|---|---|---|
-| A | Bộ test tự động `tests/test_ws360.py` | **56/56 PASS**, chạy 3 lần liên tiếp đều qua | hub WebSub giả (đúng đặc tả), máy chủ video giả, Excel thật, ffmpeg thật |
+| A | Bộ test tự động `tests/test_ws360.py` | **61/61 PASS**, chạy 3 lần liên tiếp đều qua | hub WebSub giả (đúng đặc tả), máy chủ video giả, Excel thật, ffmpeg thật |
 | B | Chỉ dùng WebSub, không polling/API | **PASS** | |
 | C | Đăng ký → hub gọi xác minh → VERIFIED, lease 432000 s | **PASS** (hub giả) | hub thật: chạy SELFTEST / DIAG trên máy bạn |
 | D | Kênh hub không xác minh: không bao giờ tính là đã xác minh, tự gửi lại theo lịch | **PASS** | |

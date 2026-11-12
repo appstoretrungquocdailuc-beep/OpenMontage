@@ -32,6 +32,23 @@ CHẠY HẰNG NGÀY
    - Mỗi lần hub gọi xác minh đều được log. Nếu tool từ chối thì log có dòng "🚫 XÁC MINH BỊ TỪ CHỐI" kèm lý do.
    - Lease được tự gia hạn khi đã qua 80% thời hạn. Callback hoặc secret thay đổi thì tool tự đăng ký lại toàn bộ.
 
+KÊNH CHƯA XÁC MINH / HUB KHÔNG GỌI XÁC MINH → DIAG.bat chọn 3 (KIỂM TRA SÂU)
+--------------------------------------------------------------------------
+Tắt START.bat, để ngrok chạy, rồi chạy DIAG.bat → 3. Tool làm 2 phép thử với 2 kênh đầu:
+  A) Đăng ký ĐỒNG BỘ (hub.verify=sync): hub phải gọi GET xác minh NGAY trong lúc xử lý yêu cầu.
+     Thành công → trả 204. Không xác minh được → trả 4xx kèm lý do.
+  B) Đăng ký THỬ với một callback MỚI (…&ws360probe=…): xem hub có gọi được tới máy bạn không, khi không dính
+     tới đăng ký cũ. Đăng ký thử được huỷ ngay sau đó và không đụng tới dữ liệu thật.
+Kết quả ghi vào HUBTEST_REPORT.md, có sẵn hướng dẫn đọc. Nội dung trang hub được lưu trong logs\hub_details\
+(đã xoá secret).
+
+CALLBACK THEO THẾ HỆ SECRET (callback_generation, mặc định BẬT)
+---------------------------------------------------------------
+Callback có dạng https://<ngrok>/websub?g=<dấu vân tay secret>. Thuê bao trên hub được xác định bởi cặp
+(callback, topic), nên khi secret đổi thì callback cũng đổi, và hub buộc phải tạo thuê bao MỚI và xác minh lại.
+Thuê bao cũ (secret cũ) tự hết hạn trong tối đa 5 ngày. POST của nó được ghi là UNKNOWN_SUBSCRIPTION
+"callback THẾ HỆ CŨ" thay vì một lỗi chữ ký khó hiểu.
+
 KÊNH CHƯA XÁC MINH (ví dụ 14/15) → DIAG.bat
 -------------------------------------------
 - Chọn 1: chẩn đoán nhanh, chạy được trong lúc tool chính đang mở.

@@ -35,5 +35,6 @@
     600,
     1800,
     3600
-  ]
+  ],
+  "callback_generation": true
 }

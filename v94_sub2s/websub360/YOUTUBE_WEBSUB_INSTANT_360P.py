@@ -98,6 +98,7 @@ DEFAULT_CONFIG = {
     "max_concurrent_downloads": 3,
     "v9_path": "",                     # đường dẫn V9_4_SUB2S.py (chỉ dùng để benchmark so sánh)
     "verify_retry_sec": [120, 300, 600, 1800, 3600],   # hub chưa gọi xác minh sau X s → gửi lại (giãn dần)
+    "callback_generation": True,       # callback = …/websub?g=<dấu vân tay secret>: đổi secret ⇒ thuê bao MỚI hoàn toàn
 }
 
 
@@ -1014,6 +1015,8 @@ class Engine:
         except ValueError:
             last_alive = 0.0
         self.last_alive_at_start = last_alive or None   # thời điểm cuối cùng lần chạy trước còn sống
+        self.last_request = {}
+        self.probes = {}              # --hubtest: probe id → [(thời điểm, mode)] các GET xác minh nhận được
         self.started_at = time.time()
         self.old_logged = set()
         self.inbox_db = None          # SELFTEST: push THẬT nhận nhầm → chuyển vào database.sqlite của tool chính
@@ -1576,10 +1579,27 @@ class Engine:
                         eng.db.x("UPDATE subs SET state='DENIED', error=? WHERE channel_id=?", (q.get("hub.reason", "")[:200], chd))
                         eng.log(f"⚠️ WebSub hub TỪ CHỐI kênh {chd}: {q.get('hub.reason', '')[:120]}")
                     return self._reply(200)
-                if "hub.challenge" not in q:
-                    return self._reply(200, b"WS360 OK")          # kiểm tra sống (health)
+                if "hub.challenge" not in q:                  # GET KIỂM TRA SỨC KHOẺ (không phải xác minh của hub)
+                    eng.hub_event("", "health-get", q.get("hub.mode", ""), 200, 1,
+                                  f"{eng.describe_source(self.client_address[0], self.headers)}")
+                    return self._reply(200, b"WS360 OK")
                 ch = norm_channel(q.get("hub.topic", ""))
                 mode = q.get("hub.mode", "")
+                src = eng.describe_source(self.client_address[0], self.headers)
+                probe = q.get("ws360probe", "")
+                if probe:                                      # GET xác minh cho đăng ký THỬ (--hubtest), không đụng subs
+                    if probe in eng.probes and len(q["hub.challenge"]) <= 512:
+                        eng.probes[probe].append((time.time(), mode))
+                        eng.hub_event(ch or "", "verify-probe", mode, 200, 1, f"probe {probe} | {src}")
+                        eng.log(f"🧪 HUB GỌI XÁC MINH (đăng ký thử {probe}, {mode}) kênh {ch} | {src}")
+                        return self._reply(200, q["hub.challenge"].encode())
+                    eng.hub_event(ch or "", "verify-probe", mode, 404, 0, f"probe lạ {probe} | {src}")
+                    return self._reply(404)
+                gen = q.get("g")
+                if gen is not None and eng.cfg.get("callback_generation", True) and gen != secret_fp(eng.secret):
+                    eng.hub_event(ch or "", "verify", mode, 404, 0, f"callback THẾ HỆ CŨ g={gen} | {src}")
+                    eng.log(f"🚫 XÁC MINH BỊ TỪ CHỐI | kênh {ch} | mode={mode} | lý do: callback thế hệ cũ g={gen}")
+                    return self._reply(404)
                 # chỉ xác nhận yêu cầu mà CHÍNH TOOL đã gửi (chống giả mạo trạng thái đăng ký từ internet)
                 asked = eng.hub_asked(ch, mode) if ch else False
                 if mode == "subscribe":
@@ -1593,7 +1613,7 @@ class Engine:
                            "tool chưa từng gửi yêu cầu '" + mode + "' cho kênh này (hoặc đã quá 6 giờ)" if not asked else
                            "kênh không còn trong Excel" if mode == "subscribe" else
                            "kênh vẫn đang theo dõi → từ chối lệnh huỷ cũ" if mode == "unsubscribe" else f"mode lạ '{mode}'")
-                    eng.hub_event(ch or q.get("hub.topic", "")[:80], "verify", mode, 404, 0, why)
+                    eng.hub_event(ch or q.get("hub.topic", "")[:80], "verify", mode, 404, 0, f"{why} | {src}")
                     eng.log(f"🚫 XÁC MINH BỊ TỪ CHỐI | kênh {ch} | mode={mode} | lý do: {why}")
                     return self._reply(404)
                 if len(q["hub.challenge"]) <= 512:
@@ -1609,7 +1629,8 @@ class Engine:
                                  "verified_secret_fp=subs.secret_fp",
                                  (ch, eng.callback, time.time(), lease))
                         sim = (ch, mode) in eng.sim_pending
-                        eng.hub_event(ch, "verify-sim" if sim else "verify", mode, 200, 1, f"lease {lease}s")
+                        eng.hub_event(ch, "verify-sim" if sim else "verify", mode, 200, 1,
+                                      f"GET XÁC MINH THẬT, đã trả đúng hub.challenge | lease {lease}s | {src}")
                         eng.hub_accepted(ch, mode)
                         if sim:
                             eng.log(f"🧪 (GIẢ LẬP SELFTEST) webhook trả đúng challenge cho kênh {ch} — KHÔNG phải hub Google xác minh")
@@ -1631,7 +1652,9 @@ class Engine:
                 if raw is None:
                     return
                 src = eng.describe_source(self.client_address[0], self.headers)
+                gen = (parse_qs(urlparse(self.path).query).get("g") or [""])[0]
                 verdict = eng.check_signature(raw, self.headers.get("X-Hub-Signature"))
+                verdict["gen"] = gen
                 self._reply(204)                              # ACK ngay — xử lý sau, không bắt hub chờ
                 eng.on_signed_post(raw, verdict, src, self.headers, t_recv)
 
@@ -1762,6 +1785,12 @@ class Engine:
             return "VALID_SIGNATURE", ids, ""
         if v["reason"].startswith("THIẾU"):
             return "MISSING_SIGNATURE", ids, v["reason"]
+        cur_gen = secret_fp(self.secret)
+        if self.cfg.get("callback_generation", True) and v.get("gen", None) is not None and v.get("gen") != cur_gen \
+                and any(self.monitored(c) for c in chans):
+            g = v.get("gen") or "(không có — đăng ký từ bản cũ, trước khi có thế hệ callback)"
+            return "UNKNOWN_SUBSCRIPTION", ids, (f"{v['reason']}; POST tới callback THẾ HỆ CŨ g={g} (hiện tại g={cur_gen}) → "
+                                                  "thuê bao cũ với secret cũ, sẽ tự hết hạn; thuê bao mới đang dùng callback hiện tại")
         if chans and not any(self.monitored(c) for c in chans):
             return "UNKNOWN_CHANNEL", ids, (f"{v['reason']}; kênh {chans} KHÔNG có trong {len(self.channels)} kênh cột K → "
                                              "thuê bao do bản cũ / tool khác / Excel cũ tạo, hub ký bằng secret khác → huỷ đăng ký")
@@ -1902,6 +1931,11 @@ class Engine:
                 cb = ""
         if cb and urlparse(cb).path in ("", "/"):
             cb = cb.rstrip("/") + self.cfg.get("websub_path", "/websub")
+        if cb and self.cfg.get("callback_generation", True) and "g=" not in urlparse(cb).query:
+            # Thuê bao trên hub được định danh bởi (callback, topic). Gắn 'thế hệ' = dấu vân tay secret vào callback:
+            # secret đổi ⇒ callback đổi ⇒ hub tạo thuê bao MỚI và PHẢI xác minh lại; thuê bao cũ (secret cũ) tự hết hạn
+            # và POST của nó được nhận diện rõ là 'thế hệ cũ' thay vì chữ ký sai bí ẩn.
+            cb = add_query(cb, {"g": secret_fp(self.secret)})
         return cb
 
     def verified_count(self, since=None) -> int:
@@ -1941,17 +1975,21 @@ class Engine:
         with self.hub_lock:
             self.pending_hub.pop((ch, mode), None)
 
-    def _hub(self, mode, ch, cb):
+    def _hub(self, mode, ch, cb, verify="async", timeout=(3, 8)):
         with self.hub_lock:
             self.pending_hub[(ch, mode)] = time.time()
             self.pending_ok.pop((ch, mode), None)
             self.pending_hub.pop((ch, "unsubscribe" if mode == "subscribe" else "subscribe"), None)
-        data = {"hub.mode": mode, "hub.topic": TOPIC_FMT.format(ch), "hub.callback": cb, "hub.verify": "async"}
+        data = {"hub.mode": mode, "hub.topic": TOPIC_FMT.format(ch), "hub.callback": cb, "hub.verify": verify}
         if mode == "subscribe":
             data["hub.secret"] = self.secret
             data["hub.lease_seconds"] = str(int(self.cfg.get("lease_seconds", 432000)))
-        r = requests.post(self.cfg["hub_url"], data=data, timeout=(3, 8))
-        return r.status_code, r.text[:200]
+        # bản ghi CHÍNH XÁC yêu cầu gửi hub (secret chỉ ghi dấu vân tay + độ dài)
+        self.last_request = {"hub_url": self.cfg["hub_url"], "hub.mode": mode, "hub.topic": data["hub.topic"],
+                             "hub.callback": cb, "hub.verify": verify, "hub.lease_seconds": data.get("hub.lease_seconds"),
+                             "hub.secret": (f"fp {secret_fp(self.secret)}, {len(self.secret)} ký tự" if mode == "subscribe" else None)}
+        r = requests.post(self.cfg["hub_url"], data=data, timeout=timeout)
+        return r.status_code, scrub(r.text, self.secret)[:300]
 
     def subscribe_all(self, chans=None):
         cb = self.callback
@@ -1971,7 +2009,9 @@ class Engine:
                           "state=CASE WHEN subs.state='VERIFIED' AND subs.callback=excluded.callback THEN 'VERIFIED' ELSE excluded.state END, "
                           "error=excluded.error, attempts=COALESCE(subs.attempts,0)+1, last_http=excluded.last_http",
                           (ch, cb, time.time(), st, None if st != "ERROR" else f"HTTP {code} {body}", code, secret_fp(self.secret)))
-                self.hub_event(ch, "subscribe", "subscribe", code, int(st != "ERROR"), body[:160] if st == "ERROR" else "")
+                self.hub_event(ch, "subscribe", "subscribe", code, int(st != "ERROR"),
+                               (f"HTTP {code} = hub NHẬN yêu cầu (chưa xác minh)" if st != "ERROR" else f"HTTP {code} {body[:200]}") +
+                               f" | gửi: {json.dumps(self.last_request, ensure_ascii=False)}")
                 if st == "ERROR":
                     self.log(f"❌ Hub trả HTTP {code} khi đăng ký kênh {ch}: {body[:120]}")
                 ok += st != "ERROR"
@@ -2268,7 +2308,7 @@ def selftest(cfg, base, video_id=None, wait_verify=90):
                     eng.pending_ok.pop((ch0, "subscribe"), None)
                 eng.sim_pending.add((ch0, "subscribe"))
                 q = urlencode({"hub.mode": "subscribe", "hub.topic": TOPIC_FMT.format(ch0), "hub.challenge": "pub456"})
-                req = urllib.request.Request(f"{cb}?{q}", headers={"ngrok-skip-browser-warning": "1"})
+                req = urllib.request.Request(cb + ("&" if "?" in cb else "?") + q, headers={"ngrok-skip-browser-warning": "1"})
                 with urllib.request.urlopen(req, timeout=8) as r:
                     okp = r.read() == b"pub456"
                 rec("TEST2b callback HTTPS công khai", "PASS" if okp and cb.startswith("https://") else "FAIL", cb)
@@ -2295,11 +2335,11 @@ def selftest(cfg, base, video_id=None, wait_verify=90):
                 if rr and rr["state"] == "VERIFIED" and (rr["verified_at"] or 0) > t_send:
                     continue
                 ev = eng.db.all("SELECT * FROM hub_events WHERE channel_id=? ORDER BY id DESC LIMIT 3", (chx,))
-                hd = hub_details(cfg, cb, chx, eng.secret)
+                hd = hub_details(cfg, cb, chx, eng.secret, save_dir=base / "logs" / "hub_details")
                 rec(f"TEST2c-kênh {chx}", "FAIL",
                     f"trạng thái {rr['state'] if rr else 'không có'} | HTTP đăng ký {rr['last_http'] if rr else '-'} | "
                     f"xác minh: {[(e['kind'], e['mode'], e['http'], 'OK' if e['accepted'] else 'TỪ CHỐI', e['detail']) for e in ev] or 'hub CHƯA gọi tới callback'} | "
-                    f"hub Google báo: {' / '.join(hd['lines'][:6]) or hd['http']}")
+                    f"hub Google báo: {hub_details_short(hd)}")
         # POST hợp lệ / không hợp lệ (qua chính webhook)
         body = (f'<?xml version="1.0"?><feed xmlns:yt="http://www.youtube.com/xml/schemas/2015" '
                 f'xmlns="http://www.w3.org/2005/Atom"><entry><yt:videoId>AAAAAAAAAAA</yt:videoId>'
@@ -2383,17 +2423,45 @@ def _strip_html(t: str) -> str:
     return "\n".join(" ".join(l.split()) for l in _h.unescape(t).splitlines() if l.strip())
 
 
-def hub_details(cfg, cb, ch, secret, timeout=10) -> dict:
-    """Hỏi CHÍNH hub Google trạng thái thuê bao (trang subscription-details). Không in secret ra log."""
+def scrub(text: str, *secrets_) -> str:
+    """Xoá mọi bí mật (secret, chữ ký) khỏi văn bản trước khi ghi báo cáo."""
+    t = str(text or "")
+    for sec in secrets_:
+        if sec:
+            t = t.replace(sec, f"<secret {secret_fp(sec)}>")
+    t = re.sub(r"(hub\.secret=)[^&\s\"']+", r"\1<ẩn>", t)
+    return re.sub(r"(sha(?:1|256|384|512)=)[0-9a-fA-F]{12,}", r"\1<ẩn>", t)
+
+
+def hub_details(cfg, cb, ch, secret, timeout=10, save_dir: Path | None = None) -> dict:
+    """Hỏi CHÍNH hub Google trang subscription-details. Trả: mã HTTP + TOÀN BỘ thông điệp (đã xoá bí mật) — trước đây
+    chỉ giữ dòng chứa vài từ khoá nên chỉ còn chữ 'Error' và mất câu giải thích. Thử cả có và không có hub.secret."""
     url = cfg["hub_url"].rsplit("/", 1)[0] + "/subscription-details"
-    try:
-        r = requests.get(url, params={"hub.callback": cb, "hub.topic": TOPIC_FMT.format(ch), "hub.secret": secret},
-                         timeout=timeout)
-        txt = _strip_html(r.text)
-        keep = [l for l in txt.splitlines() if re.search(r"(?i)state|verif|expir|deliver|error|lease|stat|callback|topic|time", l)]
-        return {"http": r.status_code, "lines": keep[:14]}
-    except Exception as e:  # noqa: BLE001
-        return {"http": None, "lines": [f"{type(e).__name__}: {e}"]}
+    out = {"http": None, "lines": [], "variants": []}
+    for label, params in (("có secret", {"hub.callback": cb, "hub.topic": TOPIC_FMT.format(ch), "hub.secret": secret}),
+                          ("không secret", {"hub.callback": cb, "hub.topic": TOPIC_FMT.format(ch)})):
+        try:
+            r = requests.get(url, params=params, timeout=timeout)
+            txt = scrub(_strip_html(r.text), secret)
+            lines = [l for l in txt.splitlines() if l.strip()][:25]
+            out["variants"].append({"label": label, "http": r.status_code, "lines": lines})
+            if save_dir is not None:
+                save_dir.mkdir(parents=True, exist_ok=True)
+                (save_dir / f"{ch}_{'sec' if 'hub.secret' in params else 'nosec'}.html").write_text(
+                    scrub(r.text, secret), encoding="utf-8")
+        except Exception as e:  # noqa: BLE001
+            out["variants"].append({"label": label, "http": None, "lines": [f"lỗi mạng: {type(e).__name__}: {str(e)[:150]}"]})
+    first = out["variants"][0] if out["variants"] else {"http": None, "lines": []}
+    out["http"], out["lines"] = first["http"], first["lines"]
+    return out
+
+
+def hub_details_short(hd) -> str:
+    parts = []
+    for v in hd.get("variants") or []:
+        msg = " / ".join(l for l in v["lines"] if l.lower() not in ("error",))[:220] or "(trang trống)"
+        parts.append(f"[{v['label']}] HTTP {v['http']}: {msg}")
+    return " ‖ ".join(parts) or f"HTTP {hd.get('http')}"
 
 
 def http_status(url, timeout=8, **kw):
@@ -2456,8 +2524,9 @@ def diag(cfg, base, resubscribe=False, wait_s=120):
         ev = eng.db.all("SELECT * FROM hub_events WHERE channel_id=? ORDER BY id DESC LIMIT 3", (ch,))
         evs = "; ".join(f"{datetime.fromtimestamp(e['at']):%H:%M:%S} {e['kind']}/{e['mode']} {e['http']} "
                         f"{'OK' if e['accepted'] else 'TỪ CHỐI'} {e['detail'] or ''}".strip() for e in ev) or "chưa có"
-        hd = hub_details(cfg, cb, ch, eng.secret) if cb and requests else {"http": None, "lines": []}
-        hds = " / ".join(hd["lines"][:6]) if hd["lines"] else f"HTTP {hd['http']}"
+        hd = hub_details(cfg, cb, ch, eng.secret, save_dir=base / "logs" / "hub_details") if cb and requests \
+            else {"http": None, "lines": []}
+        hds = hub_details_short(hd).replace("|", "/")
         pc, ptxt = http_status(CHANNEL_PAGE_FMT.format(ch))
         page_ok = pc == 200 and ch in (ptxt or "") and "This channel doesn" not in (ptxt or "")
         state = r["state"] if r else "CHƯA ĐĂNG KÝ"
@@ -2483,6 +2552,97 @@ def diag(cfg, base, resubscribe=False, wait_s=120):
         eng.stop()
     rep = base / "DIAG_REPORT.md"
     rep.write_text("\n".join(o.replace("\n", " ") if o.startswith("|") else o for o in out) + "\n", encoding="utf-8")
+    for o in out:
+        print(o)
+    log(f"📄 Đã ghi {rep}")
+    return out
+
+
+def add_query(url: str, params: dict) -> str:
+    return url + ("&" if "?" in url else "?") + urlencode(params)
+
+
+def hubtest(cfg, base, n_channels=2, wait_s=60):
+    """KIỂM TRA SÂU hub Google (tool chính PHẢI tắt, ngrok PHẢI chạy). Cho từng kênh thử:
+      A) đăng ký ĐỒNG BỘ (hub.verify=sync) callback hiện tại → hub phải gọi GET xác minh NGAY và trả 204 nếu thành công,
+         hoặc 4xx kèm lý do nếu không xác minh được → thấy trực tiếp nguyên nhân;
+      B) đăng ký THỬ với callback MỚI hoàn toàn (…?ws360probe=…) → phân biệt 'hub không gọi được tới máy bạn'
+         với 'hub không xác minh lại đăng ký ĐÃ CÓ'. Đăng ký thử được huỷ ngay sau đó.
+    Ghi HUBTEST_REPORT.md. Không ghi secret."""
+    log = Log(base / "logs")
+    out = [f"# HUBTEST — {VERSION} — {datetime.now():%Y-%m-%d %H:%M:%S}", ""]
+    if not port_free(cfg.get("listen_host", "0.0.0.0"), cfg.get("listen_port", 8765)):
+        msg = "Cổng đang bận → TẮT tool chính (START.bat) rồi chạy lại. (ngrok vẫn để chạy.)"
+        print(msg)
+        (base / "HUBTEST_REPORT.md").write_text("\n".join(out + [msg]) + "\n", encoding="utf-8")
+        return out + [msg]
+    eng = Engine(cfg, base, log)
+    eng.start(websub=False, workers=False, excel_watch=False)
+    try:
+        eng.start_webhook()
+        cb = eng.resolve_callback()
+        eng.callback = cb
+        out.append(f"Callback: {cb or 'KHÔNG CÓ (ngrok chưa chạy?)'}")
+        out.append(f"Secret hiện tại: dấu vân tay {secret_fp(eng.secret)}")
+        if not cb:
+            return out
+        try:
+            r = requests.get(cb, timeout=10)
+            out.append(f"GET sức khoẻ qua internet → HTTP {r.status_code} '{r.text[:20]}' "
+                       f"(phải là 200 'WS360 OK'; nếu là trang HTML của ngrok thì ngrok đang chặn)")
+        except Exception as e:  # noqa: BLE001
+            out.append(f"GET sức khoẻ qua internet → LỖI {type(e).__name__}: {e}")
+        out += ["", "| Kênh | Thử | Yêu cầu gửi hub | Hub trả lời | GET xác minh nhận được | Kết luận |", "|---|---|---|---|---|---|"]
+        for ch in list(eng.channels)[:max(1, n_channels)]:
+            # A) sync, callback hiện tại
+            t0 = time.time()
+            try:
+                code, body = eng._hub("subscribe", ch, cb, verify="sync", timeout=(5, 60))
+            except Exception as e:  # noqa: BLE001
+                code, body = None, f"lỗi mạng: {type(e).__name__}: {e}"
+            req = json.dumps(eng.last_request, ensure_ascii=False)
+            got = eng.db.all("SELECT * FROM hub_events WHERE channel_id=? AND kind='verify' AND at>=?", (ch, t0))
+            got_s = "; ".join(f"{e['http']} {'OK' if e['accepted'] else 'TỪ CHỐI'} {e['detail'][:80]}" for e in got) or "KHÔNG"
+            concl = ("hub xác minh ĐỒNG BỘ thành công → đăng ký với secret hiện tại đã có hiệu lực" if code == 204 else
+                     "hub chỉ nhận yêu cầu (202), KHÔNG xác minh đồng bộ" if code == 202 else
+                     f"hub TỪ CHỐI / không xác minh được: {body[:160]}")
+            out.append(f"| {ch} | A: sync, callback hiện tại | {req.replace('|', '/')} | HTTP {code}: {body[:160].replace('|', '/')} | "
+                       f"{got_s.replace('|', '/')} | {concl} |")
+            # B) callback MỚI (probe) — sync rồi async chờ
+            pid = secrets.token_hex(4)
+            eng.probes[pid] = []
+            pcb = add_query(cb, {"ws360probe": pid})
+            t1 = time.time()
+            try:
+                code2, body2 = eng._hub("subscribe", ch, pcb, verify="sync", timeout=(5, 60))
+            except Exception as e:  # noqa: BLE001
+                code2, body2 = None, f"lỗi mạng: {type(e).__name__}: {e}"
+            end = time.time() + (wait_s if code2 == 202 else 0)
+            while time.time() < end and not eng.probes[pid]:
+                time.sleep(1)
+            got2 = eng.probes[pid]
+            concl2 = ("hub GỌI ĐƯỢC tới máy bạn với callback mới" if got2 else
+                      "hub KHÔNG gọi tới máy bạn kể cả với callback mới → hub không tới được callback "
+                      "(ngrok/mạng) hoặc hub đang trì hoãn xác minh")
+            out.append(f"| {ch} | B: callback MỚI (thử) | callback …?ws360probe={pid}, verify=sync | HTTP {code2}: "
+                       f"{body2[:160].replace('|', '/')} | {len(got2)} lần sau {(got2[0][0] - t1) if got2 else 0:.1f}s | {concl2} |")
+            try:                                          # dọn đăng ký thử
+                eng._hub("unsubscribe", ch, pcb, verify="sync", timeout=(5, 30))
+            except Exception:  # noqa: BLE001
+                pass
+            hd = hub_details(cfg, cb, ch, eng.secret, save_dir=base / "logs" / "hub_details")
+            out.append(f"| {ch} | trang subscription-details | callback hiện tại | {hub_details_short(hd).replace('|', '/')} | | |")
+        out += ["", "Cách đọc:",
+                "- A=204: hub đã xác minh ngay → vấn đề đã hết, mở lại START.bat.",
+                "- A=202 và B có GET: hub tới được máy bạn nhưng KHÔNG xác minh lại đăng ký đã có (của secret cũ) → "
+                "bật 'callback_generation' (mặc định bật) để tool dùng callback mới theo secret.",
+                "- A và B đều không có GET: hub không gọi được tới callback → kiểm tra ngrok (cửa sổ ngrok phải 'online', "
+                "đúng cổng 8765), tường lửa, hoặc chờ hub (Google có thể trì hoãn).",
+                "- A=4xx: đọc lý do hub ghi trong cột 'Hub trả lời'."]
+    finally:
+        eng.stop()
+    rep = base / "HUBTEST_REPORT.md"
+    rep.write_text("\n".join(out) + "\n", encoding="utf-8")
     for o in out:
         print(o)
     log(f"📄 Đã ghi {rep}")
@@ -2602,6 +2762,7 @@ def main(argv=None):
     ap.add_argument("--diag", action="store_true", help="chẩn đoán từng kênh WebSub → DIAG_REPORT.md")
     ap.add_argument("--resubscribe", action="store_true", help="dùng với --diag: đăng ký lại cả danh sách rồi chờ hub xác minh")
     ap.add_argument("--verify-post", default="", help="kiểm lại 1 request bị từ chối đã lưu trong logs/rejected_posts")
+    ap.add_argument("--hubtest", action="store_true", help="kiểm tra sâu hub (đăng ký đồng bộ + callback thử) → HUBTEST_REPORT.md")
     a = ap.parse_args(argv)
     base = BASE_DIR
     os.chdir(base)
@@ -2612,6 +2773,9 @@ def main(argv=None):
             print(f"⚠️ '{a.video}' không phải ID/link video YouTube hợp lệ — bỏ qua TEST3")
         r = selftest(cfg, base, vid)
         return 0 if all(s != "FAIL" for _, s, _ in r) else 1
+    if a.hubtest:
+        hubtest(cfg, base)
+        return 0
     if a.verify_post:
         verify_post(cfg, base, a.verify_post)
         return 0
