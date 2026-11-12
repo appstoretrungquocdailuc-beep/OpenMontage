@@ -1163,9 +1163,11 @@ def test_hmac_correct_wrong_missing_and_no_secret_in_logs(tmp_path):
     time.sleep(0.5)
     vids = {r["video_id"] for r in e.db.all("SELECT video_id FROM videos")}
     assert vids == {"SIGSHA10001", "SIGSHA25601"}
-    ev = [r["detail"] for r in e.db.all("SELECT detail FROM hub_events WHERE kind='push-badsig'")]
-    assert any("KHÔNG khớp secret hiện tại" in d and "qua tunnel (ngrok) từ 66.249.1.1" in d for d in ev)
-    assert any("THIẾU header X-Hub-Signature" in d for d in ev)
+    ev = [(r["kind"], r["detail"]) for r in e.db.all("SELECT kind, detail FROM hub_events WHERE kind LIKE 'push-%'")]
+    assert any(k == "push-UNKNOWN_SUBSCRIPTION" and "KHÔNG khớp secret hiện tại" in d and "qua tunnel (ngrok) từ 66.249.1.1" in d
+               for k, d in ev)
+    assert any(k == "push-MISSING_SIGNATURE" and "THIẾU header X-Hub-Signature" in d for k, d in ev)
+    assert any(k == "push-VALID_SIGNATURE" for k, d in ev)
     logs = "\n".join(e._logs) + (tmp_path / "logs").glob("*.log").__next__().read_text(encoding="utf-8")
     assert e.secret not in logs and wrong not in logs and wrong[:6] + "…" in logs
     e.stop()
@@ -1217,7 +1219,7 @@ def test_old_secret_after_db_overwrite_is_recognised_and_resubscribed(tmp_path):
                                   "X-Forwarded-For": "66.249.1.1"}) == 204
         time.sleep(1.0)
         assert e.db.one("SELECT 1 FROM videos WHERE video_id='OLDSECRET01'")          # chữ ký hợp lệ (secret tool cấp) → nhận
-        assert any("secret CŨ" in l for l in e._logs)
+        assert any("VALID_OLD_SECRET" in l for l in e._logs)
         assert len(hub.reqs) > n0 and hub.reqs[-1]["hub.secret"] == e.secret           # đăng ký lại bằng secret hiện tại
         assert old not in "\n".join(e._logs)
         e.stop()
@@ -1232,3 +1234,93 @@ def test_retired_secret_expires_after_10_days(tmp_path):
     body = b"<feed/>"
     v = e.check_signature(body, "sha1=" + hmac.new(old.encode(), body, hashlib.sha1).hexdigest())
     assert not v["ok"]
+
+
+# ------------------------------------------------------------------ phân loại POST (POST thật FeedFetcher-Google bị từ chối)
+def _verified_engine(tmp_path, chans, port=None):
+    hub = FakeHub()
+    port = port or _free_port()
+    cb = f"http://127.0.0.1:{port}/websub"
+    e = make_engine(tmp_path, chans, hub, listen_port=port, callback_url=cb, websub_loop_sec=0.3)
+    e.start()
+    end = time.time() + 6
+    while time.time() < end and e.stats["websub_verified"] < len(chans):
+        time.sleep(0.1)
+    assert e.stats["websub_verified"] == len(chans)
+    return e, hub, port
+
+
+@need_ff
+def test_post_classification_codes_and_queues(tmp_path, gvs, media, monkeypatch):
+    e, hub, port = _verified_engine(tmp_path, CH[:2])
+    try:
+        monkeypatch.setattr(e.resolver, "resolve", lambda v, deadline_s=2.5: plan_prog(gvs, media, v))
+        now = datetime.now(timezone.utc)
+        ffg = {"User-Agent": "FeedFetcher-Google; (+http://www.google.com/feedfetcher.html)", "X-Forwarded-For": "66.102.0.1",
+               "Content-Type": "application/atom+xml"}
+        sign = lambda b, sec=None: "sha1=" + hmac.new((sec or e.secret).encode(), b, hashlib.sha1).hexdigest()
+        ok = atom(CH[0], "VALIDSIG001", now)
+        assert _post(port, ok, dict(ffg, **{"X-Hub-Signature": sign(ok)})) == 204
+        foreign = atom("UCAqQb0yK6XkD8WS_0CKNXCQ", "tTN8iaYHO98", now)            # kênh KHÔNG có trong cột K
+        assert _post(port, foreign, dict(ffg, **{"X-Hub-Signature": sign(foreign, "x" * 48)})) == 204
+        bad = atom(CH[1], "INVALIDSIG1", now)                                     # kênh có thuê bao xác minh, chữ ký sai
+        assert _post(port, bad, dict(ffg, **{"X-Hub-Signature": sign(bad, "y" * 48)})) == 204
+        miss = atom(CH[1], "MISSINGSIG1", now)
+        assert _post(port, miss, ffg) == 204
+        r = wait_state(e, "VALIDSIG001")
+        assert r["state"] == "DONE" and wait_excel(e, "VALIDSIG001")["state"] == "DONE"
+        kinds = {r["kind"] for r in e.db.all("SELECT kind FROM hub_events WHERE kind LIKE 'push-%'")}
+        assert {"push-VALID_SIGNATURE", "push-UNKNOWN_CHANNEL", "push-INVALID_SIGNATURE", "push-MISSING_SIGNATURE"} <= kinds
+        assert {r["video_id"] for r in e.db.all("SELECT video_id FROM videos")} == {"VALIDSIG001"}   # chỉ POST hợp lệ vào hàng đợi
+        time.sleep(0.5)
+        assert any(q["hub.mode"] == "unsubscribe" and "UCAqQb0yK6XkD8WS_0CKNXCQ" in q["hub.topic"] for q in hub.reqs)
+        saved = sorted((tmp_path / "logs" / "rejected_posts").glob("*.json"))
+        assert len(saved) == 3 and any("UNKNOWN_CHANNEL_tTN8iaYHO98" in p.name for p in saved)
+        logs = "\n".join(e._logs)
+        assert "🚫 UNKNOWN_CHANNEL" in logs and "🚫 INVALID_SIGNATURE" in logs and "🚫 MISSING_SIGNATURE" in logs
+        assert e.secret not in logs
+    finally:
+        e.stop()
+        hub.close()
+
+
+def test_unknown_subscription_when_channel_not_verified_with_current_secret(tmp_path):
+    e = make_engine(tmp_path, CH[:1])
+    e.start(workers=False)
+    port = e.httpd.server_address[1]
+    b = atom(CH[0], "UNKSUB00001", datetime.now(timezone.utc))
+    _post(port, b, {"X-Hub-Signature": "sha1=" + hmac.new(b"z" * 48, b, hashlib.sha1).hexdigest()})
+    time.sleep(0.3)
+    assert e.db.one("SELECT 1 FROM hub_events WHERE kind='push-UNKNOWN_SUBSCRIPTION'")
+    e.stop()
+
+
+def test_old_secret_scope_ends_after_transition(tmp_path):
+    e = make_engine(tmp_path, CH[:1])
+    e.channels = {CH[0]: [2]}
+    old = "ab" * 24
+    (tmp_path / "websub_secret_history.txt").write_text(f"{old} {int(time.time())}\n")
+    b = atom(CH[0], "OLDSCOPE001", datetime.now(timezone.utc))
+    v = e.check_signature(b, "sha1=" + hmac.new(old.encode(), b, hashlib.sha1).hexdigest())
+    assert e.classify_post(b, v)[0] == "VALID_OLD_SECRET"                    # chưa chuyển xong → nhận
+    e.db.x("INSERT INTO subs(channel_id, callback, verified_at, lease_seconds, state, verified_secret_fp) VALUES(?,?,?,?,?,?)",
+           (CH[0], "", time.time() - 7200, 432000, "VERIFIED", ws.secret_fp(e.secret)))
+    assert e.classify_post(b, v)[0] == "INVALID_SIGNATURE"                   # đã chuyển > 1 giờ → hết phạm vi
+
+
+def test_verify_post_cli_on_saved_request(tmp_path, capsys):
+    e = make_engine(tmp_path, CH[:1])
+    e.start(workers=False)
+    port = e.httpd.server_address[1]
+    b = atom(CH[0], "SAVEDPOST01", datetime.now(timezone.utc))
+    _post(port, b, {"X-Hub-Signature": "sha1=" + hmac.new(b"9a" * 24, b, hashlib.sha1).hexdigest(), "X-Forwarded-For": "66.1.1.1"})
+    time.sleep(0.3)
+    e.stop()
+    f = next((tmp_path / "logs" / "rejected_posts").glob("*SAVEDPOST01.json"))
+    res = ws.verify_post(dict(ws.DEFAULT_CONFIG), tmp_path, str(f))
+    assert res["body_bytes"] == len(b) and res["algo"] == "sha1"
+    assert res["matches"] and not any(m[2] for m in res["matches"]) and "KHÔNG khớp" in res["ket_luan"]
+    out = capsys.readouterr().out
+    assert e.secret not in out
+    (tmp_path / "websub_secret_history.txt").write_text(f"{'9a' * 24} {int(time.time())}\n")   # nếu secret đó là secret cũ của tool
+    assert "KHỚP secret CŨ" in ws.verify_post(dict(ws.DEFAULT_CONFIG), tmp_path, str(f))["ket_luan"]

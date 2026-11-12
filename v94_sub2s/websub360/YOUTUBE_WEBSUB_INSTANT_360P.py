@@ -292,7 +292,9 @@ class DB:
             self.con.execute("PRAGMA synchronous=NORMAL")
             for alter in ("ALTER TABLE excel_jobs ADD COLUMN order_key TEXT",     # nâng cấp DB cũ
                           "ALTER TABLE subs ADD COLUMN attempts INTEGER DEFAULT 0",
-                          "ALTER TABLE subs ADD COLUMN last_http INTEGER"):
+                          "ALTER TABLE subs ADD COLUMN last_http INTEGER",
+                          "ALTER TABLE subs ADD COLUMN secret_fp TEXT",          # secret gửi trong lần subscribe gần nhất
+                          "ALTER TABLE subs ADD COLUMN verified_secret_fp TEXT"):  # secret của thuê bao đã được hub xác minh
                 try:
                     self.con.execute(alter)
                 except sqlite3.OperationalError:
@@ -1603,7 +1605,8 @@ class Engine:
                         lease = max(60, min(lease, int(eng.cfg.get("lease_seconds", 432000)), 10 * 86400))
                         eng.db.x("INSERT INTO subs(channel_id, callback, verified_at, lease_seconds, state) VALUES(?,?,?,?,'VERIFIED') "
                                  "ON CONFLICT(channel_id) DO UPDATE SET verified_at=excluded.verified_at, callback=excluded.callback, "
-                                 "lease_seconds=excluded.lease_seconds, state='VERIFIED', error=NULL, attempts=0",
+                                 "lease_seconds=excluded.lease_seconds, state='VERIFIED', error=NULL, attempts=0, "
+                                 "verified_secret_fp=subs.secret_fp",
                                  (ch, eng.callback, time.time(), lease))
                         sim = (ch, mode) in eng.sim_pending
                         eng.hub_event(ch, "verify-sim" if sim else "verify", mode, 200, 1, f"lease {lease}s")
@@ -1734,29 +1737,98 @@ class Engine:
                          f"hay {len(load_secret_history(self.base))} secret cũ đã biết")
         return out
 
-    def on_signed_post(self, raw, v, src, headers, t_recv_ns):
+    def classify_post(self, raw, v) -> tuple[str, list, str]:
+        """→ (mã, [(kênh, video)], giải thích). Mã: VALID_SIGNATURE | VALID_OLD_SECRET | MISSING_SIGNATURE |
+        INVALID_SIGNATURE | UNKNOWN_CHANNEL | UNKNOWN_SUBSCRIPTION. KHÔNG bao giờ trả 'hợp lệ' khi HMAC không khớp."""
         try:
-            ids = [(x["channel_id"], x["video_id"]) for x in parse_atom(raw) if x.get("video_id")][:3]
+            ids = [(x["channel_id"], x["video_id"]) for x in parse_atom(raw) if x.get("video_id")][:5]
         except Exception:  # noqa: BLE001
             ids = []
         chans = sorted({c for c, _ in ids if c})
+        if v["ok"]:
+            if chans and not any(self.monitored(c) for c in chans):
+                return "UNKNOWN_CHANNEL", ids, "chữ ký đúng nhưng kênh KHÔNG có trong cột K (thuê bao còn sót) → huỷ đăng ký"
+            if v["which"] != "current":
+                # PHẠM VI secret cũ: chỉ trong giai đoạn chuyển — kênh CHƯA được hub xác minh với secret hiện tại,
+                # hoặc mới xác minh < 1 giờ (push đang trên đường). Ngoài phạm vi → coi là chữ ký không hợp lệ.
+                cur = secret_fp(self.secret)
+                for c in chans:
+                    r = self.db.one("SELECT * FROM subs WHERE channel_id=?", (c,))
+                    if r and r["state"] == "VERIFIED" and r["verified_secret_fp"] == cur and \
+                            time.time() - (r["verified_at"] or 0) > 3600:
+                        return "INVALID_SIGNATURE", ids, (f"ký bằng secret cũ {v['which']} nhưng kênh {c} đã chuyển sang "
+                                                          f"secret hiện tại hơn 1 giờ → hết giai đoạn chuyển, từ chối")
+                return "VALID_OLD_SECRET", ids, ""
+            return "VALID_SIGNATURE", ids, ""
+        if v["reason"].startswith("THIẾU"):
+            return "MISSING_SIGNATURE", ids, v["reason"]
+        if chans and not any(self.monitored(c) for c in chans):
+            return "UNKNOWN_CHANNEL", ids, (f"{v['reason']}; kênh {chans} KHÔNG có trong {len(self.channels)} kênh cột K → "
+                                             "thuê bao do bản cũ / tool khác / Excel cũ tạo, hub ký bằng secret khác → huỷ đăng ký")
+        cur = secret_fp(self.secret)
+        for c in chans:
+            r = self.db.one("SELECT * FROM subs WHERE channel_id=?", (c,))
+            if (r is None or r["state"] != "VERIFIED" or r["callback"] != self.callback
+                    or (r["verified_secret_fp"] and r["verified_secret_fp"] != cur)):
+                st = "chưa có bản ghi" if r is None else (f"trạng thái {r['state']}, secret xác minh "
+                                                         f"{r['verified_secret_fp'] or '?'} / hiện tại {cur}")
+                return "UNKNOWN_SUBSCRIPTION", ids, (f"{v['reason']}; tool CHƯA có thuê bao đã xác minh với secret hiện tại cho "
+                                                      f"kênh {c} ({st}) → hub đang dùng thuê bao khác (bản cũ / DB bị ghi đè / "
+                                                      "tool khác cùng callback) → đăng ký lại")
+        return "INVALID_SIGNATURE", ids, (f"{v['reason']}; kênh đã có thuê bao xác minh với secret hiện tại → body bị sửa "
+                                          "hoặc POST không phải từ hub của thuê bao này")
+
+    def on_signed_post(self, raw, v, src, headers, t_recv_ns):
+        code, ids, why = self.classify_post(raw, v)
+        chans = sorted({c for c, _ in ids if c})
         diag = (f"nguồn: {src} | {v['algo'] or '-'} {v['sig_hint']} | body {v['len']} B | "
                 f"Content-Encoding {headers.get('Content-Encoding') or '-'} | video {ids}")
-        if not v["ok"]:
-            self.log(f"🚫 WebSub POST BỊ TỪ CHỐI: {v['reason']} | {diag}")
-            for c in chans:
-                self.hub_event(c, "push-badsig", "", None, 0, f"{v['reason']} | {diag}"[:300])
-            if not chans:
-                self.hub_event("", "push-badsig", "", None, 0, f"{v['reason']} | {diag}"[:300])
-            self._resubscribe_after_badsig(chans, src)
+        for c in (chans or [""]):
+            self.hub_event(c, f"push-{code}", "", None, int(code.startswith("VALID")), f"{diag} | {why}")
+        if code in ("VALID_SIGNATURE", "VALID_OLD_SECRET"):
+            if code == "VALID_OLD_SECRET":
+                self.log(f"🔑 VALID_OLD_SECRET ({v['which']}) — secret cũ do chính tool cấp, còn hạn → nhận; đăng ký lại {chans} "
+                         f"để hub chuyển sang secret hiện tại | {diag}")
+                self._resubscribe_after_badsig(chans, src, force=True)
+            self.handle_push(raw, t_recv_ns)
             return
-        if v["which"] != "current":
-            self.log(f"🔑 POST ký bằng secret CŨ ({v['which']}) — chính tool đã cấp, hợp lệ → nhận. Hub vẫn giữ thuê bao cũ "
-                     f"→ đăng ký lại kênh {chans} để hub chuyển sang secret hiện tại | {diag}")
-            for c in chans:
-                self.hub_event(c, "push-oldsecret", "", None, 1, diag[:300])
-            self._resubscribe_after_badsig(chans, src, force=True)
-        self.handle_push(raw, t_recv_ns)
+        self.log(f"🚫 {code}: {why} | {diag}")
+        self._save_rejected(raw, headers, code, ids, src)
+        if code == "UNKNOWN_CHANNEL":
+            self._unsubscribe_foreign([c for c in chans if not self.monitored(c)])
+        elif code in ("UNKNOWN_SUBSCRIPTION", "INVALID_SIGNATURE"):
+            self._resubscribe_after_badsig(chans, src)
+
+    def _save_rejected(self, raw, headers, code, ids, src):
+        """Lưu NGUYÊN request bị từ chối (body thô + header chữ ký) trên máy để kiểm lại bằng --verify-post.
+        Chỉ lưu cục bộ; log KHÔNG in chữ ký đầy đủ."""
+        try:
+            d = self.base / "logs" / "rejected_posts"
+            d.mkdir(parents=True, exist_ok=True)
+            vid = ids[0][1] if ids else "unknown"
+            stem = f"{datetime.now():%Y%m%d_%H%M%S_%f}_{code}_{vid}"
+            (d / f"{stem}.body").write_bytes(raw)
+            (d / f"{stem}.json").write_text(json.dumps({
+                "received_at": iso(), "code": code, "source": src, "ids": ids,
+                "x_hub_signature": headers.get("X-Hub-Signature"), "content_type": headers.get("Content-Type"),
+                "content_length": headers.get("Content-Length"), "user_agent": headers.get("User-Agent"),
+                "x_forwarded_for": headers.get("X-Forwarded-For"), "secret_fp_at_receive": secret_fp(self.secret)},
+                ensure_ascii=False, indent=1), encoding="utf-8")
+            files = sorted(d.glob("*.json"))
+            for old in files[:-200]:                       # giữ 200 request gần nhất
+                old.unlink(missing_ok=True)
+                old.with_suffix(".body").unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _unsubscribe_foreign(self, chans):
+        now = time.time()
+        for c in chans:
+            if now - self._badsig_resub.get("unsub:" + c, 0) < 3600 or not self.callback:
+                continue
+            self._badsig_resub["unsub:" + c] = now
+            self.log(f"🧹 Huỷ thuê bao còn sót cho kênh {c} (không có trong cột K) để hub ngừng gửi")
+            threading.Thread(target=self._unsubscribe, args=(c,), daemon=True, name="UNSUB-FOREIGN").start()
 
     def _resubscribe_after_badsig(self, chans, src, force=False):
         """Push THẬT (qua tunnel) mang chữ ký không khớp → hub đang giữ secret khác cho kênh đó → đăng ký lại (≤1 lần/10 phút/kênh)."""
@@ -1845,7 +1917,7 @@ class Engine:
     def hub_event(self, ch, kind, mode, http, accepted, detail=""):
         try:
             self.db.x("INSERT INTO hub_events(at, channel_id, kind, mode, http, accepted, detail) VALUES(?,?,?,?,?,?,?)",
-                      (time.time(), ch, kind, mode, http, accepted, str(detail)[:300]))
+                      (time.time(), ch, kind, mode, http, accepted, str(detail)[:900]))
         except Exception:
             pass
 
@@ -1892,11 +1964,13 @@ class Engine:
             try:
                 code, body = self._hub("subscribe", ch, cb)
                 st = "REQUESTED" if code in (202, 204) else "ERROR"
-                self.db.x("INSERT INTO subs(channel_id, callback, requested_at, state, error, attempts, last_http) VALUES(?,?,?,?,?,1,?) "
+                self.db.x("INSERT INTO subs(channel_id, callback, requested_at, state, error, attempts, last_http, secret_fp) "
+                          "VALUES(?,?,?,?,?,1,?,?) "
                           "ON CONFLICT(channel_id) DO UPDATE SET callback=excluded.callback, requested_at=excluded.requested_at, "
+                          "secret_fp=excluded.secret_fp, "
                           "state=CASE WHEN subs.state='VERIFIED' AND subs.callback=excluded.callback THEN 'VERIFIED' ELSE excluded.state END, "
                           "error=excluded.error, attempts=COALESCE(subs.attempts,0)+1, last_http=excluded.last_http",
-                          (ch, cb, time.time(), st, None if st != "ERROR" else f"HTTP {code} {body}", code))
+                          (ch, cb, time.time(), st, None if st != "ERROR" else f"HTTP {code} {body}", code, secret_fp(self.secret)))
                 self.hub_event(ch, "subscribe", "subscribe", code, int(st != "ERROR"), body[:160] if st == "ERROR" else "")
                 if st == "ERROR":
                     self.log(f"❌ Hub trả HTTP {code} khi đăng ký kênh {ch}: {body[:120]}")
@@ -2245,7 +2319,7 @@ def selftest(cfg, base, video_id=None, wait_verify=90):
             pass
         time.sleep(0.3)
         old_ok = eng.db.one("SELECT detail FROM hub_events WHERE kind='push-old' AND detail LIKE 'AAAAAAAAAAA%'")
-        bad_ok = bad_ok and bool(eng.db.one("SELECT 1 FROM hub_events WHERE kind='push-badsig'")) and \
+        bad_ok = bad_ok and bool(eng.db.one("SELECT 1 FROM hub_events WHERE kind IN ('push-UNKNOWN_SUBSCRIPTION','push-INVALID_SIGNATURE')")) and \
             not eng.db.one("SELECT 1 FROM videos WHERE video_id='AAAAAAAAAAA'")
         rec("TEST2d POST sai chữ ký bị chặn, POST đúng chữ ký (video cũ) nhận nhưng không tải", "PASS" if bad_ok and old_ok else "FAIL",
             f"chặn={bad_ok}, cập-nhật-cũ={dict(old_ok) if old_ok else None}")
@@ -2344,7 +2418,8 @@ def diag(cfg, base, resubscribe=False, wait_s=120):
     out.append(f"Topic WebSub dùng để đăng ký: {TOPIC_FMT.format('<CHANNEL_ID>')}")
     out.append(f"Secret HMAC hiện tại: dấu vân tay {secret_fp(eng.secret)} | secret cũ đã biết: "
                f"{[secret_fp(x) for x, _ in load_secret_history(base)]}")
-    bad = eng.db.all("SELECT * FROM hub_events WHERE kind IN ('push-badsig','push-oldsecret') ORDER BY id DESC LIMIT 8")
+    bad = eng.db.all("SELECT * FROM hub_events WHERE kind LIKE 'push-%' AND kind NOT IN ('push-VALID_SIGNATURE','push-old') "
+                     "ORDER BY id DESC LIMIT 10")
     out.append("POST chữ ký sai / secret cũ gần nhất:" + ("" if bad else " không có"))
     for e in bad:
         out.append(f"  - {datetime.fromtimestamp(e['at']):%d/%m %H:%M:%S} {e['kind']} kênh {e['channel_id'] or '?'}: {e['detail']}")
@@ -2412,6 +2487,35 @@ def diag(cfg, base, resubscribe=False, wait_s=120):
         print(o)
     log(f"📄 Đã ghi {rep}")
     return out
+
+
+def verify_post(cfg, base, path) -> dict:
+    """Kiểm lại một request đã lưu (logs/rejected_posts/*.json hoặc .body) với secret HIỆN TẠI và các secret CŨ.
+    In: khớp secret nào (dấu vân tay) hoặc không khớp — KHÔNG in secret."""
+    p = Path(path)
+    meta = json.loads(p.with_suffix(".json").read_text(encoding="utf-8")) if p.with_suffix(".json").exists() else {}
+    raw = p.with_suffix(".body").read_bytes()
+    sig = meta.get("x_hub_signature") or ""
+    cur = load_shared_secret(base)
+    cands = [("HIỆN TẠI", cur)] + [(f"CŨ (thay lúc {datetime.fromtimestamp(t):%d/%m %H:%M})", x)
+                                   for x, t in load_secret_history(base)]
+    algo, _, hexs = sig.partition("=")
+    algo = algo.strip().lower()
+    res = {"file": p.name, "ids": meta.get("ids"), "source": meta.get("source"), "algo": algo,
+           "body_bytes": len(raw), "content_length_header": meta.get("content_length"), "matches": []}
+    if algo in ("sha1", "sha256", "sha384", "sha512"):
+        for name, sec in cands:
+            ok = hmac.compare_digest(hmac.new(sec.encode(), raw, getattr(hashlib, algo)).hexdigest(), hexs.strip().lower())
+            res["matches"].append((name, secret_fp(sec), ok))
+    hit = [m for m in res["matches"] if m[2]]
+    res["ket_luan"] = (f"KHỚP secret {hit[0][0]} ({hit[0][1]})" if hit else
+                       "KHÔNG khớp secret nào của tool → hub đang giữ một thuê bao dùng secret mà tool KHÔNG có "
+                       "(DB/secret bị ghi đè, hoặc tool khác đăng ký cùng callback). Cách sửa: để tool đăng ký lại và chờ "
+                       "dòng '✅ Hub XÁC MINH' cho kênh đó.")
+    if str(res["content_length_header"] or "") not in ("", str(len(raw))):
+        res["ket_luan"] += " | CẢNH BÁO: số byte body khác Content-Length"
+    print(json.dumps(res, ensure_ascii=False, indent=1))
+    return res
 
 
 def bench(cfg, base, ids, reps=3):
@@ -2497,6 +2601,7 @@ def main(argv=None):
     ap.add_argument("--config", default="config.json")
     ap.add_argument("--diag", action="store_true", help="chẩn đoán từng kênh WebSub → DIAG_REPORT.md")
     ap.add_argument("--resubscribe", action="store_true", help="dùng với --diag: đăng ký lại cả danh sách rồi chờ hub xác minh")
+    ap.add_argument("--verify-post", default="", help="kiểm lại 1 request bị từ chối đã lưu trong logs/rejected_posts")
     a = ap.parse_args(argv)
     base = BASE_DIR
     os.chdir(base)
@@ -2507,6 +2612,9 @@ def main(argv=None):
             print(f"⚠️ '{a.video}' không phải ID/link video YouTube hợp lệ — bỏ qua TEST3")
         r = selftest(cfg, base, vid)
         return 0 if all(s != "FAIL" for _, s, _ in r) else 1
+    if a.verify_post:
+        verify_post(cfg, base, a.verify_post)
+        return 0
     if a.diag:
         diag(cfg, base, resubscribe=a.resubscribe)
         return 0

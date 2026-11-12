@@ -66,6 +66,20 @@ Kết luận này chưa chứng minh được 100% từ phía máy chủ test: c
 **Test mới (đều PASS):** chữ ký đúng (sha1, sha256), sai, thiếu, lệch 1 byte, body chunked, tình huống ghi đè DB
 (secret cũ → nhận + đăng ký lại), secret cũ quá 10 ngày → từ chối.
 
+## POST thật FeedFetcher-Google bị từ chối (kênh UCAqQb0yK6XkD8WS_0CKNXCQ, video tTN8iaYHO98)
+
+Từ máy chủ test KHÔNG thể tự kiểm chữ ký của request này: cần secret, và secret chỉ nằm trên máy bạn.
+Bản này giúp xác định nguyên nhân NGAY TRÊN MÁY BẠN:
+- Mỗi POST được gán 1 mã: VALID_SIGNATURE / VALID_OLD_SECRET / MISSING_SIGNATURE / UNKNOWN_CHANNEL / UNKNOWN_SUBSCRIPTION /
+  INVALID_SIGNATURE. Mã được ghi vào log + hub_events, kèm nguồn, User-Agent, thuật toán, 6 ký tự đầu chữ ký và số byte body.
+- POST bị từ chối được lưu nguyên vẹn → `KIEM_TRA_POST.bat` chạy lại HMAC-SHA1 trên đúng byte thô với secret hiện tại và
+  từng secret cũ (`hmac.compare_digest`), rồi kết luận khớp cái nào.
+- Nếu kênh đó KHÔNG thuộc 15 kênh cột K → mã UNKNOWN_CHANNEL: thuê bao còn sót (bản cũ / Excel cũ / tool khác dùng chung
+  callback ngrok); tool tự gửi lệnh huỷ thuê bao. Nếu kênh có trong cột K → UNKNOWN_SUBSCRIPTION: hub còn giữ thuê bao
+  với secret khác → tool tự đăng ký lại.
+- `hub.secret` gửi khi subscribe luôn là secret trong `websub_secret.txt`. Dấu vân tay của nó được lưu theo từng kênh
+  (`subs.secret_fp`), và lúc hub xác minh thì lưu thêm (`subs.verified_secret_fp`).
+
 ## Review đối kháng
 
 Riêng các thay đổi WebSub đã qua 2 vòng review: vòng 3 xác nhận 13 lỗi, vòng 4 xác nhận thêm 3 lỗi do chính các bản sửa gây ra. **Đã sửa cả 16, mỗi lỗi có test hồi quy.**
@@ -74,7 +88,7 @@ Riêng các thay đổi WebSub đã qua 2 vòng review: vòng 3 xác nhận 13 l
 
 | # | Bài test | Kết quả | Ghi chú |
 |---|---|---|---|
-| A | Bộ test tự động `tests/test_ws360.py` | **52/52 PASS**, chạy 3 lần liên tiếp đều qua | hub WebSub giả (đúng đặc tả), máy chủ video giả, Excel thật, ffmpeg thật |
+| A | Bộ test tự động `tests/test_ws360.py` | **56/56 PASS**, chạy 3 lần liên tiếp đều qua | hub WebSub giả (đúng đặc tả), máy chủ video giả, Excel thật, ffmpeg thật |
 | B | Chỉ dùng WebSub, không polling/API | **PASS** | |
 | C | Đăng ký → hub gọi xác minh → VERIFIED, lease 432000 s | **PASS** (hub giả) | hub thật: chạy SELFTEST / DIAG trên máy bạn |
 | D | Kênh hub không xác minh: không bao giờ tính là đã xác minh, tự gửi lại theo lịch | **PASS** | |

@@ -77,6 +77,20 @@ Log không bao giờ ghi secret hay chữ ký đầy đủ. Secret chỉ hiện 
   để hub chuyển sang secret mới. Log có dòng "🔑 POST ký bằng secret CŨ".
 - Muốn xem lại các lần bị từ chối: DIAG.bat (mục "POST chữ ký sai / secret cũ gần nhất").
 
+MÃ PHÂN LOẠI MỖI POST (trong log và DIAG):
+  VALID_SIGNATURE      chữ ký khớp secret hiện tại → tải 360p + ghi Excel ngay
+  VALID_OLD_SECRET     khớp secret CŨ do chính tool cấp, trong giai đoạn chuyển (kênh chưa được hub xác minh với secret mới,
+                       hoặc mới xác minh < 1 giờ; secret cũ hết hạn sau 10 ngày) → nhận + tự đăng ký lại
+  MISSING_SIGNATURE    không có header X-Hub-Signature → từ chối
+  UNKNOWN_CHANNEL      kênh KHÔNG có trong cột K (thuê bao còn sót từ bản cũ / Excel cũ / tool khác) → từ chối + tự huỷ thuê bao
+  UNKNOWN_SUBSCRIPTION chữ ký không khớp; kênh trong cột K nhưng tool CHƯA có thuê bao đã xác minh với secret hiện tại
+                       → hub đang dùng thuê bao khác → từ chối + tự đăng ký lại
+  INVALID_SIGNATURE    chữ ký không khớp dù kênh đã có thuê bao xác minh với secret hiện tại → từ chối (body bị sửa /
+                       không phải hub)
+Mỗi POST bị từ chối được lưu NGUYÊN VẸN (body + header) trong logs\rejected_posts\ (tối đa 200 cái).
+KIEM_TRA_POST.bat kiểm tra lại POST bị từ chối gần nhất với secret hiện tại và các secret cũ, rồi cho biết khớp cái nào
+(chỉ in dấu vân tay, không in secret).
+
 BENCHMARK.bat (tuỳ chọn)
 ------------------------
 Nhập 2 ID video (1 ngắn, 1 dài). Tool thử 1 GET và Range x4/x8/x12/x16, rồi ghi BENCHMARK.csv.
