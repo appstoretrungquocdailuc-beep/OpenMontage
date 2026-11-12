@@ -38,5 +38,14 @@
     3600
   ],
   "atomic_rename": false,
-  "callback_generation": true
+  "callback_generation": true,
+  "tiktok_enabled": false,
+  "tam_path": "tam_INSTANT_POST.py",
+  "col_profile": "C",
+  "prewarm_mode": "PREWARM_ALL",
+  "smart_profiles": [],
+  "open_concurrency": 2,
+  "max_parallel_uploads": 4,
+  "upload_retry_failed_safe": 1,
+  "tiktok_dry_run": false
 }

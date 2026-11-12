@@ -101,7 +101,17 @@ DEFAULT_CONFIG = {
     "verify_retry_sec": [120, 300, 600, 1800, 3600],   # hub chưa gọi xác minh sau X s → gửi lại (giãn dần)
     "atomic_rename": False,            # False (theo yêu cầu): tải THẲNG vào VIDEO_ID_360p.mp4, không đổi tên;
                                        # True: tải vào .part rồi os.replace (chậm hơn trên Windows có Defender)
-    "callback_generation": True,       # callback = …/websub?g=<dấu vân tay secret>: đổi secret ⇒ thuê bao MỚI hoàn toàn
+    "callback_generation": True,
+    # ---- TÍCH HỢP ĐĂNG TIKTOK (TAM) — chạy chung tiến trình ----
+    "tiktok_enabled": False,           # bật bằng START_INTEGRATED.bat hoặc ô "Tự đăng TikTok" trên giao diện
+    "tam_path": "tam_INSTANT_POST.py", # đường dẫn backend TAM (thư mục có Genlogin.py + chromedriver.exe)
+    "col_profile": "C",                # cột PROFILE ID TikTok (cùng hàng với Channel ID cột K)
+    "prewarm_mode": "PREWARM_ALL",     # PREWARM_ALL: mở sẵn mọi profile | SMART_PREWARM: chỉ smart_profiles, còn lại mở khi có job
+    "smart_profiles": [],
+    "open_concurrency": 2,             # số profile Genlogin mở CÙNG LÚC khi khởi động
+    "max_parallel_uploads": 4,         # số phiên upload TikTok đồng thời tối đa (backpressure)
+    "upload_retry_failed_safe": 1,     # lỗi TRƯỚC khi bấm Post (an toàn) → thử lại tối đa N lần
+    "tiktok_dry_run": False,           # True: chạy hết tới khi nút Post sáng rồi DỪNG, KHÔNG bấm Post       # callback = …/websub?g=<dấu vân tay secret>: đổi secret ⇒ thuê bao MỚI hoàn toàn
 }
 
 
@@ -327,7 +337,8 @@ class DB:
             self.con.executescript(self.SCHEMA)
             self.con.execute("PRAGMA synchronous=NORMAL")
             for col in ("db_verifying_ms", "db_lock_wait_ms", "pre_verify_gap_ms", "ffprobe_ms", "rename_ms",
-                        "post_verify_gap_ms", "sum_check_ms", "expected_size", "db_resolving_ms", "db_downloading_ms"):
+                        "post_verify_gap_ms", "sum_check_ms", "expected_size", "db_resolving_ms", "db_downloading_ms",
+                        "tiktok", "t_done_wall"):
                 try:
                     self.con.execute(f"ALTER TABLE videos ADD COLUMN {col} REAL")
                 except sqlite3.OperationalError:
@@ -1106,6 +1117,9 @@ class Engine:
         self.inbox_db = None          # SELFTEST: push THẬT nhận nhầm → chuyển vào database.sqlite của tool chính
         self.sim_vids = set()         # SELFTEST: video id của sự kiện giả lập
         self.sim_pending = set()      # SELFTEST: (kênh, mode) của các lần xác minh GIẢ LẬP (TEST2a/2b)
+        self.on_done = None           # TÍCH HỢP TikTok: gọi NGAY khi file 360p hoàn chỉnh (DOWNLOAD_DONE)
+        self.on_excel_reload = None   # TÍCH HỢP TikTok: Excel đổi → cập nhật ánh xạ Profile↔Kênh
+        self.tiktok_on = False        # chỉ video phát hiện khi bật tích hợp mới được đăng (không đăng video cũ)
         self._badsig_resub = {}       # kênh → lần cuối đăng ký lại vì chữ ký sai
         self.threads = []
         self.httpd = None
@@ -1181,6 +1195,9 @@ class Engine:
             self._lockfh = None
 
     def stop(self):
+        br = getattr(self, "bridge", None)
+        if br is not None:
+            br.stop()                                       # ngừng nhận job; việc đang đăng làm cho xong
         self.stop_ev.set()
         with self.life_lock:
             self._stop_inner()
@@ -1260,6 +1277,11 @@ class Engine:
                 last = s
                 if res[0]:
                     self.subscribe_all(list(res[0]))
+                if self.on_excel_reload is not None:
+                    try:
+                        self.on_excel_reload()
+                    except Exception as e:  # noqa: BLE001
+                        self.log(f"⚠️ cập nhật ánh xạ TikTok lỗi: {e}")
 
     def monitored(self, ch):
         with self.ch_lock:
@@ -1293,7 +1315,8 @@ class Engine:
         #    Cửa sổ mất việc khi tắt đột ngột chỉ là vài micro-giây giữa 2 bước.
         t_enq = time.perf_counter_ns()
         if self.flags["download"]:
-            self.dlq.put((time.time(), next(self.seq), {"vid": vid, "ch": ch, "t_recv_ns": t_recv_ns, "t_enq_ns": t_enq, **meta}))
+            self.dlq.put((time.time(), next(self.seq), {"vid": vid, "ch": ch, "t_recv_ns": t_recv_ns, "t_enq_ns": t_enq,
+                                                         "tiktok": bool(self.tiktok_on), **meta}))
         if self.flags["excel"]:
             self.xlq.put({"vid": vid, "ch": ch, "url": url, "t_enq_ns": t_enq, "okey": okey})
         enq_ms = ms(t_recv_ns, t_enq)
@@ -1301,6 +1324,8 @@ class Engine:
                   "enqueue_ms) VALUES(?,?,?,?,?,?,?,?,?)",
                   (vid, ch, url, title, engine, meta["detected_at"], meta["published"],
                    "QUEUED" if self.flags["download"] else "SKIPPED", enq_ms))]
+        if self.tiktok_on:
+            stmts.append(("UPDATE videos SET tiktok=1 WHERE video_id=?", (vid,)))
         if self.flags["excel"]:
             stmts.append(("INSERT OR IGNORE INTO excel_jobs(video_id, channel_id, url, state, created_at, order_key) "
                           "VALUES(?,?,?,?,?,?)", (vid, ch, url, "PENDING", iso(), okey)))
@@ -1430,10 +1455,10 @@ class Engine:
             info_v, info_a = {}, {}
             mux_ms = None
             n = int(self.cfg.get("range_connections", 1))
-            atomic = bool(self.cfg.get("atomic_rename", False))
+            atomic = bool(self.cfg.get("atomic_rename", False)) or self.on_done is not None   # tích hợp: luôn .part → đổi tên
             # atomic_rename=False (mặc định theo yêu cầu): ghi THẲNG vào tên cuối; DONE chỉ sau ffprobe + đúng dung lượng;
             # lỗi → xoá file. atomic_rename=True: ghi .part rồi os.replace.
-            out_tmp = (tmpdir / f".{tag}.part.mp4") if atomic else final
+            out_tmp = (tmpdir / f".{vid}.part.mp4") if atomic else final        # uploader KHÔNG BAO GIỜ nhận .part
             parts.append(out_tmp)
             if pick["kind"] == "progressive":
                 self._fetch(pick["video"], out_tmp, info_v, n, cancel)
@@ -1505,6 +1530,13 @@ class Engine:
                      f"POST_VERIFY_GAP_MS {steps['post_verify_gap_ms']:.2f} | DB resolving {db_res[0]:.1f} / downloading "
                      f"{db_dl[0]:.1f} | lệch tổng {steps['sum_check_ms']:.3f}" + (f" | ⚠️ CHẬM: {', '.join(slow)}" if slow else ""))
             self.stats["done"] += 1
+            want_tt = bool(job.get("tiktok")) or bool((row["tiktok"] if row is not None and "tiktok" in row.keys() else 0))
+            if self.on_done is not None and want_tt:
+                try:                                       # DOWNLOAD_DONE → job TikTok ngay (không chặn tải/Excel)
+                    self.on_done({"vid": vid, "ch": ch, "path": str(final), "size": size, "t_recv_ns": job.get("t_recv_ns"),
+                                  "t_detect_ns": job.get("t_enq_ns"), "t_dl_start_ns": t_res, "t_done_ns": t_end})
+                except Exception as e:  # noqa: BLE001
+                    self.log(f"❌ không chuyển được {vid} sang TikTok: {type(e).__name__}: {e} (video vẫn an toàn trong DOWNLOADS)")
             self.stats["speed_mbps"] = mbps
             self.stats["last"] = {"vid": vid, "resolver_ms": ms(t_start, t_res), "download_ms": dl_ms, "mux_ms": mux_ms,
                                   "verify_ms": verify_ms, "total_ms": total}
@@ -2250,16 +2282,36 @@ class Engine:
                 try:
                     s = dict(self.stats)
                     s["channels"] = len(self.channels)
+                    br = getattr(self, "bridge", None)
+                    if br is not None:
+                        s["tiktok"] = br.snapshot()
                     self.on_stats(s)
                 except Exception:
                     pass
+
+
+# =============================== TÍCH HỢP TIKTOK (TAM) =============================== #
+def attach_tiktok(engine, cfg, log, tam=None):
+    """Gắn cầu nối TAM vào engine: DOWNLOAD_DONE → job TikTok đúng profile. Gọi TRƯỚC engine.start()."""
+    sys.path.insert(0, str(BASE_DIR))
+    from ws360_tam_bridge import TikTokBridge
+    tp = Path(cfg.get("tam_path") or "tam_INSTANT_POST.py")
+    if not tp.is_absolute():
+        tp = BASE_DIR / tp
+    cfg = dict(cfg, tam_path=str(tp))
+    br = TikTokBridge(engine, cfg, log, tam=tam)
+    engine.bridge = br
+    engine.tiktok_on = True
+    engine.on_done = br.submit
+    engine.on_excel_reload = br.reload_mapping
+    return br
 
 
 # =============================== GIAO DIỆN PYSIDE6 =============================== #
 def run_gui(cfg, base):
     from PySide6.QtCore import QObject, Signal, Qt
     from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
-                                   QPlainTextEdit, QCheckBox)
+                                   QPlainTextEdit, QCheckBox, QComboBox, QSpinBox, QTableWidget, QTableWidgetItem)
 
     class Bridge(QObject):
         line = Signal(str)
@@ -2285,12 +2337,32 @@ def run_gui(cfg, base):
         top.addWidget(c)
     top.addStretch(1)
     lay.addLayout(top)
+    # ---- hàng TikTok (TAM) ----
+    tt = QHBoxLayout()
+    c_tt = QCheckBox("Tự đăng TikTok")
+    c_tt.setChecked(bool(cfg.get("tiktok_enabled")))
+    c_dry = QCheckBox("Chạy thử (KHÔNG bấm Post)")
+    c_dry.setChecked(bool(cfg.get("tiktok_dry_run")))
+    cb_mode = QComboBox()
+    cb_mode.addItems(["PREWARM_ALL", "SMART_PREWARM"])
+    cb_mode.setCurrentText(str(cfg.get("prewarm_mode", "PREWARM_ALL")).upper())
+    sp_open = QSpinBox()
+    sp_open.setRange(1, 8)
+    sp_open.setValue(int(cfg.get("open_concurrency", 2)))
+    b_reset = QPushButton("Đã kiểm tra profile UNKNOWN")
+    for wdg in (c_tt, c_dry, QLabel("Mở profile:"), cb_mode, QLabel("Mở cùng lúc:"), sp_open, b_reset):
+        tt.addWidget(wdg)
+    tt.addStretch(1)
+    lay.addLayout(tt)
     grid = QGridLayout()
     labels = {}
     names = [("channels", "Tổng kênh"), ("websub_verified", "WebSub đã xác minh"), ("webhook", "Webhook"),
              ("pushes", "Push WebSub nhận"), ("detected", "Video mới"), ("downloading", "Đang tải"),
              ("done", "Tải xong"), ("failed", "Lỗi tải"), ("speed_mbps", "Tốc độ (Mbps)"), ("resolver_ms", "Resolver (ms)"),
-             ("download_ms", "Tải (ms)"), ("mux_ms", "Mux (ms)"), ("total_ms", "Tổng (ms)"), ("excel", "Excel")]
+             ("download_ms", "Tải (ms)"), ("mux_ms", "Mux (ms)"), ("total_ms", "Tổng (ms)"), ("excel", "Excel"),
+             ("tt_genlogin", "Genlogin/Selenium"), ("tt_opened", "Profile đã mở"), ("tt_ready", "Profile READY"),
+             ("tt_waiting", "Job chờ đăng"), ("tt_uploading", "Đang đăng"), ("tt_confirmed", "POST_CONFIRMED"),
+             ("tt_bad", "UNKNOWN/FAILED"), ("tt_held", "Giữ lại (thiếu profile/file)"), ("tt_last", "Lần đăng gần nhất")]
     for i, (k, t) in enumerate(names):
         grid.addWidget(QLabel(t + ":"), i // 3, (i % 3) * 2)
         lb = QLabel("-")
@@ -2298,6 +2370,10 @@ def run_gui(cfg, base):
         labels[k] = lb
         grid.addWidget(lb, i // 3, (i % 3) * 2 + 1)
     lay.addLayout(grid)
+    table = QTableWidget(0, 4)
+    table.setHorizontalHeaderLabels(["Profile", "Trạng thái", "Job chờ", "Ghi chú"])
+    table.setMaximumHeight(170)
+    lay.addWidget(table)
     logw = QPlainTextEdit()
     logw.setReadOnly(True)
     logw.setMaximumBlockCount(5000)
@@ -2311,18 +2387,39 @@ def run_gui(cfg, base):
 
     def show(s):
         last = s.get("last") or {}
+        t = s.get("tiktok") or {}
+        tl = t.get("last") or {}
+        extra = {"tt_genlogin": t.get("genlogin", "TẮT"), "tt_opened": t.get("opened"), "tt_ready": t.get("ready"),
+                 "tt_waiting": t.get("waiting"), "tt_uploading": t.get("uploading"), "tt_confirmed": t.get("confirmed"),
+                 "tt_bad": t.get("unknown_failed"), "tt_held": t.get("held"),
+                 "tt_last": (f"{tl.get('vid')} {tl.get('result')} | DONE→gắn {tl.get('done_to_attach_ms')} ms | "
+                             f"WebSub→xác nhận {tl.get('websub_to_confirm_ms')} ms") if tl else None}
         for k in labels:
-            v = s.get(k, last.get(k))
+            v = extra[k] if k in extra else s.get(k, last.get(k))
             if k == "excel":
                 v = f"OK {s.get('excel_ok', 0)} | chờ {s.get('excel_pending', 0)} | lỗi {s.get('excel_err', 0)}"
             labels[k].setText("-" if v is None else str(v))
+        prof = t.get("profiles") or []
+        table.setRowCount(len(prof))
+        for i, r in enumerate(prof):
+            for j, key in enumerate(("pid", "state", "queue", "reason")):
+                table.setItem(i, j, QTableWidgetItem(str(r.get(key, ""))))
     br.stats.connect(show)
 
     def start():
         for k, c in chk.items():
             cfg[f"{k}_enabled"] = c.isChecked()
+        cfg["tiktok_enabled"] = c_tt.isChecked()
+        cfg["tiktok_dry_run"] = c_dry.isChecked()
+        cfg["prewarm_mode"] = cb_mode.currentText()
+        cfg["open_concurrency"] = sp_open.value()
         e = Engine(cfg, base, log, on_stats=br.stats.emit)
         state["eng"] = e
+        if cfg["tiktok_enabled"]:
+            try:
+                attach_tiktok(e, cfg, log)
+            except Exception as ex:  # noqa: BLE001
+                log(f"❌ Không bật được đăng TikTok: {type(ex).__name__}: {ex} — WS360 vẫn chạy bình thường")
         for k, c in chk.items():
             c.toggled.connect(lambda v, k=k: e.flags.__setitem__(k, bool(v)))
         b_start.setEnabled(False)
@@ -2331,6 +2428,8 @@ def run_gui(cfg, base):
         def _bg():
             try:
                 e.start()
+                if getattr(e, "bridge", None) is not None:
+                    threading.Thread(target=e.bridge.start, daemon=True, name="TT-START").start()   # không chặn WebSub
                 br.started.emit()
             except Exception as ex:  # noqa: BLE001 — báo lỗi lên cửa sổ log, không im lặng
                 log(f"❌ KHÔNG khởi động được: {type(ex).__name__}: {ex}")
@@ -2354,6 +2453,17 @@ def run_gui(cfg, base):
     br.started.connect(lambda: b_stop.setEnabled(True))
     b_start.clicked.connect(start)
     b_stop.clicked.connect(stop)
+
+    def reset_unknown():
+        eng = state["eng"]
+        bb = getattr(eng, "bridge", None) if eng else None
+        if not bb:
+            return
+        for r in (bb.snapshot().get("profiles") or []):
+            if r["state"] == "UNKNOWN":
+                bb.reset_unknown(r["pid"])
+                log(f"✅ Profile {r['pid']}: bạn xác nhận đã kiểm tra → đăng tiếp")
+    b_reset.clicked.connect(reset_unknown)
     w.show()
     return app.exec()
 
@@ -2936,10 +3046,16 @@ def main(argv=None):
     ap.add_argument("--verify-post", default="", help="kiểm lại 1 request bị từ chối đã lưu trong logs/rejected_posts")
     ap.add_argument("--hubtest", action="store_true", help="kiểm tra sâu hub (đăng ký đồng bộ + callback thử) → HUBTEST_REPORT.md")
     ap.add_argument("--bench360", nargs="*", help="đo đường tải thật N lượt/video → BENCH360.csv (median/p90 từng bước)")
+    ap.add_argument("--integrated", action="store_true", help="bật sẵn tự đăng TikTok (TAM) khi mở giao diện / headless")
+    ap.add_argument("--dry-run-post", action="store_true", help="tích hợp: chạy tới khi nút Post sáng rồi DỪNG, không bấm")
     a = ap.parse_args(argv)
     base = BASE_DIR
     os.chdir(base)
     cfg = load_config(base / a.config)
+    if a.integrated:
+        cfg["tiktok_enabled"] = True
+    if a.dry_run_post:
+        cfg["tiktok_dry_run"] = True
     if a.selftest:
         vid = extract_vid(a.video) if a.video else None
         if a.video and not vid:
@@ -2964,7 +3080,11 @@ def main(argv=None):
     if a.headless:
         log = Log(base / "logs")
         e = Engine(cfg, base, log)
+        if cfg.get("tiktok_enabled"):
+            attach_tiktok(e, cfg, log)
         e.start()
+        if getattr(e, "bridge", None) is not None:
+            threading.Thread(target=e.bridge.start, daemon=True, name="TT-START").start()
         try:
             while True:
                 time.sleep(1)

@@ -1,0 +1,67 @@
+HỆ THỐNG TÍCH HỢP: WS360 (YouTube WebSub → tải 360p) + TAM (đăng TikTok qua Genlogin)
+=================================================================================
+
+NHẤN START MỘT LẦN → tool tự làm:
+  đọc Excel (cột K = Channel ID YouTube, cột C = PROFILE ID TikTok, cùng hàng)
+  → mở sẵn đúng các profile Genlogin + vào trang TikTok Studio Upload
+  → theo dõi YouTube bằng WebSub (CHỈ WebSub, không quét)
+  → có video mới: tải 360p (file tạm .<VIDEO_ID>.part.mp4 → kiểm tra → đổi tên <VIDEO_ID>_360p.mp4)
+  → giao NGAY cho đúng profile (không MOVE, không quét thư mục, không đọc lại Excel, không mở lại profile)
+  → gắn file → chờ nút Post sáng → bấm → chỉ báo THÀNH CÔNG khi TikTok xác nhận (POST_CONFIRMED).
+  Song song: ghi link YouTube vào cột D như trước.
+
+CHUẨN BỊ (1 lần)
+----------------
+1. Thư mục WS360 (nơi có check.xlsx, ffmpeg) giữ nguyên. Chép đè các file mới vào. Gói zip KHÔNG chứa
+   database.sqlite / websub_secret.txt / config.json / check.xlsx, nên không mất dữ liệu.
+2. Chỉ cho WS360 biết file TAM nằm ở đâu. Mở config.json, sửa dòng "tam_path", ví dụ:
+       "tam_path": "C:\\Users\\PC\\Desktop\\TAM\\tam_INSTANT_POST.py",
+   (dùng dấu \\ đôi). Thư mục TAM phải có Genlogin.py và chromedriver.exe như khi bạn chạy TAM bình thường.
+   Hoặc chép tam_INSTANT_POST.py, Genlogin.py, chromedriver.exe vào thư mục WS360 thì không cần sửa.
+3. Cột C của check.xlsx: PROFILE ID TikTok (chỉ chữ số) cùng hàng với Channel ID ở cột K.
+   - 1 kênh nhiều dòng CÙNG profile → đăng 1 lần.
+   - 1 kênh nhiều dòng KHÁC profile → đăng cho TẤT CẢ các profile đó (log ghi rõ khi đọc Excel).
+   - Nhiều kênh cùng 1 profile → profile đó đăng lần lượt từng video (không bao giờ 2 video cùng lúc).
+   - Kênh thiếu/sai Profile ID → video được tải + ghi Excel nhưng job TikTok bị GIỮ (HELD), KHÔNG đăng sang profile khác.
+4. Genlogin phải đang chạy và đã đăng nhập (như khi dùng TAM).
+5. Cài thêm thư viện (1 lần):  python -m pip install -r requirements.txt
+
+LẦN ĐẦU: CHẠY THỬ KHÔNG ĐĂNG (khuyến nghị)
+-----------------------------------------
+Bật ngrok như thường lệ, rồi nhấp đúp TEST_TICH_HOP_KHONG_DANG.bat.
+Tool chạy toàn bộ dây chuyền thật: mở profile, nhận video mới, tải, gắn file vào TikTok, chờ nút Post sáng.
+Tới đó thì DỪNG, KHÔNG bấm Post. Kết quả: job trạng thái DRY_RUN_DONE, log có dòng
+  "🎬 TikTok <profile>: <video> → DRY_RUN | DONE→gắn file … ms | gắn→POST_READY … ms …".
+Gửi dòng đó cho người hỗ trợ để xem tốc độ thật trên máy bạn.
+
+CHẠY THẬT
+---------
+Bật ngrok, rồi nhấp đúp START_INTEGRATED.bat → nhấn START.
+Trên giao diện:
+  - Ô "Tự đăng TikTok": đã tick sẵn. Bỏ tick nếu chỉ muốn WS360 như cũ.
+  - "Chạy thử (KHÔNG bấm Post)": tick nếu muốn thử.
+  - "Mở profile": PREWARM_ALL = mở sẵn TẤT CẢ profile (mặc định).
+                  SMART_PREWARM = chỉ mở các profile trong "smart_profiles" (config.json); profile khác mở khi có video.
+  - "Mở cùng lúc": số profile Genlogin được mở cùng một lúc (mặc định 2, tránh nghẽn máy).
+  - Bảng Profile: trạng thái từng profile (OPENING / READY / BUSY / ERROR / UNKNOWN) và số job đang chờ.
+  - Các ô: Profile đã mở, Profile READY, Job chờ đăng, Đang đăng, POST_CONFIRMED, UNKNOWN/FAILED, Giữ lại, Lần đăng gần nhất.
+
+CHỈ đăng video MỚI phát hiện sau khi bấm START ở chế độ tích hợp. Tool KHÔNG đăng hàng loạt video cũ trong DOWNLOADS.
+
+AN TOÀN CHỐNG ĐĂNG TRÙNG (giữ nguyên cơ chế TAM)
+------------------------------------------------
+- Trước khi bấm Post, tool ghi POSTING vào tam_post_journal.jsonl (cùng file nhật ký với TAM).
+  Sau khi bấm: CONFIRMED / UNKNOWN / FAILED_VISIBLE.
+- Đã bấm mà TikTok không xác nhận → UNKNOWN: KHÔNG tự đăng lại, profile đó tạm dừng nhận video.
+  Bạn mở profile kiểm tra tay. Nếu xem xong thấy ổn, bấm "Đã kiểm tra profile UNKNOWN" để đăng tiếp.
+- Lỗi TRƯỚC khi bấm Post (chắc chắn chưa đăng) → thử lại 1 lần.
+- File nào nhật ký đã ghi CONFIRMED / UNKNOWN thì không bao giờ đăng lại, kể cả khi khởi động lại tool.
+- STOP: ngừng nhận video mới. Video đang đăng được làm cho xong. KHÔNG đóng trình duyệt giữa lúc bấm/chờ xác nhận.
+- Tắt tool đột ngột: mở lại, job chưa xong được khôi phục từ database.sqlite (bảng upload_jobs).
+
+LƯU Ý
+-----
+- KHÔNG chạy cùng lúc TAM riêng lẻ (GUI TAM) trên CÙNG các profile này, để tránh 2 chương trình điều khiển 1 trình duyệt.
+- Tool KHÔNG đổi token, cookie, cấu hình Genlogin; chỉ gọi đúng các hàm của TAM.
+- Tốc độ đăng thật (upload qua proxy + TikTok xử lý) phụ thuộc mạng và TikTok. Tool chỉ bảo đảm phần của nó:
+  DONE → gắn file gần như tức thì khi profile READY.
