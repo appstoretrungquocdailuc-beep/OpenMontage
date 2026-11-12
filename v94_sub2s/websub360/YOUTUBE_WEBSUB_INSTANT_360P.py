@@ -875,7 +875,7 @@ def download_aria2(url: str, dest: Path, n: int, info: dict) -> int:
 def ffprobe_info(path: Path) -> dict:
     if not FFPROBE:
         return {"ok": path.exists() and path.stat().st_size > 0, "reason": "no_ffprobe"}
-    p = subprocess.run([FFPROBE, "-v", "error", "-show_entries", "format=duration:stream=codec_type,codec_name,height",
+    p = subprocess.run([FFPROBE, "-v", "error", "-show_entries", "format=duration:stream=codec_type,codec_name,width,height",
                         "-of", "json", str(path)], capture_output=True, text=True, timeout=30,
                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     try:
@@ -887,7 +887,8 @@ def ffprobe_info(path: Path) -> dict:
     v = [s for s in st if s.get("codec_type") == "video"]
     a = [s for s in st if s.get("codec_type") == "audio"]
     return {"ok": p.returncode == 0 and dur > 0 and bool(v), "duration": dur, "video": bool(v), "audio": bool(a),
-            "height": (v[0].get("height") if v else None), "vcodec": (v[0].get("codec_name") if v else None),
+            "height": (v[0].get("height") if v else None), "width": (v[0].get("width") if v else None),
+            "vcodec": (v[0].get("codec_name") if v else None),
             "acodec": (a[0].get("codec_name") if a else None)}
 
 
@@ -984,6 +985,8 @@ class Engine:
         if feed:
             self._spawn(self._feed_thread, "FEED")
         self._spawn(self._stats_loop, "STATS")
+        if workers and FFPROBE:
+            self._spawn(self._ff_keepwarm, "FF-WARM")
         self.log(f"✅ {VERSION} chạy | {len(self.channels)} kênh | workers={self.cfg.get('workers')} | "
                  f"ffmpeg={'có' if FFMPEG else 'KHÔNG'} | ffprobe={'có' if FFPROBE else 'KHÔNG'} | yt-dlp={'có' if yt_dlp else 'KHÔNG'}")
 
@@ -1310,7 +1313,7 @@ class Engine:
             self.log(f"✅ DONE {vid} | {pick['kind']} itag {itags} | {size / 1e6:.2f} MB | resolver {ms(t_start, t_res):.0f} ms "
                      f"({plan.get('source')}) | TTFB {info_v.get('ttfb_ms')} ms | tải {dl_ms:.0f} ms ≈{mbps} Mbps | "
                      f"mux {mux_ms or 0:.0f} ms | verify {verify_ms:.0f} ms | TỔNG {total:.0f} ms | "
-                     f"{v.get('height')}p {v.get('vcodec')}/{v.get('acodec')}")
+                     f"{v.get('width')}x{v.get('height')} {v.get('vcodec')}/{v.get('acodec')}")
             return "DONE"
         except Exception as e:  # noqa: BLE001
             if isinstance(e, InterruptedError) or self.stop_ev.is_set():
@@ -1835,6 +1838,25 @@ class Engine:
                 continue
             self.on_event(ch, e["video_id"], "FEED", e["published"], e["title"], t_send)
         st["base"] = True
+
+    def _ff_keepwarm(self):
+        """Windows nạp ffprobe/ffmpeg (DLL + quét antivirus) lần đầu ~0.3–0.6 s. Chạy '-version' lúc khởi động
+        và mỗi 20 s khi rảnh để lần kiểm tra file thật luôn 'nóng' (cùng kỹ thuật prewarm của V9.4)."""
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        first = True
+        while not self.stop_ev.is_set():
+            if first or not self.active:
+                for exe in (FFPROBE, FFMPEG):
+                    if exe:
+                        t0 = time.perf_counter_ns()
+                        try:
+                            subprocess.run([exe, "-hide_banner", "-version"], capture_output=True, timeout=10, creationflags=flags)
+                        except Exception:
+                            pass
+                        if first:
+                            self.log(f"🔥 làm nóng {Path(exe).name}: {ms(t0, time.perf_counter_ns()):.0f} ms")
+                first = False
+            self.stop_ev.wait(20)
 
     def _stats_loop(self):
         while not self.stop_ev.wait(1.0):

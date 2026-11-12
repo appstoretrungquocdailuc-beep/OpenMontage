@@ -25,7 +25,7 @@ Ngày: 2026-11-12. Môi trường test: máy chủ Linux trong cloud.
 | T2d | POST sai chữ ký bị chặn; POST đúng chữ ký nhưng là video cũ → nhận, không tải | **PASS** | |
 | T2e | Xác minh giả mạo (tool chưa gửi yêu cầu) bị từ chối; lệnh huỷ cũ không cắt đăng ký mới; hub gửi lại xác minh vẫn OK; `denied` được ghi | **PASS** | |
 | T2f | Thân push > 256 KB → 413; tối đa 32 kết nối; hạn tổng 15 s/request | **PASS** (413) | giới hạn 32 kết nối / 15 s: kiểm qua review code, chưa có test tải nặng |
-| T3 | Sự kiện → chống trùng → hàng đợi tải → resolver → HTTP → (mux) → ffprobe → DONE, song song Excel → ghi → đọc lại ô | **PASS** (hub + video giả) | **Download xong TRONG KHI Excel đang khoá**: chứng minh tải không chờ Excel. Với YouTube thật: **BLOCKED** (chạy SELFTEST.bat --video ID) |
+| T3 | Sự kiện → chống trùng → hàng đợi tải → resolver → HTTP → (mux) → ffprobe → DONE, song song Excel → ghi → đọc lại ô | **PASS** (hub + video giả) và **PASS trên Windows của bạn với YouTube thật** (12/11 13:19, Shorts Y-tLGaHGDoI) | máy giả: tải xong TRONG KHI Excel đang khoá. Máy thật: nhận→hàng đợi 0.34 ms, resolver 328 ms (INNERTUBE_ANDROID), tải 3.33 MB 1086 ms (TTFB 818 ms), ffprobe 565 ms, TỔNG 1980 ms; Excel ghi ô D2 32 ms song song |
 | T4 | Benchmark nhiều cấu hình | **PASS harness / mock** | số YouTube thật: **PENDING** (BENCHMARK.bat) |
 | T5.1 | Video trùng; 3 nguồn × 5 lần cùng 1 video | **PASS** | 1 lần tải, 14 lần `dup` |
 | T5.2 | Excel đang mở / bị khoá | **PASS** (file khoá `~$`) | ghi qua COM pywin32: **PENDING** (chỉ chạy được trên Windows có Excel) |
@@ -53,7 +53,7 @@ Lệnh chạy: `python -m pytest -q tests/test_ws360.py`.
 | 3 | Số kênh lỗi | 0 (hub giả) |
 | 4 | Số sự kiện giả lập thành công | 300 (đo độ trễ) + 200 (đo resolver start) + toàn bộ bộ test |
 | 5 | Số push thật nhận được | **0, BLOCKED** |
-| 6 | Số file 360p tải thành công | chỉ từ máy chủ giả; **từ YouTube thật: 0, BLOCKED** |
+| 6 | Số file 360p tải thành công | YouTube thật trên máy bạn: **1** (Y-tLGaHGDoI, 360x640 h264/aac, 43.8 s). Lần trước với 7cy-6oTiTBU thất bại do lỗi chọn Shorts dọc, **đã sửa** |
 | 7 | Độ trễ nội bộ webhook nhận → vào hàng đợi (300 POST có chữ ký) | **p50 1.1 ms · p90 8.2 ms · p99 15.2 ms · max 16.1 ms** (mục tiêu < 100 ms: đạt) |
 | 7b | Vào hàng đợi → worker bắt đầu resolver (200 sự kiện) | **p50 0.55 ms · p90 1.49 ms · p99 1.81 ms · max 8.2 ms** |
 | 8 | Thời gian resolver | YouTube thật: **PENDING** (máy chủ giả mô phỏng 150 ms) |
@@ -89,3 +89,11 @@ YouTube thật có thể khác hẳn (ở V9 trước đây, 1 GET thường th�
   feed chạy song song để bù.
 - Resolver dùng cùng cách gọi Innertube với V9 (3 client chạy đua) và yt-dlp làm dự phòng. Không vượt DRM, không
   dùng cookie / tài khoản.
+
+## 5. Sửa sau khi chạy trên máy bạn (12/11)
+
+- SELFTEST không chạy được khi tool chính đang mở → giờ dùng cổng / khoá / thư mục tải riêng.
+- SELFTEST không nhận link video → giờ nhận mọi dạng link (shorts, watch?v=, youtu.be).
+- **Shorts dọc 360x640 bị loại nhầm** (tool so chiều cao = 360) → giờ chọn theo nhãn '360p' / cạnh ngắn. Có test riêng.
+- ffprobe kiểm tra file mất 565 ms do Windows khởi động nguội → thêm làm nóng ffprobe/ffmpeg lúc khởi động và
+  mỗi 20 s khi rảnh. Mức giảm thật cần đo lại trên máy bạn.
