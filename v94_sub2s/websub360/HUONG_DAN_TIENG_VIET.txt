@@ -144,3 +144,13 @@ LƯU Ý
 - Video cũ bị sửa (đổi tiêu đề…) cũng gửi thông báo WebSub. Tool chỉ tải khi giờ đăng còn trong 30 phút
   (max_age_minutes).
 - Ghi bằng openpyxl (khi Excel đóng) có thể làm mất hình ảnh/biểu đồ nhúng trong file.
+
+TỐI ƯU MẠNG TẢI 360P (bản 2026-11-12)
+-------------------------------------
+- Tool giữ sẵn kết nối tới máy chủ YouTube (resolver) và máy chủ video vừa dùng (ping nhẹ mỗi 40 s) để video mới không phải
+  bắt tay mạng lại. Mỗi video tải xong có dòng log:
+    🌐 MẠNG <ID> | RESOLVER <client> <ms>: kết nối MỚI/dùng lại DNS .. TCP .. TLS .. | chờ máy chủ .. | đọc .. | parse ..
+      || TẢI <máy chủ>: .. kết nối mới | DNS .. TCP .. TLS .. | chờ máy chủ .. | TTFB .. | truyền sau byte đầu .. | ffprobe ..
+  "chờ máy chủ" là thời gian Google xử lý — tool không giảm được phần này.
+- Đo trước/sau trên máy bạn: nhấp đúp BENCH_TAI_360.bat → gửi BENCH_DL.md + BENCH_DL.csv.
+- Quay về cách cũ: config.json → "net_mode": "legacy"  (hoặc chỉ tắt giữ ấm: "net_warm": false).

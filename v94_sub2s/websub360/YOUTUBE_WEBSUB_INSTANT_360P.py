@@ -129,6 +129,13 @@ DEFAULT_CONFIG = {
     "api_quota_log_sec": 300,
     "api_url": "",                     # trống = https://www.googleapis.com/youtube/v3/activities
     "alert_wav": "",                   # file .wav phát khi có video mới (Windows); trống = tắt
+    # ---- LỚP MẠNG TẢI 360P ----
+    "net_mode": "fast",                # fast: đo DNS/TCP/TLS/chờ máy chủ + DNS cache | legacy: đúng bản trước (rollback)
+    "net_warm": True,                  # giữ kết nối ấm tới máy chủ Innertube + máy chủ video vừa dùng (GET /generate_204)
+    "net_warm_interval_sec": 40,
+    "net_warm_innertube_conns": 3,     # = số client resolver chạy song song
+    "net_warm_media_hosts": 6,
+    "resolver_host": "",               # "" = www.youtube.com (như yt-dlp) | "youtubei.googleapis.com" (máy chủ API của app Android)
     # ---- TÊN FILE ----
     "filename_mode": "TITLE",          # TITLE: '<tiêu đề gốc>.mp4' | TITLE_ID: '<tiêu đề>_<ID>.mp4' | ID_360P: '<ID>_360p.mp4'
     "filename_title_max": 0,           # 0 = không tự cắt (chỉ cắt khi vượt giới hạn đường dẫn Windows)
@@ -447,6 +454,7 @@ class DB:
                     pass
             for alter in ("ALTER TABLE excel_jobs ADD COLUMN order_key TEXT",     # nâng cấp DB cũ
                           "ALTER TABLE videos ADD COLUMN target_file TEXT",       # tên file cuối đã chọn (giữ qua khởi động lại)
+                          "ALTER TABLE videos ADD COLUMN net TEXT",               # JSON: DNS/TCP/TLS/SERVER_WAIT resolver + tải
                           "ALTER TABLE subs ADD COLUMN attempts INTEGER DEFAULT 0",
                           "ALTER TABLE subs ADD COLUMN last_http INTEGER",
                           "ALTER TABLE subs ADD COLUMN secret_fp TEXT",          # secret gửi trong lần subscribe gần nhất
@@ -705,6 +713,42 @@ class HttpStatus(Exception):
 
 _POOL = None
 _POOL_LOCK = threading.Lock()
+_NET_MODE = "fast"                  # fast: đo DNS/TCP/TLS/SERVER_WAIT + DNS cache (ws360_net) | legacy: PoolManager cũ y nguyên
+NET_LEARN = None                    # Engine gắn: học máy chủ video vừa dùng để giữ kết nối ấm
+try:
+    sys.path.insert(0, str(Path(os.path.dirname(os.path.abspath(__file__)))))
+    import ws360_net as NET
+except Exception:  # pragma: no cover
+    NET = None
+
+
+class _NoTrace:
+    d = {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def net_trace():
+    return NET.trace() if (NET is not None and _NET_MODE == "fast") else _NoTrace()
+
+
+def set_net_mode(mode: str):
+    """Đổi lớp mạng (rollback: 'legacy' = đúng PoolManager của bản trước). Đóng pool cũ."""
+    global _POOL, _NET_MODE
+    mode = "legacy" if str(mode).lower() == "legacy" or NET is None else "fast"
+    with _POOL_LOCK:
+        if _POOL is not None and mode != _NET_MODE:
+            try:
+                _POOL.clear()
+            except Exception:
+                pass
+            _POOL = None
+        _NET_MODE = mode
+    return mode
 
 
 def pool():
@@ -712,12 +756,25 @@ def pool():
     if _POOL is None:
         with _POOL_LOCK:
             if _POOL is None:
-                _POOL = urllib3.PoolManager(num_pools=32, maxsize=24, block=False, retries=False,
-                                            timeout=urllib3.Timeout(connect=2.0, read=8.0))
+                if _NET_MODE == "fast" and NET is not None:
+                    _POOL = NET.make_pool("fast")
+                else:
+                    _POOL = urllib3.PoolManager(num_pools=32, maxsize=24, block=False, retries=False,
+                                                timeout=urllib3.Timeout(connect=2.0, read=8.0))
     return _POOL
 
 
+_CLIENT_CACHE = {}
+
+
 def _innertube_client(name):
+    if name in _CLIENT_CACHE:                     # cấu hình client yt-dlp: nạp 1 lần (trước đây import + deepcopy mỗi request)
+        return _CLIENT_CACHE[name]
+    _CLIENT_CACHE[name] = _innertube_client_load(name)
+    return _CLIENT_CACHE[name]
+
+
+def _innertube_client_load(name):
     cfg = None
     if yt_dlp:
         try:
@@ -810,11 +867,23 @@ def classify_playability(ps: dict, has_streams: bool) -> str:
     return "notready"
 
 
+def _net_phases(d: dict, t0=None, t1=None) -> dict:
+    """Gom số đo 1 request: kết nối mới (DNS/TCP/TLS) hay dùng lại, SERVER_WAIT (gửi xong → header), đọc thân."""
+    out = {"new_conn": bool(d.get("new_conn")), "dns_ms": d.get("dns_ms"), "tcp_ms": d.get("tcp_ms"), "tls_ms": d.get("tls_ms"),
+           "server_wait_ms": d.get("server_wait_ms")}
+    if t0 is not None and t1 is not None:
+        out["total_ms"] = ms(t0, t1)
+        if d.get("t_hdr"):
+            out["body_ms"] = ms(d["t_hdr"], t1)
+    return out
+
+
 class Resolver:
     CLIENTS = ("android_vr", "web_embedded", "android")
 
     def __init__(self, log):
         self.log = log
+        self.host_override = ""                   # "" = máy chủ Innertube của yt-dlp | vd "youtubei.googleapis.com"
         from concurrent.futures import ThreadPoolExecutor
         self.ex = ThreadPoolExecutor(max_workers=8, thread_name_prefix="Resolve")
         self._ydl = None
@@ -838,7 +907,7 @@ class Resolver:
         c.setdefault("hl", "en")
         c.setdefault("timeZone", "UTC")
         c.setdefault("utcOffsetMinutes", 0)
-        host = str(cfg.get("INNERTUBE_HOST") or "www.youtube.com")
+        host = self.host_override or str(cfg.get("INNERTUBE_HOST") or "www.youtube.com")
         body = json.dumps({"context": ctx, "videoId": vid, "contentCheckOk": True, "racyCheckOk": True,
                            "playbackContext": {"contentPlaybackContext": {"html5Preference": "HTML5_PREF_WANTS"}}},
                           separators=(",", ":")).encode()
@@ -846,11 +915,18 @@ class Resolver:
                "User-Agent": str(c.get("userAgent") or "com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip"),
                "X-YouTube-Client-Name": str(cfg.get("INNERTUBE_CONTEXT_CLIENT_NAME") or 3),
                "X-YouTube-Client-Version": str(c.get("clientVersion") or "")}
-        r = pool().request("POST", f"https://{host}/youtubei/v1/player?prettyPrint=false", body=body, headers=hdr,
-                           timeout=urllib3.Timeout(connect=1.0, read=2.0), retries=False, preload_content=True)
+        t0 = time.perf_counter_ns()
+        with net_trace() as tr:
+            r = pool().request("POST", f"https://{host}/youtubei/v1/player?prettyPrint=false", body=body, headers=hdr,
+                               timeout=urllib3.Timeout(connect=1.0, read=2.0), retries=False, preload_content=True)
+        t1 = time.perf_counter_ns()
+        net = _net_phases(tr.d, t0, t1)
+        net["host"] = host
         if r.status != 200:
-            return {"client": client, "verdict": "notready", "reason": f"player HTTP {r.status}"}
-        data = json.loads(r.data.decode("utf-8", "replace"))
+            return {"client": client, "verdict": "notready", "reason": f"player HTTP {r.status}", "net": net}
+        data = json.loads(r.data)
+        net["parse_ms"] = ms(t1, time.perf_counter_ns())
+        net["kb"] = round(len(r.data) / 1024, 1)
         prog, adap = _innertube_formats(data)
         pick = pick_formats(prog, adap)
         verdict = classify_playability(data.get("playabilityStatus") or {}, bool(prog or adap))
@@ -861,7 +937,7 @@ class Resolver:
                   "has18": any(str(f.get("itag")) == "18" for f in allf)}
         return {"client": client, "verdict": verdict if (pick or verdict != "ok") else "noformat", "pick": pick, "counts": counts,
                 "reason": str((data.get("playabilityStatus") or {}).get("reason") or (data.get("playabilityStatus") or {}).get("status") or ""),
-                "duration": dur, "title": (data.get("videoDetails") or {}).get("title") or ""}
+                "duration": dur, "title": (data.get("videoDetails") or {}).get("title") or "", "net": net}
 
     def resolve(self, vid: str, deadline_s=2.5) -> dict:
         """Race 3 client Innertube; client nào trả 360p dùng được trước thì thắng. Không có → yt-dlp."""
@@ -876,10 +952,12 @@ class Resolver:
                 except Exception as e:
                     r = {"verdict": "error", "reason": f"{type(e).__name__}"}
                 if r:
+                    r["done_ms"] = ms(t0, time.perf_counter_ns())
                     results.append(r)
                     if r.get("pick"):
                         r["source"] = f"INNERTUBE_{r['client'].upper()}"
-                        r["resolve_ms"] = ms(t0, time.perf_counter_ns())
+                        r["resolve_ms"] = r["done_ms"]
+                        r["race_ms"] = {x.get("client"): x.get("done_ms") for x in results}
                         return r
         except FTE:
             pass
@@ -937,9 +1015,17 @@ class Resolver:
 def _follow(url, headers=None, method="GET", preload=False, timeout=None):
     """GET theo 302 thủ công (tối đa 5), trả (resp, final_url). 4xx/5xx → HttpStatus."""
     cur = url
+    hops = []
     for _ in range(6):
-        r = pool().request(method, cur, headers=headers or {}, redirect=False, preload_content=preload,
-                           retries=False, timeout=timeout or urllib3.Timeout(connect=2.0, read=8.0))
+        t0 = time.perf_counter_ns()
+        with net_trace() as tr:
+            r = pool().request(method, cur, headers=headers or {}, redirect=False, preload_content=preload,
+                               retries=False, timeout=timeout or urllib3.Timeout(connect=2.0, read=8.0))
+        hop = _net_phases(tr.d, t0, time.perf_counter_ns())
+        hop["host"] = urlparse(cur).hostname
+        hop["status"] = r.status
+        hops.append(hop)
+        r._ws_hops = hops
         if r.status in (301, 302, 303, 307, 308):
             loc = r.headers.get("Location")
             r.drain_conn()
@@ -976,6 +1062,7 @@ def download_single(url: str, dest: Path, info: dict, cancel: threading.Event | 
     """1 GET, ghi thẳng vào file tạm. info nhận ttfb_ms/bytes/elapsed_ms."""
     t0 = time.perf_counter_ns()
     r, final = _follow(url)
+    t_hdr = time.perf_counter_ns()
     total = 0
     first = None
     expected = int(r.headers.get("Content-Length") or 0)
@@ -992,8 +1079,20 @@ def download_single(url: str, dest: Path, info: dict, cancel: threading.Event | 
         r.release_conn()
     if expected and total != expected:
         raise IOError(f"thiếu dữ liệu {total}/{expected}")
-    info.update(ttfb_ms=ms(t0, first or time.perf_counter_ns()), bytes=total, elapsed_ms=ms(t0, time.perf_counter_ns()),
-                redirected=final != url)
+    t_end = time.perf_counter_ns()
+    info.update(ttfb_ms=ms(t0, first or t_end), bytes=total, elapsed_ms=ms(t0, t_end), redirected=final != url)
+    hops = getattr(r, "_ws_hops", []) or []
+    sm = lambda k: round(sum(h.get(k) or 0 for h in hops), 2) if any(h.get(k) is not None for h in hops) else None
+    # TTFB = setup (DNS+TCP+TLS mọi chặng) + SERVER_WAIT (mọi chặng) + phần còn lại; TRANSFER = byte đầu → byte cuối (không tính TTFB 2 lần)
+    info.update(hops=len(hops), new_conns=sum(1 for h in hops if h.get("new_conn")), dns_ms=sm("dns_ms"), tcp_ms=sm("tcp_ms"),
+                tls_ms=sm("tls_ms"), server_wait_ms=sm("server_wait_ms"), headers_ms=ms(t0, t_hdr),
+                first_byte_after_hdr_ms=ms(t_hdr, first) if first else None, transfer_ms=ms(first, t_end) if first else None,
+                host=urlparse(final).hostname)
+    if NET_LEARN is not None:
+        try:
+            NET_LEARN(final)
+        except Exception:
+            pass
     return total
 
 
@@ -1003,27 +1102,24 @@ def download_ranges(url: str, dest: Path, size: int, n: int, info: dict, cancel=
     t0 = time.perf_counter_ns()
     if size <= 0 or n <= 1:
         return download_single(url, dest, info, cancel)
-    # dò 302 một lần (không đọc thân; bắt buộc 206 — server bỏ qua Range thì về 1 GET)
-    r, final = _follow(url, headers={"Range": "bytes=0-0"}, preload=False)
-    st = r.status
-    if st == 206:
-        r.drain_conn()                                    # đọc hết 1 byte → kết nối dùng lại được an toàn
-        r.release_conn()
-    else:
-        r.close()                                         # server bỏ qua Range (200 cả file) → đóng, không đọc
-        raise HttpStatus(st)
+    # KHÔNG còn request dò 'bytes=0-0' (tốn thêm 1 vòng mạng + chờ máy chủ): mỗi đoạn tự theo 302 và BẮT BUỘC 206 +
+    # Content-Range khớp; máy chủ bỏ qua Range (200) → đóng ngay không đọc, ném lỗi → caller về 1 GET.
     with open(dest, "wb") as f:
         f.truncate(size)
     step = -(-size // n)
     parts = [(i * step, min(size, (i + 1) * step) - 1) for i in range(n) if i * step < size]
     firsts = []
+    hops_all = []
+    finals = []
 
     def one(a, b):
-        rr = pool().request("GET", final, headers={"Range": f"bytes={a}-{b}"}, preload_content=False, redirect=False,
-                            retries=False, timeout=urllib3.Timeout(connect=2.0, read=8.0))
+        rr, fin = _follow(url, headers={"Range": f"bytes={a}-{b}"}, preload=False)
+        hops_all.extend(getattr(rr, "_ws_hops", []) or [])
+        finals.append(fin)
+        if rr.status != 206:
+            rr.close()
+            raise HttpStatus(rr.status)
         try:
-            if rr.status != 206:
-                raise HttpStatus(rr.status)
             cr = rr.headers.get("Content-Range", "")
             if not cr.startswith(f"bytes {a}-{b}/"):
                 raise IOError(f"Content-Range sai: {cr}")
@@ -1044,8 +1140,17 @@ def download_ranges(url: str, dest: Path, size: int, n: int, info: dict, cancel=
             rr.release_conn()
     with ThreadPoolExecutor(max_workers=len(parts), thread_name_prefix="Range") as ex:
         total = sum(f.result() for f in [ex.submit(one, a, b) for a, b in parts])
-    info.update(ttfb_ms=ms(t0, min(firsts) if firsts else None), bytes=total, elapsed_ms=ms(t0, time.perf_counter_ns()),
-                connections=len(parts))
+    t_end = time.perf_counter_ns()
+    sm = lambda k: round(max((h.get(k) or 0) for h in hops_all), 2) if any(h.get(k) is not None for h in hops_all) else None
+    info.update(ttfb_ms=ms(t0, min(firsts) if firsts else None), bytes=total, elapsed_ms=ms(t0, t_end), connections=len(parts),
+                hops=len(hops_all), new_conns=sum(1 for h in hops_all if h.get("new_conn")), dns_ms=sm("dns_ms"), tcp_ms=sm("tcp_ms"),
+                tls_ms=sm("tls_ms"), server_wait_ms=sm("server_wait_ms"), transfer_ms=ms(min(firsts), t_end) if firsts else None,
+                host=urlparse(finals[0]).hostname if finals else None)
+    if NET_LEARN is not None and finals:
+        try:
+            NET_LEARN(finals[0])
+        except Exception:
+            pass
     return total
 
 
@@ -1200,7 +1305,10 @@ class Engine:
         self.pending_hub = {}                 # (channel, mode) → thời điểm yêu cầu ta THỰC SỰ gửi tới hub
         self.pending_ok = {}                  # (channel, mode) → thời điểm đã chấp nhận xác minh
         self.hub_lock = threading.Lock()
+        self.net_mode = set_net_mode(cfg.get("net_mode", "fast"))
         self.resolver = Resolver(log)
+        self.resolver.host_override = str(cfg.get("resolver_host") or "")
+        self.warmer = None
         old_secret = self.db.meta_get("websub_secret")
         self.secret = load_shared_secret(base, self.db)
         retire_secret(base, old_secret, self.secret)     # DB từng dùng secret khác → giữ lại để nhận diện thuê bao cũ
@@ -1285,6 +1393,13 @@ class Engine:
         self._spawn(self._stats_loop, "STATS")
         if workers and FFPROBE:
             self._spawn(self._ff_keepwarm, "FF-WARM")
+        if workers and self.net_mode == "fast" and self.cfg.get("net_warm", True) and NET is not None:
+            global NET_LEARN
+            hosts = [self.resolver.host_override or "www.youtube.com"]
+            self.warmer = NET.NetWarmer(pool, self.log, hosts, int(self.cfg.get("net_warm_innertube_conns", 3)),
+                                        int(self.cfg.get("net_warm_media_hosts", 6)), float(self.cfg.get("net_warm_interval_sec", 40)))
+            NET_LEARN = self.warmer.learn
+            self.warmer.start()
         self.log(f"🔑 secret HMAC hiện tại: dấu vân tay {secret_fp(self.secret)} (websub_secret.txt) | "
                  f"secret cũ đã biết: {len(load_secret_history(self.base))}")
         self.log(f"✅ {VERSION} chạy | {len(self.channels)} kênh | workers={self.cfg.get('workers')} | "
@@ -1328,6 +1443,9 @@ class Engine:
             self._stop_inner()
 
     def _stop_inner(self):
+        if getattr(self, "warmer", None) is not None:
+            self.warmer.stop()
+            self.warmer = None
         if self.api is not None:                          # ngừng nguồn API trước (không phát hiện thêm khi đang tắt)
             try:
                 self.api.stop()
@@ -1768,6 +1886,24 @@ class Engine:
             self.stats["last"] = {"vid": vid, "resolver_ms": ms(t_start, t_res), "download_ms": dl_ms, "mux_ms": mux_ms,
                                   "verify_ms": verify_ms, "total_ms": total}
             itags = ",".join(str(f["itag"]) for f in (pick["video"], pick["audio"]) if f)
+            try:
+                rn = plan.get("net") or {}
+                net = {"resolver": dict(rn, client=plan.get("client"), race_ms=plan.get("race_ms")),
+                       "media": {k: info_v.get(k) for k in ("host", "hops", "new_conns", "dns_ms", "tcp_ms", "tls_ms", "server_wait_ms",
+                                                            "headers_ms", "first_byte_after_hdr_ms", "ttfb_ms", "transfer_ms")},
+                       "ffprobe_ms": verify_ms, "net_mode": _NET_MODE}
+                self.db.upd(vid, net=json.dumps(net, ensure_ascii=False))
+                f_ = lambda v: "-" if v is None else (f"{v:.0f}" if isinstance(v, (int, float)) else str(v))
+                m_ = net["media"]
+                self.log(f"🌐 MẠNG {vid} | RESOLVER {plan.get('client')} {f_(ms(t_start, t_res))} ms: "
+                         f"{'kết nối MỚI' if rn.get('new_conn') else 'kết nối dùng lại'} DNS {f_(rn.get('dns_ms'))} TCP {f_(rn.get('tcp_ms'))} "
+                         f"TLS {f_(rn.get('tls_ms'))} | chờ máy chủ {f_(rn.get('server_wait_ms'))} | đọc {f_(rn.get('body_ms'))} "
+                         f"({f_(rn.get('kb'))} KB) | parse {f_(rn.get('parse_ms'))} | race {plan.get('race_ms')} || "
+                         f"TẢI {m_.get('host')}: {f_(m_.get('new_conns'))} kết nối mới/{f_(m_.get('hops'))} chặng | DNS {f_(m_.get('dns_ms'))} "
+                         f"TCP {f_(m_.get('tcp_ms'))} TLS {f_(m_.get('tls_ms'))} | chờ máy chủ {f_(m_.get('server_wait_ms'))} | "
+                         f"TTFB {f_(m_.get('ttfb_ms'))} | truyền sau byte đầu {f_(m_.get('transfer_ms'))} | ffprobe {f_(verify_ms)}")
+            except Exception as e:  # noqa: BLE001 — số đo không bao giờ làm hỏng việc tải
+                self.log(f"⚠️ ghi số đo mạng lỗi: {type(e).__name__}: {e}")
             det = self.race.get(vid) or {}
             self.log(f"🏁 DETECTION_TO_DOWNLOAD_DONE {vid} = "
                      + (f"{total:.0f} ms (WINNER={det.get('winner') or job.get('engine') or '?'})" if job.get("t_recv_ns")
@@ -3231,9 +3367,8 @@ def bench360(cfg, base, ids, reps=10):
     for vid in ids:
         for rep in range(reps):
             eng.db.x("DELETE FROM videos WHERE video_id=?", (vid,))
-            for f in (eng.dl_dir).rglob(f"{vid}_360p.mp4"):
-                f.unlink(missing_ok=True)
             ch = "UCBENCH" + "0" * 17
+            shutil.rmtree(eng.dl_dir / ch, ignore_errors=True)       # tên file theo tiêu đề: xoá cả thư mục bench mỗi lượt
             t = time.perf_counter_ns()
             eng.db.x("INSERT INTO videos(video_id, channel_id, url, engine, detected_at, state) VALUES(?,?,?,?,?,?)",
                      (vid, ch, video_url(vid), "BENCH", iso(), "QUEUED"))
@@ -3258,6 +3393,184 @@ def bench360(cfg, base, ids, reps=10):
             print(f"{c:<22}{pct(vals, 50):>10.1f}{pct(vals, 90):>10.1f}{max(vals):>10.1f}")
     shutil.rmtree(eng.dl_dir, ignore_errors=True)
     return rows
+
+
+BENCH_DL_VARIANTS = {
+    # tên: (cấu hình, chuẩn bị trước mỗi lượt)
+    "legacy":        ({"net_mode": "legacy", "range_connections": 1}, "cold"),     # đúng bản trước, kết nối nguội (như sau lúc rảnh)
+    "fast_cold":     ({"net_mode": "fast", "range_connections": 1}, "cold"),       # lớp mạng mới, KHÔNG giữ ấm (để tách tác dụng)
+    "warm_resolver": ({"net_mode": "fast", "range_connections": 1}, "warm_inner"), # giữ ấm Innertube; máy chủ video NGUỘI (thực tế xấu)
+    "warm_all":      ({"net_mode": "fast", "range_connections": 1}, "warm_all"),   # giữ ấm cả máy chủ video vừa dùng (thực tế tốt)
+    "warm_all_r2":   ({"net_mode": "fast", "range_connections": 2}, "warm_all"),
+    "warm_all_r4":   ({"net_mode": "fast", "range_connections": 4}, "warm_all"),
+    "warm_apihost":  ({"net_mode": "fast", "range_connections": 1, "resolver_host": "youtubei.googleapis.com"}, "warm_all"),
+    "warm_h2":       ({"net_mode": "fast", "range_connections": 1}, "warm_all"),  # tải bằng HTTP/2 (cần: pip install "httpx[http2]")
+}
+
+
+def _h2_client():
+    try:
+        import httpx  # noqa: F401
+        import h2  # noqa: F401
+    except ImportError:
+        return None
+    return httpx.Client(http2=True, follow_redirects=True, timeout=httpx.Timeout(8.0, connect=2.0))
+
+
+def _bench_h2_once(eng, vid, ch, client):
+    """Cùng các bước như Engine.process (resolve → tải 1 GET → ffprobe), nhưng phần tải qua HTTP/2 (httpx, kết nối giữ ấm)."""
+    t0 = time.perf_counter_ns()
+    plan = eng.resolver.resolve(vid)
+    t_res = time.perf_counter_ns()
+    pick = plan["pick"]
+    if pick["kind"] != "progressive":
+        return {"result": "SKIP", "error": "không phải progressive"}
+    d = eng.dl_dir / ch
+    d.mkdir(parents=True, exist_ok=True)
+    dest = d / f".{vid}.part.mp4"
+    first = None
+    n = 0
+    with client.stream("GET", pick["video"]["url"]) as r:
+        t_hdr = time.perf_counter_ns()
+        if r.status_code >= 400:
+            return {"result": "FAILED", "error": f"HTTP {r.status_code}"}
+        with open(dest, "wb", buffering=1024 * 1024) as f:
+            for chunk in r.iter_bytes(256 * 1024):
+                if first is None:
+                    first = time.perf_counter_ns()
+                f.write(chunk)
+                n += len(chunk)
+        ver = r.http_version
+    t_dl = time.perf_counter_ns()
+    exp = int(pick["video"].get("clen") or 0)
+    v = ffprobe_info(dest)
+    t_v = time.perf_counter_ns()
+    dest.unlink(missing_ok=True)
+    ok = v.get("ok") and (not exp or exp == n)
+    return {"result": "DONE" if ok else "FAILED", "error": "" if ok else f"ffprobe/size {n}/{exp}", "total_ms": ms(t0, t_v),
+            "resolver_ms": ms(t0, t_res), "ttfb_ms": ms(t_res, first), "transfer_ms": ms(first, t_dl), "download_ms": ms(t_res, t_dl),
+            "ffprobe_ms": ms(t_dl, t_v), "size": n, "media_server_wait_ms": None, "http_version": ver,
+            "mbps": round(n * 8 / 1e6 / max(1e-3, (t_dl - t_res) / 1e9), 1)}
+BENCH_DL_COLS = ["total_ms", "resolver_ms", "res_new_conn", "res_setup_ms", "res_server_wait_ms", "res_body_parse_ms",
+                 "media_new_conns", "media_setup_ms", "media_server_wait_ms", "ttfb_ms", "transfer_ms", "download_ms", "ffprobe_ms",
+                 "rename_ms", "mbps", "size"]
+
+
+def bench_dl(cfg, base, ids, reps=None, variants=None):
+    """Đo đường tải THẬT (Engine.process: resolve → tải → ffprobe → DONE) với nhiều phương án, thứ tự xoay vòng.
+    Mỗi lượt: lấy link MỚI, xoá file + bản ghi trước (không dùng file/kết quả có sẵn). Kết quả: BENCH_DL.csv / BENCH_DL.md."""
+    names = [v for v in (variants or list(BENCH_DL_VARIANTS)) if v in BENCH_DL_VARIANTS]
+    reps = reps or max(1, -(-20 // max(1, len(ids))))               # ≥ 20 lượt mỗi phương án
+    log = Log(base / "logs")
+    bcfg = dict(cfg, download_dir="DOWNLOADS_BENCH", excel_enabled=False, net_warm=False)
+    eng = Engine(bcfg, base, log, db_name="database_BENCH.sqlite", lock_name="ws360_bench.lock")
+    if FFPROBE:
+        subprocess.run([FFPROBE, "-version"], capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    global NET_LEARN
+    learned = []
+    NET_LEARN = lambda u: learned.append(u)
+    rows = []
+    ch = "UCBENCH" + "0" * 17
+    h2c = _h2_client() if "warm_h2" in names else None
+    if "warm_h2" in names and h2c is None:
+        names = [n for n in names if n != "warm_h2"]
+        log("BENCH-DL: bỏ qua warm_h2 (chưa cài 'httpx[http2]': python -m pip install \"httpx[http2]\")")
+    log(f"BENCH-DL: {len(ids)} video × {reps} vòng × {len(names)} phương án = {len(ids) * reps * len(names)} lượt tải thật")
+    for rep_i in range(reps):
+        for vid in ids:
+            order = names[rep_i % len(names):] + names[:rep_i % len(names)]
+            if rep_i % 2:
+                order = order[::-1]
+            for v in order:
+                over, prep = BENCH_DL_VARIANTS[v]
+                eng.cfg.update(dict({"range_connections": 1, "resolver_host": ""}, **over))
+                set_net_mode(eng.cfg["net_mode"])
+                eng.resolver.host_override = eng.cfg.get("resolver_host") or ""
+                p = pool()
+                if prep == "cold" or prep == "warm_inner":
+                    p.clear()                                       # đóng mọi kết nối: như khi tool rảnh lâu
+                    if NET is not None:
+                        with NET.DNS.lock:
+                            NET.DNS.m.clear()
+                if prep in ("warm_inner", "warm_all") and NET is not None:
+                    host = eng.resolver.host_override or "www.youtube.com"
+                    w = NET.NetWarmer(pool, log, (host,), 3, 6 if prep == "warm_all" else 0, 40)
+                    if prep == "warm_all":
+                        for u in learned[-6:]:
+                            w.learn(u)
+                    w.warm_now()                                    # = trạng thái bộ giữ ấm tạo ra khi chạy thật
+                eng.db.x("DELETE FROM videos WHERE video_id=?", (vid,))
+                shutil.rmtree(eng.dl_dir / ch, ignore_errors=True)
+                if v == "warm_h2":
+                    try:
+                        out = dict({"variant": v, "video_id": vid, "rep": rep_i}, **_bench_h2_once(eng, vid, ch, h2c))
+                    except Exception as e:  # noqa: BLE001
+                        out = {"variant": v, "video_id": vid, "rep": rep_i, "result": "FAILED", "error": f"{type(e).__name__}: {e}"[:160]}
+                    rows.append(out)
+                    log(f"BENCH-DL {v:14} {vid} #{rep_i + 1}: {out['result']} TỔNG {out.get('total_ms')} ms | resolver "
+                        f"{out.get('resolver_ms')} | TTFB {out.get('ttfb_ms')} truyền {out.get('transfer_ms')} | {out.get('http_version')}"
+                        + (f" | LỖI {out['error']}" if out.get("error") else ""))
+                    time.sleep(0.3)
+                    continue
+                t = time.perf_counter_ns()
+                eng.db.x("INSERT INTO videos(video_id, channel_id, url, engine, detected_at, state) VALUES(?,?,?,?,?,?)",
+                         (vid, ch, video_url(vid), "BENCH", iso(), "QUEUED"))
+                r = eng.process({"vid": vid, "ch": ch, "t_recv_ns": t, "t_enq_ns": t})
+                row = dict(eng.db.one("SELECT * FROM videos WHERE video_id=?", (vid,)))
+                net = json.loads(row.get("net") or "{}")
+                rn, mn = net.get("resolver") or {}, net.get("media") or {}
+                add = lambda *xs: round(sum(x for x in xs if x is not None), 1) if any(x is not None for x in xs) else None
+                out = {"variant": v, "video_id": vid, "rep": rep_i, "result": r, "total_ms": row.get("total_ms"),
+                       "resolver_ms": row.get("resolver_ms"), "res_new_conn": 1 if rn.get("new_conn") else 0,
+                       "res_setup_ms": add(rn.get("dns_ms"), rn.get("tcp_ms"), rn.get("tls_ms")) if rn.get("new_conn") else 0.0,
+                       "res_server_wait_ms": rn.get("server_wait_ms"), "res_body_parse_ms": add(rn.get("body_ms"), rn.get("parse_ms")),
+                       "media_new_conns": mn.get("new_conns"),
+                       "media_setup_ms": add(mn.get("dns_ms"), mn.get("tcp_ms"), mn.get("tls_ms")) if mn.get("new_conns") else 0.0,
+                       "media_server_wait_ms": mn.get("server_wait_ms"), "ttfb_ms": mn.get("ttfb_ms"), "transfer_ms": mn.get("transfer_ms"),
+                       "download_ms": row.get("download_ms"), "ffprobe_ms": row.get("ffprobe_ms"), "rename_ms": row.get("rename_ms"),
+                       "mbps": row.get("mbps"), "size": row.get("size"), "client": rn.get("client"), "media_host": mn.get("host"),
+                       "error": row.get("error") if r != "DONE" else ""}
+                rows.append(out)
+                log(f"BENCH-DL {v:14} {vid} #{rep_i + 1}: {r} TỔNG {out['total_ms']} ms | resolver {out['resolver_ms']} "
+                    f"(setup {out['res_setup_ms']}, chờ {out['res_server_wait_ms']}) | tải TTFB {out['ttfb_ms']} (setup "
+                    f"{out['media_setup_ms']}, chờ {out['media_server_wait_ms']}) truyền {out['transfer_ms']} | ffprobe {out['ffprobe_ms']}"
+                    + (f" | LỖI {out['error']}" if out["error"] else ""))
+                time.sleep(0.3)
+    NET_LEARN = None
+    set_net_mode(cfg.get("net_mode", "fast"))
+    shutil.rmtree(eng.dl_dir, ignore_errors=True)
+    with open(base / "BENCH_DL.csv", "w", newline="", encoding="utf-8") as f:
+        keys = list(dict.fromkeys(k for r in rows for k in r)) or ["variant"]
+        w = csv.DictWriter(f, fieldnames=keys)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+    md = [f"# BENCH-DL — tải 360p thật, {len(ids)} video, {reps} vòng/phương án, thứ tự xoay vòng ({iso()})", "",
+          "Mỗi lượt: link MỚI + xoá file trước (không dùng file có sẵn). Giá trị: median / P90 (ms). TỔNG = từ lúc bắt đầu resolve "
+          "tới khi file đã tải xong + ffprobe xác minh + bàn giao (không tính TTFB 2 lần: TTFB nằm trong 'tải').", "",
+          "| Phương án | lượt | lỗi | TỔNG | ≤1000 ms | resolver | setup resolver | chờ máy chủ resolver | TTFB | setup tải | "
+          "chờ máy chủ tải | truyền | ffprobe |", "|" + "---|" * 13]
+    summary = {}
+    for v in names:
+        rs = [r for r in rows if r["variant"] == v]
+        ok = [r for r in rs if r["result"] == "DONE"]
+        q = lambda k: (pct([r[k] for r in ok if r.get(k) is not None], 50), pct([r[k] for r in ok if r.get(k) is not None], 90))
+        summary[v] = {k: q(k) for k in BENCH_DL_COLS}
+        summary[v].update(n=len(rs), fail=len(rs) - len(ok), under_1s=sum(1 for r in ok if (r["total_ms"] or 1e9) <= 1000))
+        f_ = lambda t: "-" if t[0] is None else f"{t[0]:.0f} / {t[1]:.0f}"
+        sv = summary[v]
+        md.append(f"| {v} | {sv['n']} | {sv['fail']} ({100 * sv['fail'] / max(1, sv['n']):.0f}%) | {f_(sv['total_ms'])} | "
+                  f"{sv['under_1s']}/{len(ok)} | {f_(sv['resolver_ms'])} | {f_(sv['res_setup_ms'])} | {f_(sv['res_server_wait_ms'])} | "
+                  f"{f_(sv['ttfb_ms'])} | {f_(sv['media_setup_ms'])} | {f_(sv['media_server_wait_ms'])} | {f_(sv['transfer_ms'])} | "
+                  f"{f_(sv['ffprobe_ms'])} |")
+    md += ["", "Phương án: legacy = bản trước (kết nối nguội); fast_cold = lớp mạng mới không giữ ấm; warm_resolver = giữ ấm "
+           "Innertube, máy chủ video nguội; warm_all = giữ ấm cả máy chủ video vừa dùng; _r2/_r4 = chia 2/4 đoạn Range; "
+           "warm_apihost = resolver qua youtubei.googleapis.com.",
+           "Lưu ý: cùng 1 video tải lặp lại thì máy chủ cache của Google (CDN) đã có sẵn → 'chờ máy chủ tải' có thể thấp hơn video "
+           "vừa đăng thật; thứ tự xoay vòng để mọi phương án chịu ảnh hưởng như nhau."]
+    (base / "BENCH_DL.md").write_text("\n".join(md) + "\n", encoding="utf-8")
+    print("\n".join(md))
+    return {"rows": rows, "summary": summary}
 
 
 def bench(cfg, base, ids, reps=3):
@@ -3409,6 +3722,8 @@ def main(argv=None):
     ap.add_argument("--verify-post", default="", help="kiểm lại 1 request bị từ chối đã lưu trong logs/rejected_posts")
     ap.add_argument("--hubtest", action="store_true", help="kiểm tra sâu hub (đăng ký đồng bộ + callback thử) → HUBTEST_REPORT.md")
     ap.add_argument("--bench360", nargs="*", help="đo đường tải thật N lượt/video → BENCH360.csv (median/p90 từng bước)")
+    ap.add_argument("--bench-dl", nargs="*", help="so sánh các phương án mạng/tải trên video thật → BENCH_DL.md/.csv (≥20 lượt mỗi phương án)")
+    ap.add_argument("--variants", default="", help="--bench-dl: danh sách phương án, cách nhau dấu phẩy")
     ap.add_argument("--integrated", action="store_true", help="bật sẵn tự đăng TikTok (TAM) khi mở giao diện / headless")
     ap.add_argument("--dry-run-post", action="store_true", help="tích hợp: chạy tới khi nút Post sáng rồi DỪNG, không bấm")
     ap.add_argument("--mode", default="", help="WEBSUB_ONLY | API_ONLY | PARALLEL (ghi đè detection_mode trong config.json)")
@@ -3435,6 +3750,13 @@ def main(argv=None):
         return 0 if all(s != "FAIL" for _, s, _ in r) else 1
     if a.bench360 is not None:
         bench360(cfg, base, [v for v in (extract_vid(x) for x in a.bench360) if v], max(1, a.reps if a.reps != 3 else 10))
+        return 0
+    if a.bench_dl is not None:
+        ids = [v for v in (extract_vid(x) for x in a.bench_dl) if v]
+        if not ids:
+            print("Cần ít nhất 1 ID/link video. Ví dụ: --bench-dl ID1 ID2 ID3")
+            return 2
+        bench_dl(cfg, base, ids, a.reps if a.reps != 3 else None, [x.strip() for x in a.variants.split(",") if x.strip()] or None)
         return 0
     if a.hubtest:
         hubtest(cfg, base)

@@ -153,7 +153,7 @@ def mkfmt(url, itag, height, mime, clen, **kw):
 def make_engine(tmp, chans, hub=None, keep_excel=False, **cfg_over):
     if not (keep_excel and (tmp / "check.xlsx").exists()):
         make_excel(tmp / "check.xlsx", chans)
-    cfg = dict(ws.DEFAULT_CONFIG, listen_host="127.0.0.1", listen_port=0,
+    cfg = dict(ws.DEFAULT_CONFIG, listen_host="127.0.0.1", listen_port=0, net_warm=False,
                retry_schedule_sec=[0.1, 0.2, 0.3], workers=3)
     if hub:
         cfg["hub_url"] = hub.url

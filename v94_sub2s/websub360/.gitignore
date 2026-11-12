@@ -10,3 +10,4 @@ check*.xlsx
 __pycache__/
 api_keys.txt
 RACE_BENCHMARK.*
+BENCH_DL.*
