@@ -79,13 +79,13 @@ class FakeTikTok:
             self.max_conc[pid] = max(self.max_conc.get(pid, 0), self.active[pid])
             self.uploads.append((pid, paths[0], time.perf_counter_ns()))
         try:
-            assert not Path(paths[0]).name.startswith("."), "uploader nhận file .part!"
+            assert not ws.TEMP_RE.match(Path(paths[0]).name), "uploader nhận file .part!"
             trace.mark("SEND_KEYS_START")
             trace.mark("SEND_KEYS_END")
             time.sleep(self.upload_s)
             trace.mark("PROCESSING_READY")
             nm = Path(paths[0]).name
-            vid = nm.split("_360p")[0] if nm.endswith("_360p.mp4") else nm[-15:-4]   # '<tiêu đề>_<ID>.mp4' hoặc '<ID>_360p.mp4'
+            vid = nm.split("_360p")[0] if nm.endswith("_360p.mp4") else nm   # '<tiêu đề gốc>.mp4' hoặc '<ID>_360p.mp4'
             self.names.append(nm)
             out = self.outcome.get(vid, "CONFIRMED")
             if dry_run:
@@ -237,7 +237,8 @@ def test_websub_to_download_to_tiktok_end_to_end(tmp_path, tam, monkeypatch, gvs
     r3 = wait_job(br, "E2EVIDEO003:" + P2)
     assert r1["state"] == r2["state"] == r3["state"] == "CONFIRMED"
     up = {(pid, Path(p).name) for pid, p, _ in fk.uploads}
-    assert up == {(P1, "t_E2EVIDEO001.mp4"), (P1, "t_E2EVIDEO002.mp4"), (P2, "t_E2EVIDEO003.mp4")}   # tên = tiêu đề WebSub ('t')
+    names = sorted(n for _, n in up)
+    assert names == ["t (2).mp4", "t.mp4", "t.mp4"] and {p for p, _ in up} == {P1, P2}   # tên = tiêu đề gốc ('t'), trùng trong cùng thư mục kênh → (2)
     assert fk.max_conc[P1] == 1                              # 2 video cùng profile → tuần tự, không 2 phiên
     assert calls["map"] == maps_before                       # KHÔNG đọc lại Excel cho mỗi job
     assert not [a for a in listdir_calls if "DOWNLOADS" in str(a)]   # KHÔNG quét thư mục để tìm video
@@ -486,11 +487,11 @@ def test_title_named_file_reaches_uploader_exactly_and_attach_is_logged(tmp_path
     monkeypatch.setattr(e.resolver, "resolve", lambda v, deadline_s=2.5: dict(T.plan_prog(gvs, media, v), title="KHÔNG dùng"))
     e.start(websub=False)
     br.start()
-    e.on_event(CH[0], "TITLEVID001", "WEBSUB", T.TS, title='Vol.Part 2: "母が決めた" ルール?')
+    e.on_event(CH[0], "TITLEVID001", "WEBSUB", T.TS, title='.Part 2: "母が決めた" ルール? 😀')
     r = T.wait_state(e, "TITLEVID001")
     j = wait_job(br, "TITLEVID001:" + P1)
     assert r["state"] == "DONE" and j["state"] == "CONFIRMED", (r["error"], j["reason"])
-    name = 'Vol.Part 2： ＂母が決めた＂ ルール？_TITLEVID001.mp4'
+    name = '.Part 2： ＂母が決めた＂ ルール？ 😀.mp4'
     assert Path(r["file"]).name == name and Path(r["file"]).is_file()
     assert fk.names == [name] and fk.uploads[0][1] == r["file"] == j["path"]
     assert any("DOWNLOAD_DONE_TO_TIKTOK_ATTACH=" in l and name in l for l in e._logs)

@@ -1,0 +1,508 @@
+⚠️ Chưa cài 'watchdog' (pip install watchdog). Sẽ dùng chế độ trễ mặc định.
+light   2.67MB r0 A: enabled 2344 | detected 2350 | lag 6 | transfer 1074 gap 200 | proc 1220 | chromeCPU 1.17 | cmds 9 | long 0 | DRY_RUN
+light   2.67MB r0 B: enabled 2326 | detected 2557 | lag 231 | transfer 1055 gap 194 | proc 1223 | chromeCPU 1.19 | cmds 13 | long 0 | DRY_RUN
+light   2.67MB r0 C: enabled 2325 | detected 2339 | lag 14 | transfer 1055 gap 190 | proc 1221 | chromeCPU 1.19 | cmds 9 | long 0 | DRY_RUN
+light   2.67MB r1 A: enabled 2324 | detected 2330 | lag 6 | transfer 1062 gap 198 | proc 1217 | chromeCPU 1.11 | cmds 9 | long 0 | DRY_RUN
+light   2.67MB r1 C: enabled 2309 | detected 2326 | lag 17 | transfer 1049 gap 184 | proc 1216 | chromeCPU 1.12 | cmds 9 | long 0 | DRY_RUN
+light   2.67MB r1 B: enabled 2315 | detected 2560 | lag 245 | transfer 1053 gap 189 | proc 1217 | chromeCPU 1.12 | cmds 13 | long 0 | DRY_RUN
+light   2.67MB r2 C: enabled 2324 | detected 2342 | lag 18 | transfer 1054 gap 192 | proc 1226 | chromeCPU 1.17 | cmds 9 | long 0 | DRY_RUN
+light   2.67MB r2 A: enabled 2330 | detected 2336 | lag 6 | transfer 1056 gap 196 | proc 1227 | chromeCPU 1.12 | cmds 9 | long 0 | DRY_RUN
+light   2.67MB r2 B: enabled 2324 | detected 2558 | lag 234 | transfer 1056 gap 193 | proc 1220 | chromeCPU 1.12 | cmds 13 | long 0 | DRY_RUN
+light   2.67MB r3 C: enabled 2331 | detected 2350 | lag 19 | transfer 1059 gap 194 | proc 1224 | chromeCPU 1.18 | cmds 9 | long 0 | DRY_RUN
+light   2.67MB r3 B: enabled 2327 | detected 2562 | lag 235 | transfer 1061 gap 200 | proc 1216 | chromeCPU 1.15 | cmds 13 | long 0 | DRY_RUN
+light   2.67MB r3 A: enabled 2314 | detected 2320 | lag 6 | transfer 1051 gap 190 | proc 1216 | chromeCPU 1.17 | cmds 9 | long 0 | DRY_RUN
+light   2.67MB r4 B: enabled 2325 | detected 2549 | lag 224 | transfer 1061 gap 197 | proc 1217 | chromeCPU 1.18 | cmds 13 | long 0 | DRY_RUN
+light   2.67MB r4 C: enabled 2324 | detected 2338 | lag 14 | transfer 1060 gap 192 | proc 1218 | chromeCPU 1.09 | cmds 9 | long 0 | DRY_RUN
+light   2.67MB r4 A: enabled 2325 | detected 2329 | lag 4 | transfer 1058 gap 197 | proc 1220 | chromeCPU 1.12 | cmds 9 | long 0 | DRY_RUN
+light   2.67MB r5 B: enabled 2327 | detected 2549 | lag 222 | transfer 1058 gap 198 | proc 1225 | chromeCPU 1.1 | cmds 13 | long 0 | DRY_RUN
+light   2.67MB r5 A: enabled 2340 | detected 2345 | lag 5 | transfer 1071 gap 206 | proc 1223 | chromeCPU 1.07 | cmds 9 | long 0 | DRY_RUN
+light   2.67MB r5 C: enabled 2326 | detected 2343 | lag 17 | transfer 1057 gap 194 | proc 1223 | chromeCPU 1.14 | cmds 9 | long 0 | DRY_RUN
+light   9.11MB r0 A: enabled 4965 | detected 4971 | lag 6 | transfer 3694 gap 749 | proc 1224 | chromeCPU 2.43 | cmds 16 | long 0 | DRY_RUN
+light   9.11MB r0 B: enabled 4965 | detected 5080 | lag 115 | transfer 3696 gap 760 | proc 1224 | chromeCPU 2.4 | cmds 23 | long 0 | DRY_RUN
+light   9.11MB r0 C: enabled 4964 | detected 4980 | lag 16 | transfer 3698 gap 762 | proc 1221 | chromeCPU 2.43 | cmds 16 | long 0 | DRY_RUN
+light   9.11MB r1 A: enabled 4983 | detected 4988 | lag 5 | transfer 3714 gap 773 | proc 1221 | chromeCPU 2.42 | cmds 16 | long 0 | DRY_RUN
+light   9.11MB r1 C: enabled 4966 | detected 4980 | lag 14 | transfer 3698 gap 754 | proc 1224 | chromeCPU 2.43 | cmds 16 | long 0 | DRY_RUN
+light   9.11MB r1 B: enabled 4933 | detected 5084 | lag 151 | transfer 3674 gap 732 | proc 1215 | chromeCPU 2.32 | cmds 23 | long 0 | DRY_RUN
+light   9.11MB r2 C: enabled 4981 | detected 4998 | lag 17 | transfer 3715 gap 775 | proc 1222 | chromeCPU 2.39 | cmds 16 | long 0 | DRY_RUN
+light   9.11MB r2 A: enabled 4980 | detected 4985 | lag 5 | transfer 3718 gap 768 | proc 1218 | chromeCPU 2.64 | cmds 16 | long 0 | DRY_RUN
+light   9.11MB r2 B: enabled 4966 | detected 5087 | lag 121 | transfer 3698 gap 759 | proc 1216 | chromeCPU 2.53 | cmds 23 | long 0 | DRY_RUN
+light   9.11MB r3 C: enabled 4996 | detected 5013 | lag 17 | transfer 3727 gap 788 | proc 1222 | chromeCPU 2.54 | cmds 16 | long 0 | DRY_RUN
+light   9.11MB r3 B: enabled 4980 | detected 5081 | lag 101 | transfer 3710 gap 768 | proc 1217 | chromeCPU 2.5 | cmds 23 | long 0 | DRY_RUN
+light   9.11MB r3 A: enabled 4954 | detected 4959 | lag 5 | transfer 3693 gap 754 | proc 1216 | chromeCPU 2.46 | cmds 16 | long 0 | DRY_RUN
+light   9.11MB r4 B: enabled 4954 | detected 5084 | lag 130 | transfer 3689 gap 748 | proc 1218 | chromeCPU 2.41 | cmds 23 | long 0 | DRY_RUN
+light   9.11MB r4 C: enabled 4966 | detected 4979 | lag 13 | transfer 3697 gap 756 | proc 1220 | chromeCPU 2.4 | cmds 16 | long 0 | DRY_RUN
+light   9.11MB r4 A: enabled 4966 | detected 4974 | lag 8 | transfer 3698 gap 759 | proc 1218 | chromeCPU 2.56 | cmds 16 | long 0 | DRY_RUN
+light   9.11MB r5 B: enabled 4983 | detected 5083 | lag 100 | transfer 3716 gap 765 | proc 1219 | chromeCPU 2.53 | cmds 23 | long 0 | DRY_RUN
+light   9.11MB r5 A: enabled 4965 | detected 4970 | lag 5 | transfer 3700 gap 759 | proc 1220 | chromeCPU 2.43 | cmds 16 | long 0 | DRY_RUN
+light   9.11MB r5 C: enabled 4980 | detected 4993 | lag 13 | transfer 3712 gap 765 | proc 1221 | chromeCPU 2.43 | cmds 16 | long 0 | DRY_RUN
+heavy   2.67MB r0 A: enabled 2479 | detected 2502 | lag 23 | transfer 1109 gap 241 | proc 1319 | chromeCPU 3.32 | cmds 9 | long 0 | DRY_RUN
+heavy   2.67MB r0 B: enabled 2560 | detected 2653 | lag 93 | transfer 1077 gap 212 | proc 1434 | chromeCPU 3.34 | cmds 13 | long 0 | DRY_RUN
+heavy   2.67MB r0 C: enabled 2541 | detected 2571 | lag 30 | transfer 1117 gap 252 | proc 1368 | chromeCPU 3.38 | cmds 9 | long 0 | DRY_RUN
+heavy   2.67MB r1 A: enabled 2545 | detected 2565 | lag 20 | transfer 1120 gap 257 | proc 1374 | chromeCPU 3.49 | cmds 9 | long 0 | DRY_RUN
+heavy   2.67MB r1 C: enabled 2464 | detected 2499 | lag 35 | transfer 1105 gap 240 | proc 1308 | chromeCPU 3.28 | cmds 9 | long 0 | DRY_RUN
+heavy   2.67MB r1 B: enabled 2612 | detected 2666 | lag 54 | transfer 1133 gap 266 | proc 1420 | chromeCPU 3.64 | cmds 13 | long 0 | DRY_RUN
+heavy   2.67MB r2 C: enabled 2618 | detected 2646 | lag 28 | transfer 1134 gap 268 | proc 1417 | chromeCPU 3.53 | cmds 9 | long 0 | DRY_RUN
+heavy   2.67MB r2 A: enabled 2616 | detected 2639 | lag 23 | transfer 1149 gap 287 | proc 1412 | chromeCPU 3.68 | cmds 9 | long 0 | DRY_RUN
+heavy   2.67MB r2 B: enabled 2482 | detected 2593 | lag 111 | transfer 1072 gap 209 | proc 1345 | chromeCPU 3.42 | cmds 13 | long 0 | DRY_RUN
+heavy   2.67MB r3 C: enabled 2619 | detected 2662 | lag 43 | transfer 1136 gap 273 | proc 1421 | chromeCPU 3.53 | cmds 9 | long 0 | DRY_RUN
+heavy   2.67MB r3 B: enabled 2580 | detected 2702 | lag 122 | transfer 1131 gap 260 | proc 1382 | chromeCPU 3.58 | cmds 13 | long 0 | DRY_RUN
+heavy   2.67MB r3 A: enabled 2572 | detected 2591 | lag 19 | transfer 1142 gap 274 | proc 1370 | chromeCPU 3.44 | cmds 9 | long 0 | DRY_RUN
+heavy   2.67MB r4 B: enabled 2466 | detected 2613 | lag 147 | transfer 1084 gap 219 | proc 1305 | chromeCPU 3.25 | cmds 13 | long 0 | DRY_RUN
+heavy   2.67MB r4 C: enabled 2513 | detected 2565 | lag 52 | transfer 1120 gap 258 | proc 1338 | chromeCPU 3.25 | cmds 9 | long 0 | DRY_RUN
+heavy   2.67MB r4 A: enabled 2499 | detected 2520 | lag 21 | transfer 1077 gap 213 | proc 1356 | chromeCPU 3.29 | cmds 9 | long 0 | DRY_RUN
+heavy   2.67MB r5 B: enabled 2631 | detected 2869 | lag 238 | transfer 1164 gap 302 | proc 1423 | chromeCPU 3.61 | cmds 14 | long 0 | DRY_RUN
+heavy   2.67MB r5 A: enabled 2540 | detected 2556 | lag 16 | transfer 1117 gap 253 | proc 1368 | chromeCPU 3.42 | cmds 9 | long 0 | DRY_RUN
+heavy   2.67MB r5 C: enabled 2593 | detected 2630 | lag 37 | transfer 1096 gap 233 | proc 1437 | chromeCPU 3.48 | cmds 9 | long 0 | DRY_RUN
+heavy   9.11MB r0 A: enabled 5296 | detected 5308 | lag 12 | transfer 3822 gap 877 | proc 1419 | chromeCPU 6.98 | cmds 15 | long 0 | DRY_RUN
+heavy   9.11MB r0 B: enabled 5405 | detected 5484 | lag 79 | transfer 3912 gap 971 | proc 1437 | chromeCPU 7.25 | cmds 24 | long 0 | DRY_RUN
+heavy   9.11MB r0 C: enabled 5400 | detected 5435 | lag 35 | transfer 3895 gap 948 | proc 1446 | chromeCPU 7.17 | cmds 16 | long 0 | DRY_RUN
+heavy   9.11MB r1 A: enabled 5389 | detected 5411 | lag 22 | transfer 3943 gap 1002 | proc 1355 | chromeCPU 7.29 | cmds 16 | long 0 | DRY_RUN
+heavy   9.11MB r1 C: enabled 5393 | detected 5423 | lag 30 | transfer 3907 gap 962 | proc 1441 | chromeCPU 7.25 | cmds 15 | long 0 | DRY_RUN
+heavy   9.11MB r1 B: enabled 5188 | detected 5251 | lag 63 | transfer 3818 gap 874 | proc 1307 | chromeCPU 6.87 | cmds 23 | long 0 | DRY_RUN
+heavy   9.11MB r2 C: enabled 5310 | detected 5346 | lag 36 | transfer 3933 gap 984 | proc 1309 | chromeCPU 7.1 | cmds 16 | long 0 | DRY_RUN
+heavy   9.11MB r2 A: enabled 5475 | detected 5497 | lag 22 | transfer 3974 gap 1024 | proc 1429 | chromeCPU 7.59 | cmds 16 | long 0 | DRY_RUN
+heavy   9.11MB r2 B: enabled 5398 | detected 5508 | lag 110 | transfer 3993 gap 1045 | proc 1343 | chromeCPU 7.3 | cmds 24 | long 0 | DRY_RUN
+heavy   9.11MB r3 C: enabled 5361 | detected 5404 | lag 43 | transfer 3966 gap 1013 | proc 1321 | chromeCPU 7.09 | cmds 16 | long 0 | DRY_RUN
+heavy   9.11MB r3 B: enabled 5281 | detected 5497 | lag 216 | transfer 3896 gap 949 | proc 1298 | chromeCPU 7.07 | cmds 24 | long 0 | DRY_RUN
+heavy   9.11MB r3 A: enabled 5418 | detected 5448 | lag 30 | transfer 3923 gap 981 | proc 1422 | chromeCPU 7.3 | cmds 16 | long 0 | DRY_RUN
+heavy   9.11MB r4 B: enabled 5399 | detected 5561 | lag 162 | transfer 3982 gap 1036 | proc 1340 | chromeCPU 7.45 | cmds 24 | long 0 | DRY_RUN
+heavy   9.11MB r4 C: enabled 5416 | detected 5446 | lag 30 | transfer 3971 gap 1026 | proc 1381 | chromeCPU 7.28 | cmds 16 | long 0 | DRY_RUN
+heavy   9.11MB r4 A: enabled 5418 | detected 5442 | lag 24 | transfer 3871 gap 925 | proc 1484 | chromeCPU 7.18 | cmds 16 | long 0 | DRY_RUN
+heavy   9.11MB r5 B: enabled 5379 | detected 5471 | lag 92 | transfer 3958 gap 1003 | proc 1379 | chromeCPU 7.21 | cmds 24 | long 0 | DRY_RUN
+heavy   9.11MB r5 A: enabled 5294 | detected 5316 | lag 22 | transfer 3912 gap 968 | proc 1329 | chromeCPU 7.02 | cmds 15 | long 0 | DRY_RUN
+heavy   9.11MB r5 C: enabled 5353 | detected 5401 | lag 48 | transfer 3867 gap 920 | proc 1411 | chromeCPU 7.19 | cmds 16 | long 0 | DRY_RUN
+cover   2.67MB r0 A: enabled 2389 | detected 2400 | lag 11 | transfer 1090 gap 222 | proc 1251 | chromeCPU 2.15 | cmds 9 | long 0 | DRY_RUN
+cover   2.67MB r0 B: enabled 2402 | detected 2586 | lag 184 | transfer 1083 gap 221 | proc 1269 | chromeCPU 2.41 | cmds 13 | long 0 | DRY_RUN
+cover   2.67MB r0 C: enabled 2358 | detected 2378 | lag 20 | transfer 1072 gap 211 | proc 1238 | chromeCPU 1.98 | cmds 9 | long 0 | DRY_RUN
+cover   2.67MB r1 A: enabled 2369 | detected 2376 | lag 7 | transfer 1073 gap 203 | proc 1248 | chromeCPU 2.09 | cmds 9 | long 0 | DRY_RUN
+cover   2.67MB r1 C: enabled 2332 | detected 2349 | lag 17 | transfer 1059 gap 197 | proc 1225 | chromeCPU 1.85 | cmds 9 | long 0 | DRY_RUN
+cover   2.67MB r1 B: enabled 2331 | detected 2566 | lag 235 | transfer 1065 gap 203 | proc 1218 | chromeCPU 1.94 | cmds 13 | long 0 | DRY_RUN
+cover   2.67MB r2 C: enabled 2350 | detected 2368 | lag 18 | transfer 1066 gap 204 | proc 1235 | chromeCPU 1.97 | cmds 9 | long 0 | DRY_RUN
+cover   2.67MB r2 A: enabled 2347 | detected 2356 | lag 9 | transfer 1066 gap 203 | proc 1233 | chromeCPU 2.07 | cmds 9 | long 0 | DRY_RUN
+cover   2.67MB r2 B: enabled 2366 | detected 2581 | lag 215 | transfer 1072 gap 209 | proc 1246 | chromeCPU 2.2 | cmds 13 | long 0 | DRY_RUN
+cover   2.67MB r3 C: enabled 2358 | detected 2382 | lag 24 | transfer 1076 gap 210 | proc 1236 | chromeCPU 2.07 | cmds 9 | long 0 | DRY_RUN
+cover   2.67MB r3 B: enabled 2348 | detected 2570 | lag 222 | transfer 1065 gap 203 | proc 1236 | chromeCPU 1.79 | cmds 13 | long 0 | DRY_RUN
+cover   2.67MB r3 A: enabled 2341 | detected 2349 | lag 8 | transfer 1068 gap 205 | proc 1225 | chromeCPU 2.01 | cmds 9 | long 0 | DRY_RUN
+cover   2.67MB r4 B: enabled 2331 | detected 2569 | lag 238 | transfer 1058 gap 196 | proc 1221 | chromeCPU 1.88 | cmds 13 | long 0 | DRY_RUN
+cover   2.67MB r4 C: enabled 2338 | detected 2368 | lag 30 | transfer 1058 gap 194 | proc 1235 | chromeCPU 1.99 | cmds 9 | long 0 | DRY_RUN
+cover   2.67MB r4 A: enabled 2366 | detected 2375 | lag 9 | transfer 1055 gap 193 | proc 1255 | chromeCPU 2.01 | cmds 9 | long 0 | DRY_RUN
+cover   2.67MB r5 B: enabled 2330 | detected 2577 | lag 247 | transfer 1056 gap 193 | proc 1223 | chromeCPU 1.96 | cmds 13 | long 0 | DRY_RUN
+cover   2.67MB r5 A: enabled 2363 | detected 2373 | lag 10 | transfer 1074 gap 206 | proc 1240 | chromeCPU 2.14 | cmds 9 | long 0 | DRY_RUN
+cover   2.67MB r5 C: enabled 2338 | detected 2361 | lag 23 | transfer 1052 gap 190 | proc 1238 | chromeCPU 1.87 | cmds 9 | long 0 | DRY_RUN
+cover   9.11MB r0 A: enabled 5014 | detected 5023 | lag 9 | transfer 3724 gap 785 | proc 1242 | chromeCPU 4.41 | cmds 16 | long 0 | DRY_RUN
+cover   9.11MB r0 B: enabled 5024 | detected 5098 | lag 74 | transfer 3747 gap 799 | proc 1230 | chromeCPU 4.06 | cmds 23 | long 0 | DRY_RUN
+cover   9.11MB r0 C: enabled 5016 | detected 5041 | lag 25 | transfer 3719 gap 779 | proc 1250 | chromeCPU 4.3 | cmds 16 | long 0 | DRY_RUN
+cover   9.11MB r1 A: enabled 5023 | detected 5033 | lag 10 | transfer 3747 gap 803 | proc 1231 | chromeCPU 4.23 | cmds 16 | long 0 | DRY_RUN
+cover   9.11MB r1 C: enabled 5036 | detected 5057 | lag 21 | transfer 3760 gap 812 | proc 1224 | chromeCPU 4.64 | cmds 16 | long 0 | DRY_RUN
+cover   9.11MB r1 B: enabled 5023 | detected 5134 | lag 111 | transfer 3731 gap 788 | proc 1240 | chromeCPU 4.54 | cmds 23 | long 0 | DRY_RUN
+cover   9.11MB r2 C: enabled 5020 | detected 5040 | lag 20 | transfer 3718 gap 776 | proc 1251 | chromeCPU 4.27 | cmds 16 | long 0 | DRY_RUN
+cover   9.11MB r2 A: enabled 5023 | detected 5031 | lag 8 | transfer 3739 gap 784 | proc 1233 | chromeCPU 4.63 | cmds 16 | long 0 | DRY_RUN
+cover   9.11MB r2 B: enabled 5116 | detected 5139 | lag 23 | transfer 3823 gap 863 | proc 1241 | chromeCPU 5.24 | cmds 23 | long 0 | DRY_RUN
+cover   9.11MB r3 C: enabled 5024 | detected 5041 | lag 17 | transfer 3730 gap 787 | proc 1250 | chromeCPU 4.31 | cmds 16 | long 0 | DRY_RUN
+cover   9.11MB r3 B: enabled 5116 | detected 5284 | lag 168 | transfer 3835 gap 881 | proc 1234 | chromeCPU 5.02 | cmds 23 | long 0 | DRY_RUN
+cover   9.11MB r3 A: enabled 5035 | detected 5047 | lag 12 | transfer 3745 gap 803 | proc 1231 | chromeCPU 4.18 | cmds 16 | long 0 | DRY_RUN
+cover   9.11MB r4 B: enabled 4990 | detected 5114 | lag 124 | transfer 3723 gap 786 | proc 1221 | chromeCPU 4.08 | cmds 23 | long 0 | DRY_RUN
+cover   9.11MB r4 C: enabled 5018 | detected 5035 | lag 17 | transfer 3738 gap 798 | proc 1224 | chromeCPU 4.03 | cmds 16 | long 0 | DRY_RUN
+cover   9.11MB r4 A: enabled 5004 | detected 5011 | lag 7 | transfer 3726 gap 786 | proc 1225 | chromeCPU 4.2 | cmds 16 | long 0 | DRY_RUN
+cover   9.11MB r5 B: enabled 5023 | detected 5116 | lag 93 | transfer 3718 gap 779 | proc 1253 | chromeCPU 4.33 | cmds 23 | long 0 | DRY_RUN
+cover   9.11MB r5 A: enabled 5059 | detected 5070 | lag 11 | transfer 3757 gap 816 | proc 1254 | chromeCPU 4.42 | cmds 16 | long 0 | DRY_RUN
+cover   9.11MB r5 C: enabled 4999 | detected 5021 | lag 22 | transfer 3709 gap 769 | proc 1242 | chromeCPU 4.23 | cmds 16 | long 0 | DRY_RUN
+{
+ "light|2.67MB|A": {
+  "n": 6,
+  "enabled_ms": 2327.5,
+  "upload_ms": 1106.0,
+  "transfer_ms": 1060.0,
+  "gap_ms": 197.5,
+  "max_gap_ms": 51.0,
+  "processing_ms": 1220.0,
+  "detected_ms": 2333.0,
+  "lag_ms": 6.0,
+  "chrome_cpu_s": 1.1,
+  "chrome_cpu_pct": 48.0,
+  "py_cpu_s": 0.0,
+  "cmds": 9.0,
+  "longtask_ms": 0.0,
+  "cdp_TaskDuration": 360.9,
+  "cdp_ScriptDuration": 47.0,
+  "cdp_LayoutDuration": 77.3,
+  "cdp_RecalcStyleDuration": 44.3,
+  "cdp_LayoutCount": 140.0,
+  "cdp_RecalcStyleCount": 140.0
+ },
+ "light|2.67MB|B": {
+  "n": 6,
+  "enabled_ms": 2325.5,
+  "upload_ms": 1103.5,
+  "transfer_ms": 1057.0,
+  "gap_ms": 195.5,
+  "max_gap_ms": 48.5,
+  "processing_ms": 1218.5,
+  "detected_ms": 2557.5,
+  "lag_ms": 232.5,
+  "chrome_cpu_s": 1.1,
+  "chrome_cpu_pct": 44.3,
+  "py_cpu_s": 0.0,
+  "cmds": 13.0,
+  "longtask_ms": 0.0,
+  "cdp_TaskDuration": 363.3,
+  "cdp_ScriptDuration": 43.6,
+  "cdp_LayoutDuration": 80.9,
+  "cdp_RecalcStyleDuration": 43.8,
+  "cdp_LayoutCount": 140.0,
+  "cdp_RecalcStyleCount": 140.0
+ },
+ "light|2.67MB|C": {
+  "n": 6,
+  "enabled_ms": 2324.5,
+  "upload_ms": 1103.5,
+  "transfer_ms": 1056.0,
+  "gap_ms": 192.0,
+  "max_gap_ms": 47.5,
+  "processing_ms": 1222.0,
+  "detected_ms": 2340.5,
+  "lag_ms": 17.0,
+  "chrome_cpu_s": 1.2,
+  "chrome_cpu_pct": 49.4,
+  "py_cpu_s": 0.0,
+  "cmds": 9.0,
+  "longtask_ms": 0.0,
+  "cdp_TaskDuration": 367.1,
+  "cdp_ScriptDuration": 43.8,
+  "cdp_LayoutDuration": 82.0,
+  "cdp_RecalcStyleDuration": 46.1,
+  "cdp_LayoutCount": 140.0,
+  "cdp_RecalcStyleCount": 140.0
+ },
+ "light|9.11MB|A": {
+  "n": 6,
+  "enabled_ms": 4965.5,
+  "upload_ms": 3746.0,
+  "transfer_ms": 3699.0,
+  "gap_ms": 759.0,
+  "max_gap_ms": 51.0,
+  "processing_ms": 1219.0,
+  "detected_ms": 4972.5,
+  "lag_ms": 5.0,
+  "chrome_cpu_s": 2.4,
+  "chrome_cpu_pct": 49.2,
+  "py_cpu_s": 0.0,
+  "cmds": 16.0,
+  "longtask_ms": 0.0,
+  "cdp_TaskDuration": 787.9,
+  "cdp_ScriptDuration": 106.2,
+  "cdp_LayoutDuration": 177.8,
+  "cdp_RecalcStyleDuration": 101.2,
+  "cdp_LayoutCount": 298.5,
+  "cdp_RecalcStyleCount": 298.5
+ },
+ "light|9.11MB|B": {
+  "n": 6,
+  "enabled_ms": 4965.5,
+  "upload_ms": 3744.5,
+  "transfer_ms": 3697.0,
+  "gap_ms": 759.5,
+  "max_gap_ms": 50.5,
+  "processing_ms": 1217.5,
+  "detected_ms": 5083.5,
+  "lag_ms": 118.0,
+  "chrome_cpu_s": 2.5,
+  "chrome_cpu_pct": 48.3,
+  "py_cpu_s": 0.0,
+  "cmds": 23.0,
+  "longtask_ms": 0.0,
+  "cdp_TaskDuration": 790.3,
+  "cdp_ScriptDuration": 90.4,
+  "cdp_LayoutDuration": 181.5,
+  "cdp_RecalcStyleDuration": 102.0,
+  "cdp_LayoutCount": 298.0,
+  "cdp_RecalcStyleCount": 298.0
+ },
+ "light|9.11MB|C": {
+  "n": 6,
+  "enabled_ms": 4973.0,
+  "upload_ms": 3752.5,
+  "transfer_ms": 3705.0,
+  "gap_ms": 763.5,
+  "max_gap_ms": 51.5,
+  "processing_ms": 1221.5,
+  "detected_ms": 4986.5,
+  "lag_ms": 15.0,
+  "chrome_cpu_s": 2.4,
+  "chrome_cpu_pct": 48.8,
+  "py_cpu_s": 0.0,
+  "cmds": 16.0,
+  "longtask_ms": 0.0,
+  "cdp_TaskDuration": 767.8,
+  "cdp_ScriptDuration": 94.5,
+  "cdp_LayoutDuration": 170.2,
+  "cdp_RecalcStyleDuration": 97.0,
+  "cdp_LayoutCount": 299.0,
+  "cdp_RecalcStyleCount": 299.0
+ },
+ "heavy|2.67MB|A": {
+  "n": 6,
+  "enabled_ms": 2542.5,
+  "upload_ms": 1172.0,
+  "transfer_ms": 1118.5,
+  "gap_ms": 255.0,
+  "max_gap_ms": 65.5,
+  "processing_ms": 1369.0,
+  "detected_ms": 2560.5,
+  "lag_ms": 20.5,
+  "chrome_cpu_s": 3.4,
+  "chrome_cpu_pct": 133.4,
+  "py_cpu_s": 0.0,
+  "cmds": 9.0,
+  "longtask_ms": 0.0,
+  "cdp_TaskDuration": 2395.8,
+  "cdp_ScriptDuration": 413.5,
+  "cdp_LayoutDuration": 846.0,
+  "cdp_RecalcStyleDuration": 469.6,
+  "cdp_LayoutCount": 134.0,
+  "cdp_RecalcStyleCount": 134.0
+ },
+ "heavy|2.67MB|B": {
+  "n": 6,
+  "enabled_ms": 2570.0,
+  "upload_ms": 1176.5,
+  "transfer_ms": 1107.5,
+  "gap_ms": 239.5,
+  "max_gap_ms": 67.0,
+  "processing_ms": 1401.0,
+  "detected_ms": 2659.5,
+  "lag_ms": 116.5,
+  "chrome_cpu_s": 3.5,
+  "chrome_cpu_pct": 129.0,
+  "py_cpu_s": 0.0,
+  "cmds": 13.0,
+  "longtask_ms": 0.0,
+  "cdp_TaskDuration": 2459.3,
+  "cdp_ScriptDuration": 380.1,
+  "cdp_LayoutDuration": 892.3,
+  "cdp_RecalcStyleDuration": 487.3,
+  "cdp_LayoutCount": 131.5,
+  "cdp_RecalcStyleCount": 131.5
+ },
+ "heavy|2.67MB|C": {
+  "n": 6,
+  "enabled_ms": 2567.0,
+  "upload_ms": 1173.5,
+  "transfer_ms": 1118.5,
+  "gap_ms": 255.0,
+  "max_gap_ms": 71.5,
+  "processing_ms": 1392.5,
+  "detected_ms": 2600.5,
+  "lag_ms": 36.0,
+  "chrome_cpu_s": 3.4,
+  "chrome_cpu_pct": 132.0,
+  "py_cpu_s": 0.0,
+  "cmds": 9.0,
+  "longtask_ms": 0.0,
+  "cdp_TaskDuration": 2447.7,
+  "cdp_ScriptDuration": 381.9,
+  "cdp_LayoutDuration": 865.6,
+  "cdp_RecalcStyleDuration": 493.2,
+  "cdp_LayoutCount": 129.5,
+  "cdp_RecalcStyleCount": 129.5
+ },
+ "heavy|9.11MB|A": {
+  "n": 6,
+  "enabled_ms": 5403.5,
+  "upload_ms": 3981.0,
+  "transfer_ms": 3917.5,
+  "gap_ms": 974.5,
+  "max_gap_ms": 80.5,
+  "processing_ms": 1420.5,
+  "detected_ms": 5426.5,
+  "lag_ms": 22.0,
+  "chrome_cpu_s": 7.2,
+  "chrome_cpu_pct": 133.1,
+  "py_cpu_s": 0.0,
+  "cmds": 16.0,
+  "longtask_ms": 0.0,
+  "cdp_TaskDuration": 5104.1,
+  "cdp_ScriptDuration": 854.3,
+  "cdp_LayoutDuration": 1802.2,
+  "cdp_RecalcStyleDuration": 990.3,
+  "cdp_LayoutCount": 270.0,
+  "cdp_RecalcStyleCount": 270.0
+ },
+ "heavy|9.11MB|B": {
+  "n": 6,
+  "enabled_ms": 5388.5,
+  "upload_ms": 3992.0,
+  "transfer_ms": 3935.0,
+  "gap_ms": 987.0,
+  "max_gap_ms": 85.0,
+  "processing_ms": 1341.5,
+  "detected_ms": 5490.5,
+  "lag_ms": 101.0,
+  "chrome_cpu_s": 7.2,
+  "chrome_cpu_pct": 132.1,
+  "py_cpu_s": 0.0,
+  "cmds": 24.0,
+  "longtask_ms": 0.0,
+  "cdp_TaskDuration": 5083.4,
+  "cdp_ScriptDuration": 778.6,
+  "cdp_LayoutDuration": 1840.2,
+  "cdp_RecalcStyleDuration": 1026.7,
+  "cdp_LayoutCount": 274.0,
+  "cdp_RecalcStyleCount": 274.0
+ },
+ "heavy|9.11MB|C": {
+  "n": 6,
+  "enabled_ms": 5377.0,
+  "upload_ms": 3977.5,
+  "transfer_ms": 3920.0,
+  "gap_ms": 973.0,
+  "max_gap_ms": 82.5,
+  "processing_ms": 1396.0,
+  "detected_ms": 5413.5,
+  "lag_ms": 35.5,
+  "chrome_cpu_s": 7.2,
+  "chrome_cpu_pct": 133.1,
+  "py_cpu_s": 0.0,
+  "cmds": 16.0,
+  "longtask_ms": 0.0,
+  "cdp_TaskDuration": 5105.5,
+  "cdp_ScriptDuration": 800.3,
+  "cdp_LayoutDuration": 1831.7,
+  "cdp_RecalcStyleDuration": 1018.1,
+  "cdp_LayoutCount": 273.0,
+  "cdp_RecalcStyleCount": 273.0
+ },
+ "cover|2.67MB|A": {
+  "n": 6,
+  "enabled_ms": 2364.5,
+  "upload_ms": 1118.5,
+  "transfer_ms": 1070.5,
+  "gap_ms": 204.0,
+  "max_gap_ms": 54.5,
+  "processing_ms": 1244.0,
+  "detected_ms": 2374.0,
+  "lag_ms": 9.0,
+  "chrome_cpu_s": 2.1,
+  "chrome_cpu_pct": 88.0,
+  "py_cpu_s": 0.0,
+  "cmds": 9.0,
+  "longtask_ms": 0.0,
+  "cdp_TaskDuration": 1191.2,
+  "cdp_ScriptDuration": 173.2,
+  "cdp_LayoutDuration": 351.9,
+  "cdp_RecalcStyleDuration": 194.3,
+  "cdp_LayoutCount": 141.0,
+  "cdp_RecalcStyleCount": 141.0
+ },
+ "cover|2.67MB|B": {
+  "n": 6,
+  "enabled_ms": 2339.5,
+  "upload_ms": 1112.5,
+  "transfer_ms": 1065.0,
+  "gap_ms": 203.0,
+  "max_gap_ms": 51.0,
+  "processing_ms": 1229.5,
+  "detected_ms": 2573.5,
+  "lag_ms": 228.5,
+  "chrome_cpu_s": 1.9,
+  "chrome_cpu_pct": 75.9,
+  "py_cpu_s": 0.0,
+  "cmds": 13.0,
+  "longtask_ms": 0.0,
+  "cdp_TaskDuration": 1095.7,
+  "cdp_ScriptDuration": 148.6,
+  "cdp_LayoutDuration": 341.1,
+  "cdp_RecalcStyleDuration": 189.5,
+  "cdp_LayoutCount": 140.0,
+  "cdp_RecalcStyleCount": 140.0
+ },
+ "cover|2.67MB|C": {
+  "n": 6,
+  "enabled_ms": 2344.0,
+  "upload_ms": 1111.0,
+  "transfer_ms": 1062.5,
+  "gap_ms": 200.5,
+  "max_gap_ms": 51.0,
+  "processing_ms": 1235.5,
+  "detected_ms": 2368.0,
+  "lag_ms": 21.5,
+  "chrome_cpu_s": 2.0,
+  "chrome_cpu_pct": 83.3,
+  "py_cpu_s": 0.0,
+  "cmds": 9.0,
+  "longtask_ms": 0.0,
+  "cdp_TaskDuration": 1110.4,
+  "cdp_ScriptDuration": 153.0,
+  "cdp_LayoutDuration": 346.1,
+  "cdp_RecalcStyleDuration": 188.2,
+  "cdp_LayoutCount": 140.5,
+  "cdp_RecalcStyleCount": 140.5
+ },
+ "cover|9.11MB|A": {
+  "n": 6,
+  "enabled_ms": 5023.0,
+  "upload_ms": 3791.0,
+  "transfer_ms": 3742.0,
+  "gap_ms": 794.5,
+  "max_gap_ms": 57.5,
+  "processing_ms": 1232.0,
+  "detected_ms": 5032.0,
+  "lag_ms": 9.5,
+  "chrome_cpu_s": 4.3,
+  "chrome_cpu_pct": 85.7,
+  "py_cpu_s": 0.0,
+  "cmds": 16.0,
+  "longtask_ms": 0.0,
+  "cdp_TaskDuration": 2463.8,
+  "cdp_ScriptDuration": 368.1,
+  "cdp_LayoutDuration": 741.0,
+  "cdp_RecalcStyleDuration": 421.4,
+  "cdp_LayoutCount": 301.0,
+  "cdp_RecalcStyleCount": 301.0
+ },
+ "cover|9.11MB|B": {
+  "n": 6,
+  "enabled_ms": 5023.5,
+  "upload_ms": 3788.5,
+  "transfer_ms": 3739.0,
+  "gap_ms": 793.5,
+  "max_gap_ms": 63.0,
+  "processing_ms": 1237.0,
+  "detected_ms": 5125.0,
+  "lag_ms": 102.0,
+  "chrome_cpu_s": 4.4,
+  "chrome_cpu_pct": 86.6,
+  "py_cpu_s": 0.0,
+  "cmds": 23.0,
+  "longtask_ms": 0.0,
+  "cdp_TaskDuration": 2540.8,
+  "cdp_ScriptDuration": 349.4,
+  "cdp_LayoutDuration": 791.6,
+  "cdp_RecalcStyleDuration": 427.4,
+  "cdp_LayoutCount": 299.5,
+  "cdp_RecalcStyleCount": 299.5
+ },
+ "cover|9.11MB|C": {
+  "n": 6,
+  "enabled_ms": 5019.0,
+  "upload_ms": 3771.0,
+  "transfer_ms": 3724.5,
+  "gap_ms": 783.0,
+  "max_gap_ms": 56.0,
+  "processing_ms": 1246.0,
+  "detected_ms": 5040.5,
+  "lag_ms": 20.5,
+  "chrome_cpu_s": 4.3,
+  "chrome_cpu_pct": 85.0,
+  "py_cpu_s": 0.0,
+  "cmds": 16.0,
+  "longtask_ms": 0.0,
+  "cdp_TaskDuration": 2425.8,
+  "cdp_ScriptDuration": 330.6,
+  "cdp_LayoutDuration": 754.0,
+  "cdp_RecalcStyleDuration": 412.9,
+  "cdp_LayoutCount": 300.5,
+  "cdp_RecalcStyleCount": 300.5
+ }
+}
+CONFIRM CHECK (không dry-run, trang giả): {'A': {'status': 'CONFIRMED', 'evidence': 'URL → http://127.0.0.1:39871/tiktokstudio/content', 'clicked': True}, 'B': {'status': 'CONFIRMED', 'evidence': 'URL → http://127.0.0.1:39871/tiktokstudio/content', 'clicked': True}, 'C': {'status': 'CONFIRMED', 'evidence': 'URL → http://127.0.0.1:39871/tiktokstudio/content', 'clicked': True}}

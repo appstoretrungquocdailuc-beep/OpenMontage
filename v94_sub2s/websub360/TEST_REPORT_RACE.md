@@ -1,7 +1,7 @@
 # TEST REPORT — WS360 RACE MODE (WebSub + YouTube Data API) + tên file theo tiêu đề
 
 Ngày: 2026-11-12 | Bộ test: `tests/test_ws360.py` + `tests/test_integration_tam.py` + `tests/test_race_api.py`
-Kết quả: **109/109 PASS** (chạy 2 lần liên tiếp).
+Kết quả: **117/117 PASS** (gồm 8 test trình duyệt thật của `tests/test_watch_modes_lab.py`).
 
 > Mọi số liệu trong test là **GIẢ LẬP** (máy chủ Data API giả, hub WebSub giả, máy chủ video giả). Chúng chứng minh
 > logic đúng (chống trùng, quota, thử lại, tên file), **không** chứng minh nguồn nào nhanh hơn ngoài đời.
@@ -29,9 +29,9 @@ Gọi `activities.list` thật tới `www.googleapis.com` bằng 1 key giả, đ
 | Giờ vàng: vào khung là quét nhanh ngay | PASS | `test_hot_window_starts_fast_polling_immediately_even_after_long_cold_interval`, `test_hot_window_parsing_and_overlap` |
 | SELFTEST/DIAG không tiêu quota API | PASS | `test_selftest_style_start_never_spends_api_quota` |
 | Không in key ra log; key không nằm trong URL | PASS | `test_api_only_…`, `test_quota_hard_cap_…`, `test_parse_keys_projects_and_never_prints_key` |
-| Tên file `<tiêu đề>_<VIDEO_ID>.mp4`, lọc ký tự cấm Windows, giới hạn độ dài | PASS | `test_safe_title_and_path_budget` (đúng ví dụ `母が決めた…_TI8R0XUakKw.mp4`) |
+| Tên file = tiêu đề GỐC `<tiêu đề>.mp4` (chỉ đổi ký tự Windows không cho lưu) | PASS | `test_original_title_kept_only_windows_impossible_chars_changed` (`母が決めた…超えたんだが….mp4`) |
 | Title từ WebSub/API, không gọi API thêm; thiếu title → title resolver (miễn phí) | PASS | `test_resolver_title_used_only_when_detection_had_none`, `test_parallel_race_…` (tên theo nguồn thắng) |
-| Chống trùng tên (kể cả khác hoa/thường) | PASS | `test_same_title_ids_differing_only_by_case_get_unique_names` |
+| Chống trùng tên (2 video cùng tiêu đề, file lạ có sẵn không bị dùng lại/ghi đè) | PASS | `test_same_title_two_videos_and_foreign_file_on_disk_get_unique_names` |
 | Dọn file tạm không xoá nhầm tiêu đề có chữ ".Part" | PASS | `test_restart_cleanup_keeps_titles_with_part_and_removes_only_temp_files` |
 | Uploader nhận ĐÚNG đường dẫn file cuối đã xác minh | PASS | `test_title_named_file_reaches_uploader_exactly_and_attach_is_logged`, `test_websub_to_download_to_tiktok_end_to_end` |
 | Log API_DETECTED / WEBSUB_DETECTED / WINNER / DETECTION_TO_DOWNLOAD_DONE / DOWNLOAD_DONE_TO_TIKTOK_ATTACH / API_QUOTA_USED | PASS | kiểm trong các test trên |

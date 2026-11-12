@@ -48,19 +48,24 @@ QUOTA VÀ NHỊP QUÉT (tự động, không bao giờ vượt quota)
   max_age_minutes) thì tải.
 - Âm báo: điền "alert_wav": "C:\\duong\\dan\\bao.wav" trong config.json (để trống = tắt).
 
-TÊN FILE MỚI
-------------
-  <tiêu đề công khai>_<VIDEO_ID>.mp4      ví dụ: 母が決めたある特殊ルールのせいで小5で100kgを超えたんだが…_TI8R0XUakKw.mp4
-- Tiêu đề lấy từ WebSub hoặc API (nguồn thắng). Không có tiêu đề → lấy tiêu đề do bước lấy link tải trả về (không tốn
-  thêm request). Vẫn không có → <VIDEO_ID>_360p.mp4 như cũ.
-- Ký tự Windows cấm  < > : " / \ | ? *  được đổi thành bản full-width trông giống hệt (：？／…), để tiêu đề giữ nguyên nghĩa.
-- Bỏ ký tự ẩn/điều khiển và emoji 4 byte (ChromeDriver không gõ được đường dẫn có emoji → TikTok không gắn được file).
-- Tiêu đề tối đa 100 ký tự ("filename_title_max"); toàn bộ đường dẫn ≤ 240 ký tự ("filename_max_path").
-- Hai video khác nhau ra cùng tên → thêm " (2)". Tên đã chọn được lưu trong SQLite, khởi động lại vẫn giữ.
-- Video ID luôn ở cuối tên = định danh nội bộ. File tạm vẫn là .<VIDEO_ID>.part.mp4; uploader TikTok nhận đúng
-  đường dẫn file cuối sau khi ffprobe xác minh.
-- Muốn tên kiểu cũ: "filename_mode": "ID_360P".
-- Lưu ý: TikTok thường lấy tên file làm chú thích nháp — vì vậy tên file giờ là tiêu đề.
+TÊN FILE = TIÊU ĐỀ GỐC CỦA VIDEO
+--------------------------------
+  <tiêu đề gốc>.mp4      ví dụ: 母が決めたある特殊ルールのせいで小5で100kgを超えたんだが….mp4
+- Giữ NGUYÊN tiêu đề: không thêm Video ID, không bỏ emoji, không đổi khoảng trắng.
+- Chỉ đổi đúng những thứ Windows KHÔNG cho phép lưu (không đổi thì không tạo được file):
+    9 ký tự  < > : " / \ | ? *   → bản full-width trông gần như y hệt  ＜ ＞ ： ＂ ／ ＼ ｜ ？ ＊
+    xuống dòng / tab trong tiêu đề → 1 khoảng trắng
+    dấu chấm / khoảng trắng ở CUỐI tiêu đề → bỏ (Windows tự xoá chúng)
+    tiêu đề đúng bằng CON, NUL, COM1… → thêm "_"
+    chỉ cắt bớt khi đường dẫn vượt giới hạn của Windows (~240 ký tự)
+  Việc này mất vài micro-giây, không ảnh hưởng tốc độ.
+- 2 video khác nhau cùng tiêu đề trong cùng thư mục kênh → video sau là "<tiêu đề> (2).mp4" (không ghi đè).
+  File lạ đã có sẵn cùng tên → tool KHÔNG dùng lại, KHÔNG ghi đè, đặt tên (2).
+- Tiêu đề lấy từ WebSub hoặc API (nguồn thắng); không có → tiêu đề do bước lấy link tải trả về (không tốn request);
+  vẫn không có → <VIDEO_ID>_360p.mp4.
+- Video ID vẫn là định danh nội bộ: SQLite lưu ID ↔ đường dẫn file, uploader TikTok nhận đúng file đã xác minh.
+- File tạm vẫn là .<VIDEO_ID>.part.mp4 (không bao giờ trùng tên tiêu đề, không bao giờ được đem đăng).
+- Muốn kiểu khác trong config.json: "filename_mode": "TITLE_ID" (tiêu đề_ID) hoặc "ID_360P" (kiểu cũ).
 
 LOG MỚI
 -------

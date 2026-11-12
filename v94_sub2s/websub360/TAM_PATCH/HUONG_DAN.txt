@@ -1,0 +1,18 @@
+TAM v5.1.0 — thêm 2 cách theo dõi nút Post nhẹ hơn + công cụ đo A/B/C trên TikTok thật
+====================================================================================
+Mặc định KHÔNG đổi: vẫn là A (event) như v5.0.0. Đăng / bảo vệ lúc nhấn / POST_CONFIRMED / nhật ký chống trùng giữ nguyên.
+
+CÀI
+1. Bản cũ đã được lưu: WS360\backup\tam_INSTANT_POST_5.0.0_goc.py
+2. Chép tam_INSTANT_POST.py (thư mục này) đè lên file TAM của bạn (thư mục có Genlogin.py + chromedriver.exe).
+   GENLOGIN_API_TOKEN trong file mới giống file bạn gửi (để trống). Nếu bạn từng điền token vào file cũ thì điền lại.
+3. Chép BENCH_WATCH_TIKTOK.bat vào CÙNG thư mục đó.
+
+ĐO A/B/C TRÊN TIKTOK THẬT (không đăng gì)
+- Tắt WS360/TAM đang mở profile thử, mở Genlogin, nhấp đúp BENCH_WATCH_TIKTOK.bat, nhập Profile ID + kéo thả 1 video, 6 vòng.
+- Mỗi lượt: nạp trang Upload sạch → gắn file → chờ nút Post sáng → DỪNG, KHÔNG BẤM POST.
+- Gửi lại file tam_bench_watch_<ngày giờ>.json.
+
+ĐỔI CHẾ ĐỘ (chỉ khi số đo trên TikTok thật cho thấy C/B nhanh hơn A)
+- WS360 tích hợp: config.json → "tam_wait_mode": "lite"  (C)   hoặc "sparse" (B);  "" = mặc định A.
+- TAM chạy riêng: đặt biến môi trường TAM_WAIT_MODE=lite trước khi chạy.

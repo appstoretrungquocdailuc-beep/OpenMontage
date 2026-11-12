@@ -60,7 +60,7 @@
   "api_quota_log_sec": 300,
   "api_url": "",
   "alert_wav": "",
-  "filename_mode": "TITLE_ID",
-  "filename_title_max": 100,
+  "filename_mode": "TITLE",
+  "filename_title_max": 0,
   "filename_max_path": 240
 }

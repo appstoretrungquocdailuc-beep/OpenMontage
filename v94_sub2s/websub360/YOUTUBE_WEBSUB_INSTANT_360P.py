@@ -115,6 +115,7 @@ DEFAULT_CONFIG = {
     "max_parallel_uploads": 4,         # số phiên upload TikTok đồng thời tối đa (backpressure)
     "upload_retry_failed_safe": 1,     # lỗi TRƯỚC khi bấm Post (an toàn) → thử lại tối đa N lần
     "tiktok_dry_run": False,           # True: chạy hết tới khi nút Post sáng rồi DỪNG, KHÔNG bấm Post
+    "tam_wait_mode": "",               # cách TAM theo dõi nút Post: "" = mặc định của TAM (event/A) | "lite" (C) | "sparse" (B)
     # ---- NGUỒN PHÁT HIỆN (RACE MODE) ----
     "detection_mode": "PARALLEL",      # WEBSUB_ONLY | API_ONLY | PARALLEL (WebSub + API chạy đồng thời, nguồn nào tới trước thắng)
     "api_keys_file": "api_keys.txt",   # mỗi dòng: TEN_PROJECT|KEY  (hoặc chỉ KEY = 1 project riêng)
@@ -129,8 +130,8 @@ DEFAULT_CONFIG = {
     "api_url": "",                     # trống = https://www.googleapis.com/youtube/v3/activities
     "alert_wav": "",                   # file .wav phát khi có video mới (Windows); trống = tắt
     # ---- TÊN FILE ----
-    "filename_mode": "TITLE_ID",       # TITLE_ID: '<tiêu đề>_<VIDEO_ID>.mp4' | ID_360P: '<VIDEO_ID>_360p.mp4' (kiểu cũ)
-    "filename_title_max": 100,         # số ký tự tối đa của phần tiêu đề
+    "filename_mode": "TITLE",          # TITLE: '<tiêu đề gốc>.mp4' | TITLE_ID: '<tiêu đề>_<ID>.mp4' | ID_360P: '<ID>_360p.mp4'
+    "filename_title_max": 0,           # 0 = không tự cắt (chỉ cắt khi vượt giới hạn đường dẫn Windows)
     "filename_max_path": 240,          # tổng độ dài đường dẫn tối đa (Windows giới hạn 260)
 }
 MODES = ("WEBSUB_ONLY", "API_ONLY", "PARALLEL")
@@ -186,41 +187,63 @@ def extract_vid(v) -> str | None:
 _WIN_FORBIDDEN = {'<': '＜', '>': '＞', ':': '：', '"': '＂', '/': '／', '\\': '＼', '|': '｜', '?': '？', '*': '＊'}
 
 
-def safe_title(title, max_len=100) -> str:
-    """Tiêu đề công khai → phần tên file an toàn trên Windows.
-    • 9 ký tự cấm < > : " / \\ | ? * → bản full-width trông giống hệt (giữ nguyên nghĩa tiêu đề);
-    • bỏ ký tự điều khiển, ký tự định dạng ẩn (zero-width, đảo chiều chữ RLO…) và ký tự ngoài BMP (emoji 4 byte:
-      ChromeDriver không gõ được → TikTok không gắn được file);
-    • gộp khoảng trắng/xuống dòng; bỏ dấu chấm/khoảng trắng ở đầu & cuối (đầu '.' = file ẩn/tạm);
-    • cắt theo max_len ký tự."""
+# file tạm của tool: .<ID>.part.mp4 | .<ID>.aN.part.v/.a | (bản cũ) .<ID>_360p.part.mp4 — KHÔNG BAO GIỜ trùng tên tiêu đề
+TEMP_RE = re.compile(r"^\.[0-9A-Za-z_-]{11}(?:_360p)?(?:\.a\d+)?\.part(?:\.mp4|\.v|\.a)?$")
+_WIN_RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+
+
+def safe_title(title, max_len=0) -> str:
+    """GIỮ NGUYÊN tiêu đề gốc. Chỉ sửa đúng những gì Windows KHÔNG cho phép lưu (không sửa thì không tạo được file):
+    • 9 ký tự cấm < > : " / \\ | ? * → bản full-width trông gần như giống hệt;
+    • ký tự điều khiển (mã 0–31: xuống dòng, tab…) → khoảng trắng;
+    • dấu chấm / khoảng trắng ở CUỐI (Windows tự xoá → tên file sẽ lệch với đường dẫn tool giữ);
+    • tên thiết bị dành riêng (CON, NUL, COM1…) → thêm '_';
+    • chỉ cắt bớt khi vượt giới hạn đường dẫn của Windows (max_len > 0).
+    Emoji, chữ Nhật/Việt, nhiều khoảng trắng, dấu chấm đầu… giữ nguyên."""
     out = []
-    for c in unicodedata.normalize("NFC", str(title or "")):
+    for c in str(title or ""):
         if c in _WIN_FORBIDDEN:
             out.append(_WIN_FORBIDDEN[c])
-            continue
-        cat = unicodedata.category(c)
-        if c in "\t\r\n" or cat == "Zs" or cat in ("Zl", "Zp"):
+        elif ord(c) < 32:
             out.append(" ")
-        elif cat in ("Cc", "Cf", "Cs", "Co", "Cn") or ord(c) > 0xFFFF:
-            continue
         else:
             out.append(c)
-    t = re.sub(r" {2,}", " ", "".join(out)).strip(" .")
+    t = "".join(out)
     if max_len > 0 and len(t) > max_len:
-        t = t[:max_len].rstrip(" .")
+        t = t[:max_len]
+        if 0xD800 <= ord(t[-1]) <= 0xDBFF:            # không cắt đôi cặp surrogate
+            t = t[:-1]
+    t = t.rstrip(" .")
+    if t.split(".")[0].strip().upper() in _WIN_RESERVED:
+        t += "_"
     return t
 
 
-def build_filename(title, vid, folder: Path, mode="TITLE_ID", title_max=100, max_path=240, n=1) -> str:
-    """'<tiêu đề>_<VIDEO_ID>.mp4' (Video ID luôn ở cuối = định danh nội bộ). Không có tiêu đề hợp lệ → '<VIDEO_ID>_360p.mp4'."""
+def _units(s: str) -> int:
+    """Độ dài theo đơn vị UTF-16 (cách Windows đếm giới hạn đường dẫn: emoji = 2)."""
+    return len(s.encode("utf-16-le")) // 2
+
+
+def build_filename(title, vid, folder: Path, mode="TITLE", title_max=0, max_path=240, n=1) -> str:
+    """TITLE (mặc định): '<tiêu đề gốc>.mp4' | TITLE_ID: '<tiêu đề>_<ID>.mp4' | ID_360P: '<ID>_360p.mp4'.
+    Không có tiêu đề → '<ID>_360p.mp4'. Video ID luôn là định danh nội bộ (SQLite giữ ID ↔ đường dẫn file)."""
+    mode = str(mode or "TITLE").upper()
     suffix = f" ({n})" if n > 1 else ""
-    if str(mode).upper() != "TITLE_ID":
+    if mode not in ("TITLE", "TITLE_ID"):
         return f"{vid}_360p{suffix.replace(' ', '')}.mp4"
-    budget = int(max_path) - len(str(folder)) - 1 - len(f"_{vid}.mp4") - len(suffix)
-    t = safe_title(title, max(0, min(int(title_max), budget)))
+    tail = f"{suffix}_{vid}.mp4" if mode == "TITLE_ID" else f"{suffix}.mp4"
+    budget = int(max_path) - _units(str(folder)) - 1 - len(tail)
+    budget = min(budget, 250 - len(tail))                  # 1 tên file trên NTFS tối đa 255 đơn vị
+    if title_max and int(title_max) > 0:
+        budget = min(budget, int(title_max))
+    t = safe_title(title, 0)
+    if _units(t) > budget:                                 # chỉ cắt khi Windows bắt buộc
+        while t and _units(t) > budget:
+            t = t[:-1]
+        t = safe_title(t, 0)
     if not t:
         return f"{vid}_360p{suffix.replace(' ', '')}.mp4"
-    return f"{t}{suffix}_{vid}.mp4"
+    return f"{t}{tail}"
 
 
 def port_free(host, port) -> bool:
@@ -1563,8 +1586,8 @@ class Engine:
             self.xlq.put({"vid": r["video_id"], "ch": r["channel_id"], "url": r["url"], "t_enq_ns": time.perf_counter_ns(),
                           "okey": r["order_key"] or r["created_at"] or ""})
             m += 1
-        for p in self.dl_dir.rglob(".*"):              # CHỈ file tạm của tool (luôn bắt đầu bằng '.'): tiêu đề có
-            if not p.is_file() or ".part" not in p.name.lower():   # chữ '.Part' KHÔNG bao giờ bị xoá nhầm
+        for p in self.dl_dir.rglob(".*"):              # CHỈ file tạm đúng mẫu của tool: tiêu đề gốc (kể cả bắt đầu
+            if not p.is_file() or not TEMP_RE.match(p.name):    # bằng '.' hay có chữ '.part') KHÔNG bao giờ bị xoá nhầm
                 continue
             try:
                 p.unlink()
@@ -1621,10 +1644,10 @@ class Engine:
             if row and row["state"] in ("DONE", "FAILED", "SKIPPED"):
                 return row["state"]
             attempts = int(row["attempts"] if row else 0)
-            title = ((row["title"] if row else "") or job.get("title") or "").strip()
+            title = (row["title"] if row else "") or job.get("title") or ""
             legacy = self.dl_dir / ch / f"{vid}_360p.mp4"
             final = Path(row["target_file"]) if row is not None and row["target_file"] else \
-                (self._choose_target(vid, ch, title) if title else None)       # tiêu đề từ WebSub/API: KHÔNG gọi API thêm
+                (self._choose_target(vid, ch, title) if title.strip() else None)       # tiêu đề từ WebSub/API: KHÔNG gọi API thêm
             for cand in dict.fromkeys(c for c in (final, legacy) if c is not None):
                 if not cand.exists():
                     continue
@@ -1647,7 +1670,7 @@ class Engine:
             plan = self.resolver.resolve(vid)
             t_res = time.perf_counter_ns()
             if final is None:                             # WebSub/API không có tiêu đề → dùng tiêu đề resolver vừa trả (miễn phí)
-                if plan.get("title") and not title:
+                if plan.get("title") and not title.strip():
                     self.db.x("UPDATE videos SET title=? WHERE video_id=? AND (title IS NULL OR title='')", (plan["title"], vid))
                 final = self._choose_target(vid, ch, plan.get("title") or "")
             tmpdir = final.parent
@@ -1807,12 +1830,13 @@ class Engine:
                 return Path(r["target_file"])
             p = None
             for n in range(1, 100):
-                name = build_filename(title, vid, folder, self.cfg.get("filename_mode", "TITLE_ID"),
-                                      int(self.cfg.get("filename_title_max", 100)), int(self.cfg.get("filename_max_path", 240)), n)
+                name = build_filename(title, vid, folder, self.cfg.get("filename_mode", "TITLE"),
+                                      int(self.cfg.get("filename_title_max", 0) or 0), int(self.cfg.get("filename_max_path", 240)), n)
                 p = folder / name
                 clash = self.db.one("SELECT video_id FROM videos WHERE video_id<>? AND (lower(target_file)=lower(?) "
                                     "OR lower(file)=lower(?))", (vid, str(p), str(p)))
-                if clash is None:
+                # file đã có trên đĩa mà KHÔNG phải của video này (tên không chứa ID) → KHÔNG BAO GIỜ dùng lại / ghi đè
+                if clash is None and not p.exists() and not TEMP_RE.match(name):
                     break
             self.db.upd(vid, target_file=str(p))
             return p

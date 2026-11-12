@@ -309,7 +309,7 @@ def test_websub_subscribe_verify_push_download_and_excel_parallel(tmp_path, gvs,
         x = e.db.one("SELECT * FROM excel_jobs WHERE video_id=?", (vid,))
         assert x["state"] != "DONE"                           # Excel vẫn đang chờ — download KHÔNG chờ Excel
         f = Path(r["file"])
-        assert f.name == f"video mới_{vid}.mp4" and f.parent.name == CH[0] and ws.ffprobe_info(f)["audio"]
+        assert f.name == "video mới.mp4" and f.parent.name == CH[0] and ws.ffprobe_info(f)["audio"]
         assert r["engine"] == "WEBSUB" and r["enqueue_ms"] < 100 and r["resolver_start_ms"] < 100
         lock.unlink()
         x = wait_excel(e, vid)

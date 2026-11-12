@@ -188,7 +188,7 @@ def test_api_only_detects_every_video_and_keeps_scanning(tmp_path, api, gvs, med
     api.upload(CH[1], "APIVIDEO003", title="Video 3")
     r2, r3 = T.wait_state(e, "APIVIDEO002"), T.wait_state(e, "APIVIDEO003")
     assert r1["state"] == r2["state"] == r3["state"] == "DONE"
-    assert Path(r1["file"]).name == "Video 1： thử？_APIVIDEO001.mp4" and r1["engine"] == "API"
+    assert Path(r1["file"]).name == "Video 1： thử？.mp4" and r1["engine"] == "API"
     assert {r["video_id"] for r in e.db.all("SELECT video_id FROM videos")} == {"APIVIDEO001", "APIVIDEO002", "APIVIDEO003"}
     assert T.wait_excel(e, "APIVIDEO003")["state"] == "DONE"
     w = load_workbook(tmp_path / "check.xlsx").active
@@ -247,7 +247,7 @@ def test_parallel_race_one_download_one_excel_one_winner(tmp_path, api, gvs, med
     assert e.db.one("SELECT COUNT(*) c FROM excel_jobs WHERE video_id=?", (vid,))["c"] == 1
     assert T.wait_excel(e, vid)["state"] == "DONE"
     want_title = "tiêu đề WebSub" if first == "WEBSUB" else "tiêu đề API"   # tên file theo nguồn THẮNG (không gọi thêm)
-    assert Path(r["file"]).name == f"{want_title}_{vid}.mp4"
+    assert Path(r["file"]).name == f"{want_title}.mp4"
     L = logs(e)
     assert f"{first}_DETECTED {vid} | WINNER={first}" in L and f"{loser}_DETECTED {vid} | WINNER={first}" in L
     rep = ws.race_report(e.db, tmp_path)
@@ -365,32 +365,40 @@ def test_selftest_style_start_never_spends_api_quota(tmp_path, api):
 
 
 # ------------------------------------------------------------------ tên file
-def test_safe_title_and_path_budget():
-    assert ws.safe_title('a<b>c:d"e/f\\g|h?i*j') == "a＜b＞c：d＂e／f＼g｜h？i＊j"
-    assert ws.safe_title("  ..ẩn\u200b\u202e đi😀\n\tok..  ") == "ẩn đi ok"
-    long = "母" * 300
+def test_original_title_kept_only_windows_impossible_chars_changed():
+    d = Path("C:/d")
+    ex = "母が決めたある特殊ルールのせいで小5で100kgを超えたんだが…"
+    assert ws.build_filename(ex, "TI8R0XUakKw", d) == ex + ".mp4"                  # giữ NGUYÊN, không thêm ID
+    assert ws.build_filename("Hôm nay  😀 vui  .NET", "TI8R0XUakKw", d) == "Hôm nay  😀 vui  .NET.mp4"   # emoji, 2 dấu cách: giữ
+    assert ws.build_filename(".Part 2", "TI8R0XUakKw", d) == ".Part 2.mp4"        # chấm đầu: giữ (Windows cho phép)
+    assert ws.build_filename('a<b>c:d"e/f\\g|h?i*j', "X" * 11, d) == "a＜b＞c：d＂e／f＼g｜h？i＊j.mp4"   # 9 ký tự Windows cấm
+    assert ws.build_filename("dòng 1\ndòng 2", "X" * 11, d) == "dòng 1 dòng 2.mp4"   # ký tự điều khiển
+    assert ws.build_filename("Kết thúc...", "X" * 11, d) == "Kết thúc.mp4"         # Windows tự xoá dấu chấm cuối
+    assert ws.build_filename("NUL", "X" * 11, d) == "NUL_.mp4"
+    assert ws.build_filename("", "TI8R0XUakKw", d) == "TI8R0XUakKw_360p.mp4"
+    assert ws.build_filename("x", "TI8R0XUakKw", d, mode="TITLE_ID") == "x_TI8R0XUakKw.mp4"
+    assert ws.build_filename("x", "TI8R0XUakKw", d, mode="ID_360P") == "TI8R0XUakKw_360p.mp4"
     deep = Path("C:/" + "x" * 150)
-    n = ws.build_filename(long, "TI8R0XUakKw", deep)
-    assert n.endswith("_TI8R0XUakKw.mp4") and len(str(deep / n)) <= 240
-    assert ws.build_filename("母" * 300, "TI8R0XUakKw", Path("C:/d")).count("母") == 100
-    assert ws.build_filename("???", "TI8R0XUakKw", Path("d")) == "？？？_TI8R0XUakKw.mp4"
-    assert ws.build_filename("\u200b", "TI8R0XUakKw", Path("d")) == "TI8R0XUakKw_360p.mp4"
-    assert ws.build_filename("x", "TI8R0XUakKw", Path("d"), mode="ID_360P") == "TI8R0XUakKw_360p.mp4"
-    assert ws.build_filename("母が決めたある特殊ルールのせいで小5で100kgを超えたんだが…", "TI8R0XUakKw", Path("d")) == \
-        "母が決めたある特殊ルールのせいで小5で100kgを超えたんだが…_TI8R0XUakKw.mp4"
+    n = ws.build_filename("母" * 300, "TI8R0XUakKw", deep)                          # chỉ cắt khi vượt giới hạn Windows
+    assert n.endswith(".mp4") and ws._units(str(deep / n)) <= 240
+    n2 = ws.build_filename("😀" * 200, "TI8R0XUakKw", Path("C:/d"))
+    assert ws._units(n2) <= 255 and "\ud83d" not in n2.encode("utf-16", "surrogatepass").decode("utf-16")
+    assert ws.TEMP_RE.match(".TI8R0XUakKw.part.mp4") and not ws.TEMP_RE.match(".Part 2.mp4")
 
 
-def test_same_title_ids_differing_only_by_case_get_unique_names(tmp_path):
-    e = T.make_engine(tmp_path, CH[:1], download_enabled=False, filename_mode="TITLE_ID")
+def test_same_title_two_videos_and_foreign_file_on_disk_get_unique_names(tmp_path):
+    e = T.make_engine(tmp_path, CH[:1], download_enabled=False)
     e.reload_channels(initial=True)
-    for v in ("abcDEF12345", "ABCdef12345"):
+    for v in ("SAMETITLE01", "SAMETITLE02", "SAMETITLE03"):
         assert e.on_event(CH[0], v, "WEBSUB", now(), "Cùng tiêu đề") == "queued"
-    p1 = e._choose_target("abcDEF12345", CH[0], "Cùng tiêu đề")
-    assert p1.name == "Cùng tiêu đề_abcDEF12345.mp4"
-    # Windows không phân biệt hoa/thường: 'Cùng tiêu đề_ABCdef12345.mp4' ≡ tên của video khác → (2)
-    p2 = e._choose_target("ABCdef12345", CH[0], "Cùng tiêu đề")
-    assert p2.name == "Cùng tiêu đề (2)_ABCdef12345.mp4"
-    assert e._choose_target("ABCdef12345", CH[0], "tiêu đề khác") == p2          # đã chọn → giữ nguyên qua khởi động lại
+    d = tmp_path / "DOWNLOADS" / CH[0]
+    p1 = e._choose_target("SAMETITLE01", CH[0], "Cùng tiêu đề")
+    assert p1 == d / "Cùng tiêu đề.mp4"
+    assert e._choose_target("SAMETITLE02", CH[0], "Cùng tiêu đề").name == "Cùng tiêu đề (2).mp4"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "Cùng tiêu đề (3).mp4").write_bytes(b"file cua nguoi dung")       # file lạ có sẵn → KHÔNG dùng lại, không ghi đè
+    assert e._choose_target("SAMETITLE03", CH[0], "Cùng tiêu đề").name == "Cùng tiêu đề (4).mp4"
+    assert e._choose_target("SAMETITLE02", CH[0], "khác") .name == "Cùng tiêu đề (2).mp4"   # đã chọn → giữ qua khởi động lại
 
 
 @need_ff
@@ -401,16 +409,16 @@ def test_resolver_title_used_only_when_detection_had_none(tmp_path, gvs, media, 
     e.on_event(CH[0], "NOTITLE0001", "WEBSUB", now(), "")
     e.on_event(CH[0], "HASTITLE001", "WEBSUB", now(), "Từ WebSub")
     a, b = T.wait_state(e, "NOTITLE0001"), T.wait_state(e, "HASTITLE001")
-    assert Path(a["file"]).name == "Từ resolver_NOTITLE0001.mp4" and a["title"] == "Từ resolver"
-    assert Path(b["file"]).name == "Từ WebSub_HASTITLE001.mp4"
+    assert Path(a["file"]).name == "Từ resolver.mp4" and a["title"] == "Từ resolver"
+    assert Path(b["file"]).name == "Từ WebSub.mp4"
     e.stop()
 
 
 def test_restart_cleanup_keeps_titles_with_part_and_removes_only_temp_files(tmp_path):
     d = tmp_path / "DOWNLOADS" / CH[0]
     d.mkdir(parents=True)
-    keep = d / "Spider.Part 2_PARTTITLE1.mp4"
-    tmp1, tmp2 = d / ".PARTTITLE2.part.mp4", d / ".PARTTITLE3.a1.part.v"
+    keep = d / ".Part 2.mp4"
+    tmp1, tmp2 = d / ".PARTTITLE02.part.mp4", d / ".PARTTITLE03.a1.part.v"
     for p in (keep, tmp1, tmp2):
         p.write_bytes(b"x")
     e = T.make_engine(tmp_path, CH[:1])

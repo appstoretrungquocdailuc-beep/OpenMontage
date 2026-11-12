@@ -5,7 +5,7 @@ NHẤN START MỘT LẦN → tool tự làm:
   đọc Excel (cột K = Channel ID YouTube, cột C = PROFILE ID TikTok, cùng hàng)
   → mở sẵn đúng các profile Genlogin + vào trang TikTok Studio Upload
   → theo dõi YouTube bằng WebSub và/hoặc YouTube Data API (chế độ RACE — xem HUONG_DAN_RACE_API.txt)
-  → có video mới: tải 360p (file tạm .<VIDEO_ID>.part.mp4 → kiểm tra → đổi tên <tiêu đề>_<VIDEO_ID>.mp4)
+  → có video mới: tải 360p (file tạm .<VIDEO_ID>.part.mp4 → kiểm tra → đổi tên <tiêu đề gốc>.mp4)
   → giao NGAY cho đúng profile (không MOVE, không quét thư mục, không đọc lại Excel, không mở lại profile)
   → gắn file → chờ nút Post sáng → bấm → chỉ báo THÀNH CÔNG khi TikTok xác nhận (POST_CONFIRMED).
   Song song: ghi link YouTube vào cột D như trước.

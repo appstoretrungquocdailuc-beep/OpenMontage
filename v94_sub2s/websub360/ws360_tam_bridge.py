@@ -40,6 +40,9 @@ TERMINAL = ("CONFIRMED", "UNKNOWN", "FAILED_VISIBLE", "DUPLICATE", "DRY_RUN_DONE
 OPEN_STATES = ("CLOSED", "OPENING", "READY", "BUSY", "ERROR", "UNKNOWN", "NOT_FOUND")
 
 
+TEMP_RE = re.compile(r"^\.[0-9A-Za-z_-]{11}(?:_360p)?(?:\.a\d+)?\.part(?:\.mp4|\.v|\.a)?$")
+
+
 def _ms(a, b):
     return None if a is None or b is None else round((b - a) / 1e6, 3)
 
@@ -152,6 +155,14 @@ class TikTokBridge:
             self.tam = load_tam(self.cfg.get("tam_path") or "tam_INSTANT_POST.py")
         self.stats["genlogin"] = ("OK" if getattr(self.tam, "Genlogin", None) is not None else "THIẾU Genlogin.py") + \
             (" | selenium OK" if getattr(self.tam, "webdriver", None) is not None else " | THIẾU selenium")
+        wm = str(self.cfg.get("tam_wait_mode") or "").strip().lower()
+        if wm and hasattr(self.tam, "CFG"):
+            if wm in ("event", "sparse", "lite") and (wm == "event" or hasattr(self.tam, "JS_LITE_INSTALL")):
+                self.tam.CFG.wait_mode = wm
+            else:
+                self.log(f"⚠️ TikTok: tam_wait_mode '{wm}' không dùng được với file TAM này — giữ '{self.tam.CFG.wait_mode}'")
+        self.log(f"👁️ TikTok: cách theo dõi nút Post = {getattr(getattr(self.tam, 'CFG', None), 'wait_mode', '?')} "
+                 f"(event=A watcher đầy đủ | lite=C chỉ theo dõi nút | sparse=B không cài gì khi upload)")
         self.reload_mapping()
         self.accepting = True
         self.recover()
@@ -352,8 +363,8 @@ class TikTokBridge:
 
     def _check_file(self, job) -> str:
         p = Path(job["path"])
-        if p.name.startswith(".") or p.name.lower().endswith((".part", ".part.mp4", ".part.v", ".part.a")):
-            # file tạm của WS360 LUÔN bắt đầu bằng '.' — tiêu đề có chữ 'Part' (vd 'Vol.Part 2_<ID>.mp4') vẫn hợp lệ
+        if TEMP_RE.match(p.name):
+            # file tạm của WS360 có mẫu cố định '.<ID>.part.mp4' — tiêu đề gốc như '.Part 2 ….mp4' vẫn hợp lệ
             return "file tạm (.part) — không bao giờ upload"
         if not p.is_file():
             return "file không tồn tại"

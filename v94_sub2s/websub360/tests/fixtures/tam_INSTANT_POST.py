@@ -53,7 +53,7 @@ from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 BACKEND_NAME = "tam_INSTANT_POST"
-BACKEND_VERSION = "5.0.0"
+BACKEND_VERSION = "5.1.0"
 BACKEND_API_LEVEL = 5          # GUI bắt buộc khớp số này (chống GUI mới chạy backend cũ)
 
 
@@ -183,7 +183,9 @@ class _Cfg:
 
     def reload(self):
         self.variant = _env_str("TAM_VARIANT", "default")
-        self.wait_mode = _env_str("TAM_WAIT_MODE", "event").lower()          # event | poll
+        self.wait_mode = _env_str("TAM_WAIT_MODE", "event").lower()          # event (A) | sparse (B) | lite (C) | poll (cũ)
+        self.sparse_ms = max(20, _env_int("TAM_SPARSE_MS", 250))             # B: chu kỳ đọc 1 thuộc tính nút Post (không cài gì vào trang)
+        self.lite_tick_ms = max(20, _env_int("TAM_LITE_TICK_MS", 100))       # C: chu kỳ kiểm tra nút còn trong DOM (không layout)
         self.poll_s = max(0.005, _env_float("TAM_POLL_S", 0.02))             # chỉ dùng khi wait_mode=poll
         self.stage = _env_str("TAM_STAGE", "direct").lower()                 # direct | ram
         self.page_load = _env_str("TAM_PAGE_LOAD_STRATEGY", "normal").lower()
@@ -1629,6 +1631,119 @@ S.waitReady(ms, attachFlag).then(done, function (e) { done({ready: false, err: S
 # hỏi một lần, trả ngay (chỉ dùng khi TAM_WAIT_MODE=poll để so sánh với cơ chế sự kiện)
 JS_POLL_READY = r"""const S = window.__tam5; if (!S) return {ready: false, err: 'not-installed'}; return S.pollReady(arguments[0]);"""
 
+# ---------------- MODE C (lite): theo dõi NHẸ NHẤT trong lúc upload ----------------
+#  * 1 MutationObserver CHỈ trên chính nút Post (disabled/aria-disabled/class) — không subtree, không tổ tiên.
+#  * Không getComputedStyle / getBoundingClientRect / elementFromPoint trong lúc upload (không ép layout).
+#  * Nút bị React thay node: kiểm tra isConnected mỗi TAM_LITE_TICK_MS (querySelector khi cần, không layout).
+#  * Khi nút đã bật: Python mới cài watcher đầy đủ (bảo vệ lúc nhấn + bằng chứng đăng) như cũ.
+JS_LITE_INSTALL = r"""
+const sel = arguments[0], tickMs = arguments[1];
+const NS = '__tamLite';
+try { const o = window[NS]; if (o && o.dispose) o.dispose(); } catch (e) {}
+try { if (!window.__tamDoc) window.__tamDoc = Math.random().toString(36).slice(2) + Date.now().toString(36); } catch (e) {}
+const L = {doc: window.__tamDoc || null, btn: null, obs: null, aobs: null, attachedAt: null, readyAt: null, waiters: [],
+           stats: {checks: 0, muts: 0, anc: 0, ticks: 0, requery: 0}, timer: null, disposed: false};
+function enabled(b) {
+  if (!b || !b.isConnected || b.disabled) return false;
+  if (String(b.getAttribute('aria-disabled') || '').toLowerCase() === 'true') return false;
+  const c = b.className;
+  if (typeof c === 'string' && c.toLowerCase().indexOf('disabled') >= 0) return false;
+  return true;
+}
+function hook(b) {
+  if (L.obs) { try { L.obs.disconnect(); } catch (e) {} L.obs = null; }
+  if (L.aobs) { try { L.aobs.disconnect(); } catch (e) {} L.aobs = null; }
+  L.btn = b;
+  if (!b) return;
+  L.obs = new MutationObserver(function (m) { L.stats.muts += m.length; check(); });
+  L.obs.observe(b, {attributes: true, attributeFilter: ['disabled', 'aria-disabled', 'class']});
+  // React thay NODE nút (không đổi thuộc tính): chỉ nghe con TRỰC TIẾP của 3 tổ tiên gần nhất (không subtree, không layout)
+  L.aobs = new MutationObserver(function (m) { L.stats.anc += m.length; if (!L.btn || !L.btn.isConnected) check(); });
+  let n = b.parentElement, d = 0;
+  while (n && d < 3) { L.aobs.observe(n, {childList: true}); n = n.parentElement; d++; }
+}
+function payload() {
+  return {ready: L.readyAt !== null, readyAt: L.readyAt, attachedAt: L.attachedAt, now: performance.now(), doc: L.doc,
+          vis: document.visibilityState, stats: L.stats};
+}
+function flush() {
+  const w = L.waiters.splice(0);
+  for (let i = 0; i < w.length; i++) { clearTimeout(w[i].t); w[i].r(payload()); }
+}
+function check() {
+  if (L.disposed) return;
+  L.stats.checks++;
+  let b = L.btn;
+  if (!b || !b.isConnected) { L.stats.requery++; b = document.querySelector(sel); if (b !== L.btn) hook(b); }
+  if (L.attachedAt !== null && enabled(b)) { if (L.readyAt === null) L.readyAt = performance.now(); flush(); }
+  else if (!enabled(b)) L.readyAt = null;
+}
+function tick() {
+  if (L.disposed) return;
+  L.stats.ticks++;
+  if (!L.btn || !L.btn.isConnected) check();
+  L.timer = setTimeout(tick, tickMs);
+}
+function onChange(e) {
+  const t = e.target;
+  if (t && t.tagName === 'INPUT' && t.type === 'file' && t.files && t.files.length) {
+    if (L.attachedAt === null) L.attachedAt = performance.now();
+    check();
+  }
+}
+document.addEventListener('change', onChange, true);
+L.wait = function (ms, attachFlag) {
+  if (attachFlag && L.attachedAt === null) L.attachedAt = performance.now();
+  check();
+  return new Promise(function (res) {
+    if (L.readyAt !== null) { res(payload()); return; }
+    const x = {r: res, t: null};
+    x.t = setTimeout(function () { const i = L.waiters.indexOf(x); if (i >= 0) L.waiters.splice(i, 1); res(payload()); }, ms);
+    L.waiters.push(x);
+  });
+};
+L.dispose = function () {
+  L.disposed = true;
+  try { if (L.obs) L.obs.disconnect(); } catch (e) {}
+  try { if (L.aobs) L.aobs.disconnect(); } catch (e) {}
+  clearTimeout(L.timer);
+  document.removeEventListener('change', onChange, true);
+  flush();
+  try { delete window[NS]; } catch (e) { window[NS] = null; }
+};
+window[NS] = L;
+hook(document.querySelector(sel));
+tick();
+return {ok: true, doc: L.doc, now: performance.now(), vis: document.visibilityState, url: String(location.href)};
+"""
+
+JS_LITE_WAIT = r"""
+const ms = arguments[0], attachFlag = arguments[1], done = arguments[arguments.length - 1];
+const L = window.__tamLite;
+if (!L) { done({ready: false, err: 'not-installed'}); return; }
+L.wait(ms, attachFlag).then(done, function (e) { done({ready: false, err: String(e)}); });
+"""
+
+JS_LITE_DISPOSE = r"""try { const L = window.__tamLite; if (L) L.dispose(); } catch (e) {} return true;"""
+
+# ---------------- MODE B (sparse): KHÔNG cài gì vào trang trong lúc upload ----------------
+#  Mỗi TAM_SPARSE_MS, Python đọc đúng 1 lần thuộc tính disabled của nút Post (querySelector, không layout, không observer).
+JS_SPARSE_PREP = r"""
+try { if (!window.__tamDoc) window.__tamDoc = Math.random().toString(36).slice(2) + Date.now().toString(36); } catch (e) {}
+return {ok: true, doc: window.__tamDoc || null, now: performance.now(), vis: document.visibilityState, url: String(location.href)};
+"""
+
+JS_SPARSE_STATE = r"""
+const b = document.querySelector(arguments[0]);
+let en = false;
+if (b) {
+  const c = b.className;
+  en = !(b.disabled || String(b.getAttribute('aria-disabled') || '').toLowerCase() === 'true' ||
+         (typeof c === 'string' && c.toLowerCase().indexOf('disabled') >= 0));
+}
+return [performance.now(), en, window.__tamDoc || null, document.visibilityState];
+"""
+
 # chờ bằng chứng đăng theo lát (tham số: ms)
 JS_WAIT_CONFIRM = r"""
 const ms = arguments[0], done = arguments[arguments.length - 1];
@@ -2031,9 +2146,62 @@ def _wait_post_ready_poll(driver, kill: Callable[[], bool], timeout_s: float, st
 
 
 def wait_post_ready(driver, kill: Callable[[], bool], timeout_s: float, stats: Optional[Dict[str, Any]] = None):
-    """Chờ nút Post sẵn sàng. Trả ('ready', payload) | ('timeout', last) | ('killed', last). Lỗi trước-khi-bấm => JobError."""
+    """Chờ nút Post sẵn sàng (watcher ĐẦY ĐỦ đã cài). Trả ('ready', payload) | ('timeout', last) | ('killed', last).
+    Lỗi trước-khi-bấm => JobError. Mode sparse/lite: watcher đầy đủ chỉ được cài SAU khi nút đã bật → hàm này chạy chế độ sự kiện."""
     if CFG.wait_mode == "poll":
         return _wait_post_ready_poll(driver, kill, timeout_s, stats)
+    return _wait_post_ready_event(driver, kill, timeout_s, stats)
+
+
+def _raise_pre_click(driver, e: BaseException, what: str):
+    if _is_alert_exc(e):
+        raise JobError(f"hộp thoại của trang chặn lệnh (không tự bấm): {_alert_text(driver)[:120]}")
+    if _is_nav_exc(e):
+        raise JobError(f"trang điều hướng/nạp lại khi đang chờ nút Post ({what})")
+    if _is_dead_browser_exc(e):
+        raise JobError(f"mất kết nối trình duyệt: {e}")
+    raise e
+
+
+def wait_post_enabled_light(driver, kill: Callable[[], bool], timeout_s: float, stats: Dict[str, Any], mode: str):
+    """B/C: chờ nút Post BẬT mà không cài watcher nặng. Trả ('ready', {readyAt, attachedAt, doc, now, vis}) | timeout | killed.
+    B (sparse): mỗi TAM_SPARSE_MS đọc 1 thuộc tính (readyAt = lần đọc đầu tiên thấy bật, sai số ≤ 1 chu kỳ).
+    C (lite):   observer trên CHÍNH nút; Python chờ theo lát execute_async_script (readyAt chính xác theo đồng hồ trang)."""
+    end = time.perf_counter() + timeout_s
+    n = 0
+    if mode == "lite":
+        slice_s = CFG.slice_ms / 1000.0
+        _ensure_script_timeout(driver, slice_s + 1.5)
+    while True:
+        if kill():
+            return "killed", None
+        left = end - time.perf_counter()
+        if left <= 0:
+            return "timeout", None
+        try:
+            if mode == "lite":
+                r = driver.execute_async_script(JS_LITE_WAIT, int(max(20, min(CFG.slice_ms / 1000.0, left) * 1000)), True)
+            else:
+                now, en, doc, vis = driver.execute_script(JS_SPARSE_STATE, CFG.sel_post)
+                r = {"ready": bool(en), "readyAt": now if en else None, "attachedAt": None, "now": now, "doc": doc, "vis": vis}
+        except Exception as e:
+            if mode == "lite" and _is_script_timeout(e):
+                n += 1
+                continue
+            _raise_pre_click(driver, e, f"mode {mode}")
+        n += 1
+        stats["light_calls"] = n
+        if isinstance(r, dict):
+            if r.get("err") == "not-installed":
+                raise JobError("watcher nhẹ không còn trong trang (trang đã nạp lại?)")
+            if r.get("ready"):
+                stats["light_stats"] = r.get("stats")
+                return "ready", r
+        if mode == "sparse":
+            time.sleep(min(CFG.sparse_ms / 1000.0, max(0.0, end - time.perf_counter())))
+
+
+def _wait_post_ready_event(driver, kill: Callable[[], bool], timeout_s: float, stats: Optional[Dict[str, Any]] = None):
     slice_s = CFG.slice_ms / 1000.0
     _ensure_script_timeout(driver, slice_s + 1.5)
     end = time.perf_counter() + timeout_s
@@ -2346,7 +2514,21 @@ def _upload_core(driver, paths: List[str], log, kill, pid: str, trace: PerfTrace
             return UploadResult(S.KILLED, "Hard Stop khi chờ trang ấm", trace=trace, paths=paths)
 
     # --- 2) cài watcher TRƯỚC khi gắn file (để không bỏ lỡ video xử lý rất nhanh) ---
-    info = install_watcher(driver, trace, sync)
+    #     B (sparse) / C (lite): KHÔNG cài watcher đầy đủ trong lúc upload — chỉ cài sau khi nút Post đã bật.
+    light = CFG.wait_mode in ("sparse", "lite")
+    if light:
+        t0i = time.perf_counter_ns()
+        try:
+            if CFG.wait_mode == "lite":
+                info = driver.execute_script(JS_LITE_INSTALL, CFG.sel_post, CFG.lite_tick_ms) or {}
+            else:
+                info = driver.execute_script(JS_SPARSE_PREP) or {}
+        except Exception as e:
+            info = {"ok": False, "err": str(e)}
+        if isinstance(info, dict):
+            sync.add_sample(t0i, time.perf_counter_ns(), info.get("now"), info.get("doc"))
+    else:
+        info = install_watcher(driver, trace, sync)
     if not info.get("ok"):
         fsm.to(PState.ERROR, "không cài được watcher")
         return UploadResult(S.FAILED_SAFE, "không cài được watcher vào trang", trace=trace, paths=paths)
@@ -2371,14 +2553,40 @@ def _upload_core(driver, paths: List[str], log, kill, pid: str, trace: PerfTrace
     log(f"⏱️ [Timing] T1 (Đã nạp file): {ctx.t_attached - ctx.t_start:.3f}s")
     if CFG.wait_mode == "poll":
         log(f"⚡ [INSTANT] (A/B) Chế độ POLLING {CFG.poll_s * 1000:.0f} ms — chỉ để so sánh với chế độ sự kiện.")
+    elif CFG.wait_mode == "lite":
+        log("⚡ [INSTANT] MODE C (lite): chỉ theo dõi chính nút Post trong lúc upload (không observer toàn trang, không ép layout).")
+    elif CFG.wait_mode == "sparse":
+        log(f"⚡ [INSTANT] MODE B (sparse): KHÔNG cài watcher trong lúc upload; đọc trạng thái nút mỗi {CFG.sparse_ms} ms.")
     else:
         log("⚡ [INSTANT] Rình nút Post theo SỰ KIỆN ngay từ lúc attach file (không polling, không chờ cứng).")
-    if CFG.perf_enable:
+    if CFG.perf_enable and not light:
         sync.sync(driver, samples=3)      # lúc này trình duyệt đang upload => tốn vài ms ở đây không ảnh hưởng ReadyToClick
 
     # --- 4) chờ nút Post sẵn sàng (theo lát; Hard Stop kiểm tra giữa các lát) ---
     wstats = {}     # type: Dict[str, Any]
-    state, ready = wait_post_ready(driver, kill, CFG.ready_timeout_s, wstats)
+    if light:
+        state, lready = wait_post_enabled_light(driver, kill, CFG.ready_timeout_s, wstats, CFG.wait_mode)
+        t_enabled_py = time.perf_counter_ns()
+        ready = None
+        if state == "ready" and lready:
+            if CFG.wait_mode == "lite":
+                try:
+                    driver.execute_script(JS_LITE_DISPOSE)
+                except Exception:
+                    pass
+            # nút đã BẬT: giờ mới cài watcher đầy đủ (kiểm tra hiển thị/che, bảo vệ lúc nhấn, bằng chứng đăng) — như mode A
+            info2 = install_watcher(driver, trace, sync)
+            if not info2.get("ok"):
+                fsm.to(PState.ERROR, "không cài được watcher")
+                return UploadResult(S.FAILED_SAFE, "không cài được watcher vào trang", trace=trace, paths=paths)
+            left = max(1.0, CFG.ready_timeout_s - (time.perf_counter() - ctx.t_attached))
+            state, ready = wait_post_ready(driver, kill, left, wstats)
+            if state == "ready" and ready:
+                ready = dict(ready, readyAt=lready.get("readyAt") if lready.get("doc") == ready.get("doc") else ready.get("readyAt"),
+                             attachedAt=lready.get("attachedAt"), handoffAt=ready.get("readyAt"))
+                wstats["handoff_ms"] = round((time.perf_counter_ns() - t_enabled_py) / 1e6, 1)
+    else:
+        state, ready = wait_post_ready(driver, kill, CFG.ready_timeout_s, wstats)
     t_resp = time.perf_counter_ns()
     if state == "killed":
         fsm.to(PState.ERROR, "Hard Stop khi chờ nút Post")
@@ -2402,6 +2610,9 @@ def _upload_core(driver, paths: List[str], log, kill, pid: str, trace: PerfTrace
     trace.set("watch_stats", ready.get("stats"))
     trace.set("slices", wstats.get("slices"))
     trace.set("polls", wstats.get("polls"))
+    trace.set("light_calls", wstats.get("light_calls"))
+    trace.set("light_stats", wstats.get("light_stats"))
+    trace.set("handoff_ms", wstats.get("handoff_ms"))
     trace.set("wait_mode", CFG.wait_mode)
     trace.set("attach_mode", "tool")
     _finish_attach(driver, trace, sync, ready, rec_ok, m0)
@@ -2586,6 +2797,11 @@ def upload_video_to_tiktok_ex(driver, video_paths, logger_func=None, check_force
                 pass
         if not ctx.nav:
             dispose_watcher(driver)        # nhả "bảo vệ lúc nhấn"; tài liệu mới (sau điều hướng) vốn không có watcher
+            if CFG.wait_mode == "lite":
+                try:
+                    driver.execute_script(JS_LITE_DISPOSE)
+                except Exception:
+                    pass
         if result.status in (S.KILLED, S.FAILED_SAFE) and fsm.state in (PState.ATTACHING, PState.UPLOADING, PState.PROCESSING, PState.POST_READY):
             fsm.to(PState.ERROR, result.reason)
         if result.confirmed:
@@ -4394,9 +4610,11 @@ def run_selftest() -> int:
             return ("SKIP", "không có `node` để kiểm cú pháp JavaScript (sẽ được kiểm ở lần chạy thật: install_watcher báo lỗi nếu hỏng)")
         import subprocess
         bad = []
-        for name in ("JS_INSTALL", "JS_WAIT_READY", "JS_POLL_READY", "JS_WAIT_CONFIRM", "JS_SNAPSHOT", "JS_WATCH_ONLY", "JS_REARM",
-                     "JS_DISPOSE", "JS_WAIT_FILE_INPUT", "JS_CALIB", "SYNC_JS",
-                     "JS_REC_INSTALL", "JS_REC_READ", "JS_ENV", "JS_SPARSE_INSTALL", "JS_SPARSE_POLL", "JS_PAGE_AGE"):
+        names = ("JS_INSTALL", "JS_WAIT_READY", "JS_POLL_READY", "JS_WAIT_CONFIRM", "JS_SNAPSHOT", "JS_WATCH_ONLY", "JS_REARM",
+                 "JS_DISPOSE", "JS_WAIT_FILE_INPUT", "JS_CALIB", "SYNC_JS",
+                 "JS_REC_INSTALL", "JS_REC_READ", "JS_ENV", "JS_SPARSE_INSTALL", "JS_SPARSE_POLL", "JS_PAGE_AGE",
+                 "JS_LITE_INSTALL", "JS_LITE_WAIT", "JS_LITE_DISPOSE", "JS_SPARSE_PREP", "JS_SPARSE_STATE")
+        for name in names:
             code = globals()[name]
             try:
                 r = subprocess.run([node, "-e", "new Function(require('fs').readFileSync(0,'utf8'))"], input=code.encode("utf-8"),
@@ -4406,7 +4624,7 @@ def run_selftest() -> int:
             except Exception as e:
                 bad.append(f"{name}: {e}")
         assert not bad, "; ".join(bad)
-        return "17 đoạn JavaScript hợp lệ cú pháp (node)"
+        return f"{len(names)} đoạn JavaScript hợp lệ cú pháp (node)"
 
     for nm, fn in (("Python", t_python), ("File backend", t_backend_file), ("Thư viện", t_deps), ("chromedriver", t_driver),
                    ("Máy trạng thái FSM", t_fsm), ("Phân phối profile/limit", t_plan), ("Cổng file ghi xong", t_filegate),
@@ -4693,6 +4911,108 @@ def cli_bench_upload(pid: str, files: List[str], repeat: int, yes: bool, keep_op
               "xem --perf-summary --compare A B. Mốc UPLOAD_COMPLETED chỉ có khi đặt TAM_UPLOAD_DONE_SEL / TAM_UPLOAD_DONE_TEXT_RE.")
         return 0
     finally:
+        _close_one(pid, drv, keep_open)
+
+
+def cli_bench_watch(pid: str, files: List[str], repeat: int, yes: bool, keep_open: bool, modes: str = "ABC") -> int:
+    """A/B/C trên TikTok THẬT, cùng profile, cùng file, mỗi lượt nạp lại trang Upload sạch, thứ tự xoay vòng.
+    A = event (watcher hiện tại) | B = sparse (không cài gì khi upload) | C = lite (chỉ theo dõi chính nút Post).
+    LUÔN dry-run: chạy tới khi nút Post sáng rồi DỪNG — KHÔNG BAO GIỜ bấm Post, không video nào được đăng."""
+    names = {"A": "event", "B": "sparse", "C": "lite"}
+    modes = [m for m in modes.upper() if m in names] or ["A", "B", "C"]
+    files = [os.path.abspath(f) for f in files]
+    miss = [f for f in files if not os.path.isfile(f)]
+    if miss:
+        print("Không thấy file: " + ", ".join(miss))
+        return 2
+    print(f"BENCH WATCH: profile {pid} | {len(files)} file | {repeat} vòng × {''.join(modes)} (thứ tự xoay vòng) | DRY-RUN: KHÔNG bấm Post.\n"
+          f"Mỗi lượt gắn file vào trang Upload rồi DỪNG khi nút Post sáng — TikTok có thể giữ bản nháp tải lên; tool nạp lại trang "
+          f"trước lượt sau. Bộ ghi thụ động (long task, Resource Timing) bật GIỐNG NHAU cho mọi chế độ.")
+    if not yes and input("Tiếp tục? [y/N] ").strip().lower() not in ("y", "yes"):
+        print("Đã huỷ.")
+        return 1
+    drv = _open_one(pid)
+    if drv is None:
+        return 3
+    saved = (CFG.wait_mode, CFG.rec_enable)
+    rows = []   # type: List[Dict[str, Any]]
+    try:
+        CFG.rec_enable = True
+        n_bytes = sum((stat_file(f) or (0, 0))[0] for f in files)
+        for r in range(max(1, repeat)):
+            order = modes[r % len(modes):] + modes[:r % len(modes)]
+            if r % 2:
+                order = order[::-1]
+            for m in order:
+                CFG.wait_mode = names[m]
+                get_fsm(pid).dirty = True                       # mỗi lượt: trang Upload SẠCH vừa nạp
+                snap = {}       # type: Dict[str, Any]
+                counter = _CountingDriver(drv)
+
+                def hook(msg, snap=snap, counter=counter):
+                    if "[Timing] T1" in msg:
+                        snap.update(t0=time.perf_counter(), c0=_cpu_snapshot(drv), n0=counter.count, m0=cdp_metrics(drv))
+                    elif "💡 [READY]" in msg:
+                        snap.update(t1=time.perf_counter(), c1=_cpu_snapshot(drv), n1=counter.count, m1=cdp_metrics(drv))
+                tr = PerfTrace(label=f"watch-{m}#{r + 1}", profile=pid, mode="BENCH-WATCH", n_files=len(files), n_bytes=n_bytes)
+                tr.mark_unknown("FILE_READY", "bench")
+                staged, tmp, _info = stage_files(files, "benchwatch", tr)
+                try:
+                    res = upload_video_to_tiktok_ex(drv, staged, logger_func=hook, check_force_kill=None, pid=pid, mode="BENCH-WATCH",
+                                                    trace=tr, dry_run=True)
+                finally:
+                    cleanup_stage_dir(tmp)
+                    counter.release()
+                rec = tr.record()
+                fl = rec.get("flags") or {}
+                row = {"mode": m, "wait_mode": names[m], "round": r + 1, "result": res.status.value,
+                       "attach_to_ready_py_ms": round((snap["t1"] - snap["t0"]) * 1000) if "t1" in snap and "t0" in snap else None,
+                       "attach_to_ready_page_ms": (rec.get("ms") or {}).get("AttachToReadyPage"),
+                       "webdriver_cmds": (snap["n1"] - snap["n0"]) if snap.get("n1") is not None and snap.get("n0") is not None else None}
+                for k in ("python", "chromedriver", "chrome"):
+                    a0, a1 = (snap.get("c0") or {}).get(k), (snap.get("c1") or {}).get(k)
+                    row["cpu_" + k + "_s"] = None if a0 is None or a1 is None else round(a1 - a0, 3)
+                for k, v in cdp_delta(snap.get("m0"), snap.get("m1")).items():
+                    row[k] = v
+                for k in ("x_longtask_count", "x_longtask_ms", "x_longtask_max_ms", "x_net_span_ms", "x_net_busy_ms",
+                          "x_after_net_to_ready_ms", "handoff_ms", "light_calls", "slices", "watch_stats", "rec_res_top"):
+                    if k in fl:
+                        row[k] = fl[k]
+                rows.append(row)
+                if CFG.perf_enable:
+                    PERF_LOG.write(rec)
+                print(f"  vòng {r + 1} {m}({names[m]}): gắn→READY {row['attach_to_ready_py_ms']} ms | trang {row['attach_to_ready_page_ms']} | "
+                      f"CPU chrome {row['cpu_chrome_s']} s | lệnh {row['webdriver_cmds']} | long task {row.get('x_longtask_ms')} ms | "
+                      f"{row['result']}" + ("" if res.status == PostStatus.DRY_RUN else f" ({res.reason})"))
+        rep = {"profile": pid, "files": [os.path.basename(f) for f in files], "bytes": n_bytes, "repeat": repeat,
+               "ts": datetime.datetime.now().isoformat(timespec="seconds"), "rows": rows, "summary": {}}
+        for m in modes:
+            rs = [x for x in rows if x["mode"] == m and x["result"] == PostStatus.DRY_RUN.value]
+            rep["summary"][m] = {k: _pct_list([x.get(k) for x in rs if isinstance(x.get(k), (int, float))])
+                                 for k in ("attach_to_ready_py_ms", "attach_to_ready_page_ms", "cpu_chrome_s", "cpu_python_s",
+                                           "webdriver_cmds", "x_longtask_ms", "x_task_ms", "x_layout_count", "x_recalcstyle_count",
+                                           "x_net_span_ms")}
+        out = os.path.join(BASE_DIR, f"tam_bench_watch_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+        with open(out, "w", encoding="utf-8") as f:
+            json.dump(rep, f, ensure_ascii=False, indent=1)
+        print("\n=== TÓM TẮT (median | P95) — DRY-RUN, không bấm Post ===")
+        print(f"{'chế độ':8} {'gắn→READY ms':>16} {'CPU chrome s':>14} {'CPU python s':>14} {'lệnh WD':>9} {'long task ms':>13} {'layout':>8}")
+        for m in modes:
+            sm = rep["summary"][m]
+            f_ = lambda k: (f"{sm[k].get('median')}|{sm[k].get('p95')}" if sm[k].get("n") else "-")
+            print(f"{m}({names[m]:6}) {f_('attach_to_ready_py_ms'):>16} {f_('cpu_chrome_s'):>14} {f_('cpu_python_s'):>14} "
+                  f"{f_('webdriver_cmds'):>9} {f_('x_longtask_ms'):>13} {f_('x_layout_count'):>8}")
+        for a_, b_ in (("A", "C"), ("A", "B")):
+            xa = [x["attach_to_ready_py_ms"] for x in rows if x["mode"] == a_ and x.get("attach_to_ready_py_ms") is not None]
+            xb = [x["attach_to_ready_py_ms"] for x in rows if x["mode"] == b_ and x.get("attach_to_ready_py_ms") is not None]
+            if len(xa) >= 3 and len(xb) >= 3:
+                d, lo, hi = bootstrap_median_diff(xa, xb)
+                print(f"{b_} − {a_} (gắn→READY, median): {d:+.0f} ms, KTC95% [{lo:+.0f}; {hi:+.0f}]"
+                      + ("  ⇒ khác biệt CÓ ý nghĩa" if (lo > 0 or hi < 0) else "  ⇒ CHƯA khác biệt rõ (chạy thêm vòng)"))
+        print(f"\nĐã lưu: {out}  — gửi file này để phân tích.")
+        return 0
+    finally:
+        CFG.wait_mode, CFG.rec_enable = saved
         _close_one(pid, drv, keep_open)
 
 
@@ -5046,6 +5366,7 @@ def build_parser() -> "argparse.ArgumentParser":
             "  python tam_INSTANT_POST.py --selftest\n"
             "  python tam_INSTANT_POST.py --calibrate-confirm --profile 12345            # quan sát khi bạn TỰ đăng 1 video, KHÔNG bấm gì\n"
             "  python tam_INSTANT_POST.py --bench-overhead --profile 12345 --secs 10     # chi phí chờ nút: event vs poll (không đăng)\n"
+            "  python tam_INSTANT_POST.py --bench-watch --profile 12345 --files a.mp4 --repeat 6   # A/B/C watcher nút Post (không đăng)\n"
             "  python tam_INSTANT_POST.py --bench-upload --profile 12345 --files a.mp4 --repeat 5 --variant direct\n"
             "  python tam_INSTANT_POST.py --bench-upload --profile 12345 --files a.mp4 --repeat 5 --variant ram --stage ram\n"
             "  python tam_INSTANT_POST.py --bench-attach --profile 12345 --files a.mp4 --attach-mode both --repeat 10   # tay vs tool, cùng trang/profile/file\n"
@@ -5062,6 +5383,7 @@ def build_parser() -> "argparse.ArgumentParser":
     g.add_argument("--calibrate-confirm", action="store_true", help="quan sát (không bấm gì) khi bạn tự đăng 1 video; cần --profile")
     g.add_argument("--bench-overhead", action="store_true", help="đo chi phí chờ nút event vs poll trên profile thật; cần --profile")
     g.add_argument("--bench-upload", action="store_true", help="chạy thử tới lúc nút Post sáng rồi DỪNG (không đăng); cần --profile --files")
+    g.add_argument("--bench-watch", action="store_true", help="A/B/C cơ chế theo dõi nút Post trên TikTok thật (DRY-RUN, không bấm Post); cần --profile --files")
     g.add_argument("--bench-attach", action="store_true", help="đo AttachToReady (file được chọn -> nút Post sáng): đăng tay vs tool, không đăng; cần --profile --files")
     ap.add_argument("--attach-mode", choices=["tool", "manual", "both"], default="both", help="--bench-attach: tool | manual (bạn tự chọn file) | both (xen kẽ ABBA)")
     ap.add_argument("--watch", choices=["event", "sparse"], default="event", help="--bench-attach: event = watcher+bộ ghi; sparse = không observer, hỏi thưa (đo tải do công cụ gây ra)")
@@ -5079,7 +5401,8 @@ def build_parser() -> "argparse.ArgumentParser":
     ap.add_argument("--repeat", type=int, default=3, help="số lượt cho --bench-upload (mặc định 3)")
     ap.add_argument("--secs", type=float, default=None, help="thời gian đo / quan sát (giây)")
     ap.add_argument("--variant", help="nhãn ghi vào PERF (TAM_VARIANT)")
-    ap.add_argument("--wait-mode", choices=["event", "poll"], help="đặt TAM_WAIT_MODE cho lần chạy này")
+    ap.add_argument("--wait-mode", choices=["event", "sparse", "lite", "poll"], help="đặt TAM_WAIT_MODE cho lần chạy này (event=A, sparse=B, lite=C)")
+    ap.add_argument("--modes", default="ABC", help="--bench-watch: các chế độ so sánh (mặc định ABC)")
     ap.add_argument("--stage", choices=["direct", "ram"], help="đặt TAM_STAGE cho lần chạy này")
     ap.add_argument("--force-reload", action="store_true", help="đặt TAM_FORCE_RELOAD=1 cho lần chạy này")
     ap.add_argument("--keep-open", action="store_true", help="không đóng profile sau khi đo")
@@ -5125,6 +5448,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not a.profile:
             ap.error("--bench-overhead cần --profile")
         return cli_bench_overhead(a.profile, a.secs or 10.0, a.keep_open)
+    if a.bench_watch:
+        if not a.profile or not a.files:
+            ap.error("--bench-watch cần --profile và --files")
+        return cli_bench_watch(a.profile, a.files, a.repeat if a.repeat != 3 else 6, a.yes, a.keep_open, a.modes)
     if a.bench_attach:
         if not a.profile or not a.files:
             ap.error("--bench-attach cần --profile (có thể a,b,c) và --files")
