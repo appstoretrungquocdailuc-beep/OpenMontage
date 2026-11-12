@@ -145,6 +145,27 @@ def video_url(vid: str) -> str:
     return f"https://www.youtube.com/watch?v={vid}"
 
 
+def extract_vid(v) -> str | None:
+    """Nhận ID hoặc mọi dạng link: watch?v=, /shorts/, youtu.be/, /live/, /embed/."""
+    v = str(v or "").strip()
+    if VID_RE.match(v):
+        return v
+    m = re.search(r"(?:v=|/shorts/|youtu\.be/|/live/|/embed/)([0-9A-Za-z_-]{11})", v)
+    return m.group(1) if m else None
+
+
+def port_free(host, port) -> bool:
+    import socket
+    s_ = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s_.bind((host if host not in ("", "0.0.0.0") else "0.0.0.0", int(port)))
+        return True
+    except OSError:
+        return False
+    finally:
+        s_.close()
+
+
 def norm_channel(v) -> str | None:
     m = CH_RE.search(str(v or ""))
     return m.group(1) if m else None
@@ -889,7 +910,8 @@ def ffmpeg_mux(vfile: Path, afile: Path | None, out: Path) -> float:
 
 # =============================== ENGINE =============================== #
 class Engine:
-    def __init__(self, cfg: dict, base: Path, log: Log, on_stats=None, db_name="database.sqlite"):
+    def __init__(self, cfg: dict, base: Path, log: Log, on_stats=None, db_name="database.sqlite", lock_name="ws360.lock"):
+        self.lock_name = lock_name
         self.cfg = cfg
         self.base = base
         self.log = log
@@ -962,7 +984,7 @@ class Engine:
                  f"ffmpeg={'có' if FFMPEG else 'KHÔNG'} | ffprobe={'có' if FFPROBE else 'KHÔNG'} | yt-dlp={'có' if yt_dlp else 'KHÔNG'}")
 
     def _acquire_instance_lock(self):
-        self._lockfh = open(self.base / "ws360.lock", "a+")
+        self._lockfh = open(self.base / self.lock_name, "a+")
         try:
             if os.name == "nt":
                 import msvcrt
@@ -974,7 +996,8 @@ class Engine:
         except OSError:
             self._lockfh.close()
             self._lockfh = None
-            raise RuntimeError("Tool đang chạy ở cửa sổ khác trong cùng thư mục — chỉ được chạy 1 bản")
+            raise RuntimeError("Tool đang chạy ở cửa sổ khác trong cùng thư mục (START.bat?) — chỉ được chạy 1 bản. "
+                               "Tắt cửa sổ đó rồi chạy lại.")
 
     def _release_instance_lock(self):
         fh = getattr(self, "_lockfh", None)
@@ -1949,12 +1972,25 @@ def selftest(cfg, base, video_id=None, wait_verify=90):
     test_xl = base / "check_TEST.xlsx"
     if xl.exists():
         shutil.copyfile(xl, test_xl)
-    tcfg = dict(cfg, excel_file=test_xl.name)
+    tcfg = dict(cfg, excel_file=test_xl.name, download_dir="DOWNLOADS_TEST")   # không đụng thư mục/file tạm của tool chính
+    main_busy = not port_free(cfg.get("listen_host", "0.0.0.0"), cfg.get("listen_port", 8765))
+    if main_busy:
+        log(f"ℹ️ Cổng {cfg.get('listen_port', 8765)} đang bận (tool chính đang chạy?) → SELFTEST dùng cổng tạm, "
+            "bỏ qua bài test hub thật")
+        tcfg["listen_port"] = 0
     db_test = base / "database_TEST.sqlite"
     for p in (db_test, Path(str(db_test) + "-wal"), Path(str(db_test) + "-shm")):
-        p.unlink(missing_ok=True)
-    eng = Engine(tcfg, base, log, db_name=db_test.name)
-    eng.start(websub=True, api=False, feed=False)
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
+    eng = Engine(tcfg, base, log, db_name=db_test.name, lock_name="ws360_selftest.lock")
+    try:
+        eng.start(websub=True, api=False, feed=False)
+    except Exception as e:  # noqa: BLE001
+        rec("SELFTEST khởi động", "FAIL", f"{type(e).__name__}: {e}")
+        _write_selftest_report(base, res, log)
+        return res
     try:
         port = eng.httpd.server_address[1]
         ch0 = next(iter(chans), None)
@@ -1967,8 +2003,11 @@ def selftest(cfg, base, video_id=None, wait_verify=90):
             with urllib.request.urlopen(f"http://127.0.0.1:{port}{cfg['websub_path']}?{q}", timeout=3) as r:
                 ok_local = r.read() == b"xyz123"
         rec("TEST2a webhook cục bộ trả hub.challenge", "PASS" if ok_local else "FAIL", f"cổng {port}")
-        cb = eng.resolve_callback()
-        if not cb:
+        cb = "" if main_busy else eng.resolve_callback()
+        if main_busy:
+            rec("TEST2b callback HTTPS công khai", "BLOCKED", "tool chính đang giữ cổng — tắt START.bat rồi chạy lại SELFTEST.bat")
+            rec("TEST2c đăng ký hub thật + xác minh", "BLOCKED", "như trên")
+        elif not cb:
             rec("TEST2b callback HTTPS công khai", "BLOCKED", "chưa có ngrok/cloudflared hoặc callback_url trong config.json")
             rec("TEST2c đăng ký hub thật + xác minh", "BLOCKED", "cần callback công khai")
         else:
@@ -2052,13 +2091,17 @@ def selftest(cfg, base, video_id=None, wait_verify=90):
             "(xem log dòng '[WEBSUB] VIDEO MỚI' + bảng videos engine='WEBSUB')")
     finally:
         eng.stop()
+    _write_selftest_report(base, res, log)
+    return res
+
+
+def _write_selftest_report(base, res, log):
     rep = base / "TEST_REPORT_MAY_BAN.md"
     with open(rep, "w", encoding="utf-8") as f:
         f.write(f"# TEST REPORT (chạy trên máy bạn) — {VERSION} — {datetime.now():%Y-%m-%d %H:%M:%S}\n\n| Test | Kết quả | Chi tiết |\n|---|---|---|\n")
         for n, s, d in res:
             f.write(f"| {n} | **{s}** | {str(d).replace('|', '/')} |\n")
     log(f"📄 Đã ghi {rep}")
-    return res
 
 
 def bench(cfg, base, ids, reps=3):
@@ -2147,10 +2190,13 @@ def main(argv=None):
     os.chdir(base)
     cfg = load_config(base / a.config)
     if a.selftest:
-        r = selftest(cfg, base, a.video or None)
+        vid = extract_vid(a.video) if a.video else None
+        if a.video and not vid:
+            print(f"⚠️ '{a.video}' không phải ID/link video YouTube hợp lệ — bỏ qua TEST3")
+        r = selftest(cfg, base, vid)
         return 0 if all(s != "FAIL" for _, s, _ in r) else 1
     if a.bench is not None:
-        bench(cfg, base, a.bench or [], a.reps)
+        bench(cfg, base, [v for v in (extract_vid(x) for x in (a.bench or [])) if v], a.reps)
         return 0
     if a.headless:
         log = Log(base / "logs")
