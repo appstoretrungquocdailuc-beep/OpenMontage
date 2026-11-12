@@ -568,11 +568,15 @@ def _innertube_client(name):
 
 
 def _fmt_height(f):
-    h = f.get("height")
-    if h:
-        return int(h)
+    """'Độ phân giải p' = CẠNH NGẮN của khung hình. Shorts dọc 360p là 360x640 → trả 360 (không phải 640).
+    Ưu tiên nhãn '360p' của YouTube; không có nhãn thì lấy min(width, height)."""
     m = re.match(r"(\d+)p", str(f.get("qualityLabel") or f.get("format_note") or ""))
-    return int(m.group(1)) if m else 0
+    if m:
+        return int(m.group(1))
+    w, h = int(f.get("width") or 0), int(f.get("height") or 0)
+    if w and h:
+        return min(w, h)
+    return h or w
 
 
 def pick_formats(progressive: list, adaptive: list) -> dict | None:
@@ -740,7 +744,7 @@ class Resolver:
                 continue
             vc, ac = str(f.get("vcodec") or "none"), str(f.get("acodec") or "none")
             ext = str(f.get("ext") or "")
-            d = {"itag": f.get("format_id"), "url": f["url"], "height": int(f.get("height") or 0),
+            d = {"itag": f.get("format_id"), "url": f["url"], "height": _fmt_height(f),
                  "mime": f"{'video' if vc != 'none' else 'audio'}/{ext}; codecs=\"{vc if vc != 'none' else ac}\"",
                  "clen": int(f.get("filesize") or 0), "bitrate": int((f.get("tbr") or 0) * 1000),
                  "is_video": vc != "none" and ac == "none", "is_audio": vc == "none" and ac != "none",

@@ -829,3 +829,21 @@ def test_stop_during_start_is_clean_and_restart_works(tmp_path, monkeypatch):
     e2.start(api=False, feed=False)                       # khoá đã nhả, cổng đã đóng
     assert e2.httpd is not None
     e2.stop()
+
+
+def test_vertical_shorts_360p_is_picked():
+    """Shorts dọc: itag 18 có width=360, height=640, qualityLabel '360p' → phải được chọn."""
+    data = {"playabilityStatus": {"status": "OK"},
+            "streamingData": {"formats": [{"itag": 18, "url": "https://x/18", "mimeType": 'video/mp4; codecs="avc1.42001E, mp4a.40.2"',
+                                           "qualityLabel": "360p", "width": 360, "height": 640, "contentLength": "9"}],
+                              "adaptiveFormats": [{"itag": 134, "url": "https://x/134", "mimeType": 'video/mp4; codecs="avc1"',
+                                                   "width": 360, "height": 640},
+                                                  {"itag": 135, "url": "https://x/135", "mimeType": 'video/mp4; codecs="avc1"',
+                                                   "qualityLabel": "480p", "width": 480, "height": 854}]}}
+    prog, adap = ws._innertube_formats(data)
+    p = ws.pick_formats(prog, adap)
+    assert p["kind"] == "progressive" and p["video"]["itag"] == 18
+    p = ws.pick_formats([], adap)
+    assert p["video"]["itag"] == 134
+    assert ws._fmt_height({"format_note": "360p", "width": 360, "height": 640}) == 360
+    assert ws._fmt_height({"width": 640, "height": 360}) == 360
