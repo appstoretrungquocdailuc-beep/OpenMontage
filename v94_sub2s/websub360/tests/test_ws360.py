@@ -1084,3 +1084,50 @@ def test_verification_replay_after_window_is_rejected(tmp_path):
     with pytest.raises(urllib.request.HTTPError):
         urllib.request.urlopen(f"http://127.0.0.1:{port}/websub?{q}", timeout=3)
     e.stop()
+
+
+def test_downtime_window_only_covers_the_outage(tmp_path):
+    make_excel(tmp_path / "check.xlsx", CH[:1])
+    db = ws.DB(tmp_path / "database.sqlite")
+    db.meta_set("last_alive", time.time() - 3 * 3600)
+    db.con.close()
+    e = make_engine(tmp_path, CH[:1], keep_excel=True)
+    e.channels = {CH[0]: [2]}
+    now = datetime.now(timezone.utc)
+    assert e.on_event(CH[0], "INOUTAGE001", "WEBSUB", now - timedelta(hours=2)) == "queued"     # đăng lúc tool tắt
+    assert e.on_event(CH[0], "BEFOREOUT01", "WEBSUB", now - timedelta(hours=5)) == "old"        # đăng TRƯỚC khi tắt → sửa video cũ
+
+
+def test_selftest_divert_ignores_old_edits_and_known_videos(tmp_path):
+    make_excel(tmp_path / "check.xlsx", CH[:1])
+    main = ws.DB(tmp_path / "database.sqlite")
+    main.x("INSERT INTO seen(video_id, channel_id, why, at) VALUES('KNOWNVID001', ?, 'x', 'x')", (CH[0],))
+    t = ws.Engine(dict(ws.DEFAULT_CONFIG, listen_port=0), tmp_path, ws.Log(tmp_path / "logs"), db_name="database_TEST.sqlite",
+                  lock_name="ws360_selftest.lock")
+    t.channels = {CH[0]: [2]}
+    t.inbox_db = main
+    t.handle_push(atom(CH[0], "OLDEDIT0001", datetime.now(timezone.utc) - timedelta(days=700)), time.perf_counter_ns())
+    t.handle_push(atom(CH[0], "KNOWNVID001", datetime.now(timezone.utc)), time.perf_counter_ns())
+    assert not main.one("SELECT 1 FROM videos WHERE video_id IN ('OLDEDIT0001','KNOWNVID001')")
+
+
+def test_failed_first_excel_read_never_unsubscribes(tmp_path):
+    hub = FakeHub()
+    port = _free_port()
+    cb = f"http://127.0.0.1:{port}/websub"
+    try:
+        e = make_engine(tmp_path, CH[:2], hub, listen_port=port, callback_url=cb, websub_loop_sec=0.3)
+        e.start(workers=False)
+        end = time.time() + 5
+        while time.time() < end and e.stats["websub_verified"] < 2:
+            time.sleep(0.1)
+        e.stop()
+        (tmp_path / "check.xlsx").write_bytes(b"not a zip")             # file tạm thời đọc lỗi (OneDrive/đang lưu…)
+        n0 = len(hub.reqs)
+        e2 = make_engine(tmp_path, CH[:2], hub, keep_excel=True, listen_port=port, callback_url=cb, websub_loop_sec=0.3)
+        e2.start(workers=False)
+        time.sleep(1.5)
+        assert not [q for q in hub.reqs[n0:] if q["hub.mode"] == "unsubscribe"]
+        e2.stop()
+    finally:
+        hub.close()

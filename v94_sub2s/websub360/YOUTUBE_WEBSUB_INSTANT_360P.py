@@ -979,7 +979,8 @@ class Engine:
             last_alive = float(self.db.meta_get("last_alive") or 0)
         except ValueError:
             last_alive = 0.0
-        self.offline_gap_s = max(0.0, time.time() - last_alive) if last_alive else 0.0
+        self.last_alive_at_start = last_alive or None   # thời điểm cuối cùng lần chạy trước còn sống
+        self.started_at = time.time()
         self.old_logged = set()
         self.inbox_db = None          # SELFTEST: push THẬT nhận nhầm → chuyển vào database.sqlite của tool chính
         self.sim_vids = set()         # SELFTEST: video id của sự kiện giả lập
@@ -1109,6 +1110,7 @@ class Engine:
         with self.ch_lock:
             old = set(self.channels)
             self.channels = chans
+            self.channels_loaded = True
         new = set(chans)
         added, removed = new - old, old - new
         if initial or added or removed:
@@ -1149,7 +1151,7 @@ class Engine:
             return "foreign"
         if published is not None:
             age = (now_utc() - published).total_seconds()
-            if age > self.max_age_window():
+            if not self.is_new_video(published):
                 # KHÔNG đánh dấu 'đã thấy' vĩnh viễn: chỉ ghi nhật ký để có thể xem lại
                 self.hub_event(ch, "push-old", "", None, 0, f"{vid} published {iso(published)} tuổi {int(age)}s")
                 with self.seen_lock:
@@ -1190,12 +1192,19 @@ class Engine:
         if enq_ms is not None:
             self.db.upd(vid, enqueue_ms=enq_ms)
 
-    def max_age_window(self) -> float:
-        """Cửa sổ 'video MỚI' = max(max_age_minutes, thời gian tool/webhook đã tắt trước lần chạy này + 10 phút), tối đa 24h.
-        Nhờ vậy push mà hub GỬI LẠI sau khi tool/ngrok tắt một lúc (video đăng trong lúc tắt) vẫn được tải."""
-        base = float(self.cfg.get("max_age_minutes", 30)) * 60
-        gap = getattr(self, "offline_gap_s", 0.0)
-        return min(max(base, gap + 600), 86400.0)
+    def is_new_video(self, published) -> bool:
+        """MỚI nếu: tuổi <= max_age_minutes, HOẶC được đăng ĐÚNG trong khoảng tool tắt (từ lần còn sống cuối −10 phút tới lúc
+        mở lại, tối đa 24h) — để push hub GỬI LẠI muộn sau khi tool/ngrok tắt vẫn được tải, mà sửa video cũ thì không."""
+        if published is None:
+            return True
+        age = (now_utc() - published).total_seconds()
+        if age <= float(self.cfg.get("max_age_minutes", 30)) * 60:
+            return True
+        la = self.last_alive_at_start
+        if la and age <= 86400:
+            t = published.timestamp()
+            return la - 600 <= t <= self.started_at
+        return False
 
     def _mark_seen(self, vid, ch, why):
         with self.seen_lock:
@@ -1662,6 +1671,11 @@ class Engine:
         ch, vid = e["channel_id"], e["video_id"]
         if not VID_RE.match(vid or "") or not self.monitored(ch):
             return
+        if not self.is_new_video(e["published"]):         # cùng bộ lọc như tool chính: sửa video cũ → bỏ
+            self.hub_event(ch, "push-old", "", None, 0, f"{vid} (SELFTEST, không chuyển)")
+            return
+        if self.inbox_db.one("SELECT 1 FROM videos WHERE video_id=? UNION SELECT 1 FROM seen WHERE video_id=?", (vid, vid)):
+            return                                         # tool chính đã biết video này
         pub = iso(e["published"]) if e["published"] else None
         okey = pub or iso()
         try:
@@ -1826,9 +1840,10 @@ class Engine:
             missing = [c for c in self.channels if not self.db.one("SELECT 1 FROM subs WHERE channel_id=?", (c,))]
             if renew or missing:
                 self.subscribe_all(renew + missing)
-            for r in self.db.all("SELECT channel_id, state FROM subs WHERE state NOT IN ('REMOVED','UNSUBSCRIBED')"):
-                if r["channel_id"] not in self.channels:          # kênh đã rời cột K (kể cả lúc tool tắt)
-                    self._unsubscribe(r["channel_id"])
+            if getattr(self, "channels_loaded", False) and self.channels:   # chỉ khi đã đọc Excel THÀNH CÔNG
+                for r in self.db.all("SELECT channel_id, state FROM subs WHERE state NOT IN ('REMOVED','UNSUBSCRIBED')"):
+                    if r["channel_id"] not in self.channels:          # kênh đã rời cột K (kể cả lúc tool tắt)
+                        self._unsubscribe(r["channel_id"])
             self.stats["websub_verified"] = self.verified_count()
             self.stats["webhook"] = f"{self.callback}"
             self.stop_ev.wait(float(self.cfg.get("websub_loop_sec", 30)))

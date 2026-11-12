@@ -41,11 +41,15 @@ Muốn biết chính xác, chạy **DIAG.bat → chọn 2** (tắt tool chính, 
 Channel ID, mã HTTP lúc gửi đăng ký, số lần gửi, các lần hub gọi xác minh (chấp nhận hoặc từ chối, kèm lý do),
 **trạng thái do chính hub Google báo** (State / Last verification error / Expiration), và trang kênh có tồn tại hay không.
 
+## Review đối kháng
+
+Riêng các thay đổi WebSub đã qua 2 vòng review: vòng 3 xác nhận 13 lỗi, vòng 4 xác nhận thêm 3 lỗi do chính các bản sửa gây ra. **Đã sửa cả 16, mỗi lỗi có test hồi quy.**
+
 ## Kết quả test
 
 | # | Bài test | Kết quả | Ghi chú |
 |---|---|---|---|
-| A | Bộ test tự động `tests/test_ws360.py` | **45/45 PASS**, chạy 3 lần liên tiếp đều qua | hub WebSub giả (đúng đặc tả), máy chủ video giả, Excel thật, ffmpeg thật |
+| A | Bộ test tự động `tests/test_ws360.py` | **48/48 PASS**, chạy 3 lần liên tiếp đều qua | hub WebSub giả (đúng đặc tả), máy chủ video giả, Excel thật, ffmpeg thật |
 | B | Chỉ dùng WebSub, không polling/API | **PASS** | |
 | C | Đăng ký → hub gọi xác minh → VERIFIED, lease 432000 s | **PASS** (hub giả) | hub thật: chạy SELFTEST / DIAG trên máy bạn |
 | D | Kênh hub không xác minh: không bao giờ tính là đã xác minh, tự gửi lại theo lịch | **PASS** | |
@@ -53,8 +57,9 @@ Channel ID, mã HTTP lúc gửi đăng ký, số lần gửi, các lần hub g�
 | F | Kênh bị xoá khỏi cột K lúc tool tắt → không được đếm, bị huỷ đăng ký | **PASS** | |
 | G | POST đúng chữ ký → hàng đợi tải + hàng đợi Excel; POST sai chữ ký bị chặn và ghi nhật ký | **PASS** | |
 | H | Tải 360p + ghi Excel song song (tải xong ngay cả khi Excel đang khoá) | **PASS** | |
-| I | Hub gửi lại push muộn sau khi tool/ngrok tắt → vẫn tải; sửa video cũ (đăng 3 ngày trước) → không tải | **PASS** | |
-| J | Push THẬT tới đúng lúc SELFTEST đang giữ cổng → chuyển sang database của tool chính, tool chính tải khi mở lại | **PASS** | |
+| I | Hub gửi lại push muộn: video đăng ĐÚNG lúc tool tắt → vẫn tải; video đăng trước đó hoặc sửa video cũ → không tải | **PASS** | |
+| I2 | Lần đọc Excel đầu bị lỗi (OneDrive/đang lưu) → KHÔNG huỷ đăng ký kênh nào | **PASS** | |
+| J | Push THẬT tới đúng lúc SELFTEST đang giữ cổng → chuyển sang database của tool chính, tool chính tải khi mở lại (sửa video cũ / video đã biết thì không chuyển) | **PASS** | |
 | K | SELFTEST khi tool chính đang chạy: không gửi gì lên hub | **PASS** | |
 | L | SELFTEST không sửa `check.xlsx` gốc (so hash SHA-256) | **PASS** | |
 | M | SELFTEST trên Windows của bạn với YouTube thật (bản trước, cùng bộ tải) | **PASS**: TỔNG **1352 ms**, tải 900 ms, verify 112 ms, Excel 34 ms | bộ tải 360p **không đổi** trong bản này |
