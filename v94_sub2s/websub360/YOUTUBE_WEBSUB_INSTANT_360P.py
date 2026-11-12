@@ -209,10 +209,14 @@ def pct(vals, p):
 
 
 def find_tool(name):
-    for cand in (BASE_DIR / f"{name}.exe", BASE_DIR / "bin" / f"{name}.exe", BASE_DIR / name):
-        if cand.exists():
+    """Chỉ nhận FILE chạy được (không nhận nhầm THƯ MỤC tên 'ffmpeg'). Thứ tự: cạnh tool, bin/, ffmpeg/bin/, ffmpeg/, PATH."""
+    exe = f"{name}.exe" if os.name == "nt" else name
+    for cand in (BASE_DIR / exe, BASE_DIR / "bin" / exe, BASE_DIR / "ffmpeg" / "bin" / exe, BASE_DIR / "ffmpeg" / exe,
+                 BASE_DIR / name):
+        if cand.is_file():
             return str(cand)
-    return shutil.which(name)
+    w = shutil.which(name)
+    return w if w and os.path.isfile(w) else None
 
 
 FFMPEG = find_tool("ffmpeg")
@@ -1849,12 +1853,16 @@ class Engine:
                 for exe in (FFPROBE, FFMPEG):
                     if exe:
                         t0 = time.perf_counter_ns()
+                        err = ""
                         try:
-                            subprocess.run([exe, "-hide_banner", "-version"], capture_output=True, timeout=10, creationflags=flags)
-                        except Exception:
-                            pass
+                            pr = subprocess.run([exe, "-hide_banner", "-version"], capture_output=True, timeout=10, creationflags=flags)
+                            if pr.returncode != 0:
+                                err = f"mã lỗi {pr.returncode}"
+                        except Exception as e:  # noqa: BLE001
+                            err = f"{type(e).__name__}: {e}"
                         if first:
-                            self.log(f"🔥 làm nóng {Path(exe).name}: {ms(t0, time.perf_counter_ns()):.0f} ms")
+                            self.log(f"🔥 làm nóng {exe}: {ms(t0, time.perf_counter_ns()):.0f} ms" +
+                                     (f" | ❌ KHÔNG CHẠY ĐƯỢC ({err}) — video cần ghép hình+tiếng sẽ lỗi" if err else ""))
                 first = False
             self.stop_ev.wait(20)
 
