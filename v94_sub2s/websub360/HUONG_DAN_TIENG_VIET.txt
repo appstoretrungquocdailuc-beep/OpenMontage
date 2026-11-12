@@ -108,6 +108,22 @@ Mỗi POST bị từ chối được lưu NGUYÊN VẸN (body + header) trong lo
 KIEM_TRA_POST.bat kiểm tra lại POST bị từ chối gần nhất với secret hiện tại và các secret cũ, rồi cho biết khớp cái nào
 (chỉ in dấu vân tay, không in secret).
 
+ĐO TỪNG BƯỚC TẢI 360P (BENCH360.bat)
+------------------------------------
+Mỗi video tải xong, log có 1 dòng "⏱️ BƯỚC <video>" ghi:
+  DB_VERIFYING_MS (ghi SQLite, gồm thời gian chờ khoá + tên luồng đang giữ khoá nếu phải chờ), PRE_VERIFY_GAP_MS,
+  FFPROBE_MS, RENAME_MS, POST_VERIFY_GAP_MS, và "lệch tổng" (phải ≈ 0: các bước cộng lại khớp total_ms; TTFB nằm
+  TRONG thời gian tải, không cộng 2 lần). Bước nào > 50 ms được đánh dấu "⚠️ CHẬM".
+BENCH360.bat: nhập 1–2 Shorts → chạy 10 lượt đúng đường tải thật (lấy link mới mỗi lượt, có ffprobe + SQLite),
+in median/p90 từng bước, ghi BENCH360.csv. Không đụng Excel, database hay file tải thật.
+
+KHÔNG ĐỔI TÊN FILE (atomic_rename = false, mặc định theo yêu cầu)
+----------------------------------------------------------------
+Video được tải THẲNG vào DOWNLOADS\<kênh>\<video>_360p.mp4. Chỉ đánh dấu DONE khi ffprobe đạt VÀ dung lượng đúng bằng
+dung lượng YouTube báo. Lỗi → xoá file. Tắt giữa chừng → lần sau phát hiện file thiếu dung lượng và tải lại.
+Lưu ý: trong lúc tải (khoảng 1 giây), file đã xuất hiện nhưng chưa đủ. Tool đăng TikTok của bạn có bước chờ file
+"đứng yên" (TAM_STABLE_MS) nên không đăng file dở. Muốn file chỉ xuất hiện khi đã đủ: đặt "atomic_rename": true.
+
 BENCHMARK.bat (tuỳ chọn)
 ------------------------
 Nhập 2 ID video (1 ngắn, 1 dài). Tool thử 1 GET và Range x4/x8/x12/x16, rồi ghi BENCHMARK.csv.

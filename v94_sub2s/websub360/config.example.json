@@ -36,5 +36,6 @@
     1800,
     3600
   ],
+  "atomic_rename": false,
   "callback_generation": true
 }

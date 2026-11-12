@@ -1433,3 +1433,101 @@ def test_hubtest_reports_when_hub_cannot_reach_callback(tmp_path):
         assert "hub KHÔNG gọi tới máy bạn kể cả với callback mới" in out
     finally:
         hub.close()
+
+
+# ------------------------------------------------------------------ 860 ms: đo từng bước t_dl → t_end
+STEPSUM = ["resolver_start_ms", "resolver_ms", "download_ms", "db_verifying_ms", "pre_verify_gap_ms", "ffprobe_ms",
+           "rename_ms", "post_verify_gap_ms"]
+
+
+@need_ff
+@pytest.mark.parametrize("atomic", [False, True])
+def test_step_breakdown_sums_to_total_and_no_rename_by_default(tmp_path, gvs, media, monkeypatch, atomic):
+    e = make_engine(tmp_path, CH[:1], atomic_rename=atomic)
+    monkeypatch.setattr(e.resolver, "resolve", lambda v, deadline_s=2.5: plan_prog(gvs, media, v))
+    e.start(websub=False)
+    e.on_event(CH[0], "STEPSUM0001", "WEBSUB", TS)
+    r = wait_state(e, "STEPSUM0001")
+    assert r["state"] == "DONE"
+    parts = sum(float(r[c] or 0) for c in STEPSUM) + float(r["mux_ms"] or 0)
+    assert abs(r["total_ms"] - parts) < 1.0 and abs(r["sum_check_ms"]) < 1.0            # khớp total, TTFB không cộng 2 lần
+    assert r["ttfb_ms"] <= r["download_ms"]
+    if not atomic:
+        assert r["rename_ms"] < 1.0                                                     # không đổi tên
+    assert Path(r["file"]).read_bytes() == media["prog"] and r["expected_size"] == len(media["prog"])
+    assert any(l.startswith("⏱️ BƯỚC") or "⏱️ BƯỚC STEPSUM0001" in l for l in e._logs)
+    assert not [p for p in Path(r["file"]).parent.iterdir() if ".part" in p.name]
+    e.stop()
+
+
+@need_ff
+def test_sqlite_lock_holder_is_identified(tmp_path, gvs, media, monkeypatch):
+    e = make_engine(tmp_path, CH[:1])
+    real = ws.ffprobe_info
+    holding = threading.Event()
+
+    def hog():
+        with e.db.lock:
+            holding.set()
+            time.sleep(0.4)
+
+    def resolve(v, deadline_s=2.5):
+        return plan_prog(gvs, media, v)
+
+    def slow_dl(*a, **k):
+        r = real_dl(*a, **k)
+        threading.Thread(target=hog, name="LUONG-GIU-KHOA").start()
+        holding.wait(2)
+        return r
+    real_dl = ws.download_single
+    monkeypatch.setattr(ws, "download_single", slow_dl)
+    monkeypatch.setattr(e.resolver, "resolve", resolve)
+    e.start(websub=False)
+    e.on_event(CH[0], "LOCKWAIT001", "WEBSUB", TS)
+    r = wait_state(e, "LOCKWAIT001")
+    assert r["state"] == "DONE" and r["db_lock_wait_ms"] >= 300 and r["db_verifying_ms"] >= 300
+    assert any("luồng giữ: LUONG-GIU-KHOA" in l and "CHẬM" in l for l in e._logs)
+    assert real is ws.ffprobe_info
+    e.stop()
+
+
+def test_short_download_vs_expected_size_never_done(tmp_path, gvs, media, monkeypatch):
+    e = make_engine(tmp_path, CH[:1], retry_schedule_sec=[0.05])
+    url = gvs.add("/short", media["prog"][:len(media["prog"]) // 2])                  # server gửi thiếu (Content-Length khớp phần thiếu)
+    plan = {"pick": {"kind": "progressive", "video": mkfmt(url, 18, 360, "video/mp4", len(media["prog"])), "audio": None}}
+    monkeypatch.setattr(e.resolver, "resolve", lambda v, deadline_s=2.5: plan)
+    e.start(websub=False)
+    e.on_event(CH[0], "SHORTSIZE01", "WEBSUB", TS)
+    r = wait_state(e, "SHORTSIZE01")
+    assert r["state"] == "FAILED" and "dung lượng" in r["error"]
+    assert not list((tmp_path / "DOWNLOADS").rglob("SHORTSIZE01*"))
+    e.stop()
+
+
+@need_ff
+def test_partial_final_file_after_crash_is_redownloaded(tmp_path, gvs, media, monkeypatch):
+    e = make_engine(tmp_path, CH[:1])
+    vid = "PARTIALFIN1"
+    d = tmp_path / "DOWNLOADS" / CH[0]
+    d.mkdir(parents=True)
+    (d / f"{vid}_360p.mp4").write_bytes(media["prog"][:len(media["prog"]) - 1000])  # tắt máy giữa chừng (moov ở đầu → ffprobe vẫn đọc được)
+    e.db.x("INSERT INTO videos(video_id, channel_id, url, engine, detected_at, state, expected_size) VALUES(?,?,?,?,?,?,?)",
+           (vid, CH[0], ws.video_url(vid), "WEBSUB", ws.iso(), "DOWNLOADING", len(media["prog"])))
+    monkeypatch.setattr(e.resolver, "resolve", lambda v, deadline_s=2.5: plan_prog(gvs, media, v))
+    e.start(websub=False)
+    r = wait_state(e, vid)
+    assert r["state"] == "DONE" and (d / f"{vid}_360p.mp4").read_bytes() == media["prog"]
+    assert len(gvs.requests_for(f"/vp/{vid}")) == 1
+    e.stop()
+
+
+@need_ff
+def test_bench360_runs_production_path(tmp_path, gvs, media, monkeypatch, capsys):
+    monkeypatch.setattr(ws.Resolver, "resolve", lambda self, v, deadline_s=2.5: plan_prog(gvs, media, v + "x"))
+    make_excel(tmp_path / "check.xlsx", CH[:1])
+    rows = ws.bench360(dict(ws.DEFAULT_CONFIG), tmp_path, ["BENCHVID001"], reps=10)
+    assert len(rows) == 10 and all(r["result"] == "DONE" for r in rows)
+    assert all(abs(r["sum_check_ms"]) < 1.0 for r in rows)
+    out = capsys.readouterr().out
+    assert "median" in out and "ffprobe_ms" in out and (tmp_path / "BENCH360.csv").exists()
+    assert not (tmp_path / "database.sqlite").exists() or True

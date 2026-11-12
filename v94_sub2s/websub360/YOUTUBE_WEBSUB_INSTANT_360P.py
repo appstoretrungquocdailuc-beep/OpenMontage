@@ -98,6 +98,8 @@ DEFAULT_CONFIG = {
     "max_concurrent_downloads": 3,
     "v9_path": "",                     # đường dẫn V9_4_SUB2S.py (chỉ dùng để benchmark so sánh)
     "verify_retry_sec": [120, 300, 600, 1800, 3600],   # hub chưa gọi xác minh sau X s → gửi lại (giãn dần)
+    "atomic_rename": False,            # False (theo yêu cầu): tải THẲNG vào VIDEO_ID_360p.mp4, không đổi tên;
+                                       # True: tải vào .part rồi os.replace (chậm hơn trên Windows có Defender)
     "callback_generation": True,       # callback = …/websub?g=<dấu vân tay secret>: đổi secret ⇒ thuê bao MỚI hoàn toàn
 }
 
@@ -261,6 +263,38 @@ class Log:
 
 
 # =============================== SQLITE =============================== #
+class _TimedLock:
+    """RLock có đo THỜI GIAN CHỜ và ghi lại LUỒNG đang giữ — để biết chắc SQLite có làm chậm đường nóng hay không."""
+
+    def __init__(self):
+        self._l = threading.RLock()
+        self.holder = None
+        self.since = 0
+        self.depth = 0
+        self.last_wait_ms = 0.0
+        self.last_holder_seen = None
+
+    def __enter__(self):
+        t0 = time.perf_counter_ns()
+        h = self.holder
+        self._l.acquire()
+        w = (time.perf_counter_ns() - t0) / 1e6
+        self.depth += 1
+        if self.depth == 1:
+            self.holder = threading.current_thread().name
+            self.since = time.perf_counter_ns()
+        self.last_wait_ms = w
+        self.last_holder_seen = h if w > 1 else None
+        return self
+
+    def __exit__(self, *a):
+        self.depth -= 1
+        if self.depth == 0:
+            self.holder = None
+        self._l.release()
+        return False
+
+
 class DB:
     SCHEMA = """
     PRAGMA journal_mode=WAL;
@@ -285,12 +319,18 @@ class DB:
 
     def __init__(self, path: Path):
         self.path = path
-        self.lock = threading.RLock()
+        self.lock = _TimedLock()
         self.con = sqlite3.connect(str(path), check_same_thread=False, isolation_level=None, timeout=30)
         self.con.row_factory = sqlite3.Row
         with self.lock:
             self.con.executescript(self.SCHEMA)
             self.con.execute("PRAGMA synchronous=NORMAL")
+            for col in ("db_verifying_ms", "db_lock_wait_ms", "pre_verify_gap_ms", "ffprobe_ms", "rename_ms",
+                        "post_verify_gap_ms", "sum_check_ms", "expected_size", "db_resolving_ms", "db_downloading_ms"):
+                try:
+                    self.con.execute(f"ALTER TABLE videos ADD COLUMN {col} REAL")
+                except sqlite3.OperationalError:
+                    pass
             for alter in ("ALTER TABLE excel_jobs ADD COLUMN order_key TEXT",     # nâng cấp DB cũ
                           "ALTER TABLE subs ADD COLUMN attempts INTEGER DEFAULT 0",
                           "ALTER TABLE subs ADD COLUMN last_http INTEGER",
@@ -333,10 +373,15 @@ class DB:
         self.x("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, str(v)))
 
     def upd(self, vid, **kw):
+        """Trả (tổng ms, ms chờ khoá, luồng đang giữ khoá khi phải chờ) để đo đường nóng."""
         if not kw:
-            return
+            return (0.0, 0.0, None)
         cols = ", ".join(f"{k}=?" for k in kw)
-        self.x(f"UPDATE videos SET {cols} WHERE video_id=?", (*kw.values(), vid))
+        t0 = time.perf_counter_ns()
+        with self.lock as lk:
+            wait, holder = lk.last_wait_ms, lk.last_holder_seen
+            self.con.execute(f"UPDATE videos SET {cols} WHERE video_id=?", (*kw.values(), vid))
+        return ((time.perf_counter_ns() - t0) / 1e6, wait, holder)
 
 
 # =============================== EXCEL =============================== #
@@ -897,6 +942,18 @@ def ffprobe_info(path: Path) -> dict:
             "acodec": (a[0].get("codec_name") if a else None)}
 
 
+def _replace_retry(src: Path, dst: Path, budget_s=3.0):
+    """os.replace có thử lại khi Windows báo đang bị giữ (Defender/indexer đang quét file vừa ghi)."""
+    end = time.time() + budget_s
+    while True:
+        try:
+            return os.replace(src, dst)
+        except PermissionError:
+            if time.time() > end:
+                raise
+            time.sleep(0.02)
+
+
 class _AnyEvent:
     """is_set() đúng khi BẤT KỲ event nào được đặt (huỷ theo job hoặc dừng toàn tool)."""
 
@@ -1320,6 +1377,9 @@ class Engine:
             final = self.dl_dir / ch / f"{vid}_360p.mp4"
             if final.exists():
                 v = ffprobe_info(final)
+                exp = row["expected_size"] if row and "expected_size" in row.keys() else None
+                if exp and final.stat().st_size != int(exp):   # file dở do tắt giữa chừng (tải thẳng, không .part)
+                    v = dict(v, ok=False)
                 if v["ok"]:
                     self.db.upd(vid, state="DONE", file=str(final), size=final.stat().st_size, error=None)
                     self.log(f"✅ {vid} đã có file hợp lệ — không tải lại")
@@ -1330,22 +1390,28 @@ class Engine:
             k = {}
             if job.get("t_recv_ns"):
                 k["resolver_start_ms"] = ms(job["t_recv_ns"], t_start)
-            self.db.upd(vid, state="RESOLVING", attempts=attempts + 1, **k)
+            db_res = self.db.upd(vid, state="RESOLVING", attempts=attempts + 1, **k)
             tag = f"{vid}.a{attempts + 1}"                # tên tạm RIÊNG cho từng lần thử
             tmpdir = final.parent
             plan = self.resolver.resolve(vid)
             t_res = time.perf_counter_ns()
             pick = plan["pick"]
-            self.db.upd(vid, state="DOWNLOADING", resolver_ms=ms(t_start, t_res), kind=pick["kind"],
-                        itags=",".join(str(f["itag"]) for f in (pick["video"], pick["audio"]) if f),
-                        download_started_at=iso())
+            exp_size = int(pick["video"].get("clen") or 0) if pick["kind"] == "progressive" else 0
+            db_dl = self.db.upd(vid, state="DOWNLOADING", resolver_ms=ms(t_start, t_res), kind=pick["kind"],
+                                itags=",".join(str(f["itag"]) for f in (pick["video"], pick["audio"]) if f),
+                                download_started_at=iso(), expected_size=exp_size or None)
             info_v, info_a = {}, {}
             mux_ms = None
             n = int(self.cfg.get("range_connections", 1))
-            out_tmp = tmpdir / f".{tag}.part.mp4"
+            atomic = bool(self.cfg.get("atomic_rename", False))
+            # atomic_rename=False (mặc định theo yêu cầu): ghi THẲNG vào tên cuối; DONE chỉ sau ffprobe + đúng dung lượng;
+            # lỗi → xoá file. atomic_rename=True: ghi .part rồi os.replace.
+            out_tmp = (tmpdir / f".{tag}.part.mp4") if atomic else final
             parts.append(out_tmp)
             if pick["kind"] == "progressive":
                 self._fetch(pick["video"], out_tmp, info_v, n, cancel)
+                if exp_size and out_tmp.stat().st_size != exp_size:
+                    raise IOError(f"dung lượng {out_tmp.stat().st_size} ≠ {exp_size} byte YouTube báo")
             else:
                 vtmp = tmpdir / f".{tag}.part.v"
                 atmp = tmpdir / f".{tag}.part.a"
@@ -1369,25 +1435,46 @@ class Engine:
                 if not FFMPEG:
                     raise Fatal("cần ffmpeg để ghép/đóng gói 360p DASH")
                 mux_ms = ffmpeg_mux(vtmp, atmp if pick["audio"] else None, out_tmp)
-            t_dl = time.perf_counter_ns()
-            self.db.upd(vid, state="VERIFYING")
-            t_v0 = time.perf_counter_ns()
+            t_dl = time.perf_counter_ns()                                  # tải (và ghép) xong
+            t_db0 = time.perf_counter_ns()
+            db_v = self.db.upd(vid, state="VERIFYING")                     # DB_VERIFYING (gồm chờ khoá)
+            t_db1 = time.perf_counter_ns()
+            t_v0 = time.perf_counter_ns()                                  # PRE_VERIFY_GAP = t_db1→t_v0
             v = ffprobe_info(out_tmp)
-            verify_ms = ms(t_v0, time.perf_counter_ns())
+            t_v1 = time.perf_counter_ns()                                  # FFPROBE = t_v0→t_v1
+            verify_ms = ms(t_v0, t_v1)
             if not v["ok"]:
                 raise IOError(f"ffprobe: file hỏng ({v})")
             if not v.get("audio"):
                 self.log(f"⚠️ {vid}: nguồn không có luồng tiếng ({pick['kind']}) — giữ file chỉ có hình")
             if pick["kind"] == "dash" and pick["audio"] and not v.get("audio"):
                 raise IOError("ghép xong nhưng không có audio")
-            os.replace(out_tmp, final)
+            t_r0 = time.perf_counter_ns()
+            if out_tmp != final:
+                _replace_retry(out_tmp, final)                              # RENAME = t_r0→t_r1 (chỉ khi atomic_rename)
+            parts = [p for p in parts if p != final]                       # thành công: KHÔNG xoá file cuối
+            t_r1 = time.perf_counter_ns()
             t_end = time.perf_counter_ns()
             size = final.stat().st_size
             dl_ms = ms(t_res, t_dl) - (mux_ms or 0)
             total = ms(job["t_recv_ns"], t_end) if job.get("t_recv_ns") else ms(t_start, t_end)
+            steps = {"db_verifying_ms": ms(t_db0, t_db1), "db_lock_wait_ms": db_v[1], "pre_verify_gap_ms": ms(t_db1, t_v0),
+                     "ffprobe_ms": verify_ms, "rename_ms": ms(t_r0, t_r1),
+                     "post_verify_gap_ms": round(ms(t_v1, t_r0) + ms(t_r1, t_end), 3),
+                     "db_resolving_ms": db_res[0], "db_downloading_ms": db_dl[0]}
+            parts_sum = (ms(job["t_recv_ns"], t_start) if job.get("t_recv_ns") else 0) + ms(t_start, t_res) + dl_ms + \
+                (mux_ms or 0) + steps["db_verifying_ms"] + steps["pre_verify_gap_ms"] + steps["ffprobe_ms"] + \
+                steps["post_verify_gap_ms"] + steps["rename_ms"]
+            steps["sum_check_ms"] = round(total - parts_sum, 3)            # phải ≈ 0: tổng các bước khớp total_ms
             mbps = round(size * 8 / 1e6 / max(1e-3, (info_v.get("elapsed_ms") or dl_ms) / 1000), 1)
             self.db.upd(vid, state="DONE", file=str(final), size=size, ttfb_ms=info_v.get("ttfb_ms"), download_ms=dl_ms,
-                        mux_ms=mux_ms, verify_ms=verify_ms, total_ms=total, done_at=iso(), error=None, mbps=mbps)
+                        mux_ms=mux_ms, verify_ms=verify_ms, total_ms=total, done_at=iso(), error=None, mbps=mbps, **steps)
+            slow = [f"{k}={v_:.0f}" for k, v_ in steps.items() if isinstance(v_, (int, float)) and abs(v_) > 50]
+            self.log(f"⏱️ BƯỚC {vid} | DB_VERIFYING_MS {steps['db_verifying_ms']:.1f} (chờ khoá {db_v[1]:.1f}"
+                     f"{', luồng giữ: ' + str(db_v[2]) if db_v[2] else ''}) | PRE_VERIFY_GAP_MS {steps['pre_verify_gap_ms']:.2f} | "
+                     f"FFPROBE_MS {steps['ffprobe_ms']:.1f} | RENAME_MS {steps['rename_ms']:.1f} | "
+                     f"POST_VERIFY_GAP_MS {steps['post_verify_gap_ms']:.2f} | DB resolving {db_res[0]:.1f} / downloading "
+                     f"{db_dl[0]:.1f} | lệch tổng {steps['sum_check_ms']:.3f}" + (f" | ⚠️ CHẬM: {', '.join(slow)}" if slow else ""))
             self.stats["done"] += 1
             self.stats["speed_mbps"] = mbps
             self.stats["last"] = {"vid": vid, "resolver_ms": ms(t_start, t_res), "download_ms": dl_ms, "mux_ms": mux_ms,
@@ -2678,6 +2765,53 @@ def verify_post(cfg, base, path) -> dict:
     return res
 
 
+STEP_COLS = ["resolver_start_ms", "db_resolving_ms", "resolver_ms", "db_downloading_ms", "ttfb_ms", "download_ms", "mux_ms",
+             "db_verifying_ms", "db_lock_wait_ms", "pre_verify_gap_ms", "ffprobe_ms", "rename_ms", "post_verify_gap_ms",
+             "total_ms", "sum_check_ms"]
+
+
+def bench360(cfg, base, ids, reps=10):
+    """Đo ĐÚNG đường tải thật của tool (Engine.process: resolve → tải → ffprobe → DONE, có SQLite) N lượt / video.
+    Mỗi lượt: xoá file + bản ghi, lấy link MỚI. Ghi BENCH360.csv và in median/p90 từng bước. Không đụng Excel/DB thật."""
+    log = Log(base / "logs")
+    bcfg = dict(cfg, download_dir="DOWNLOADS_BENCH", excel_enabled=False)
+    eng = Engine(bcfg, base, log, db_name="database_BENCH.sqlite", lock_name="ws360_bench.lock")
+    eng.resolver.warm()
+    if FFPROBE:
+        subprocess.run([FFPROBE, "-version"], capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    rows = []
+    for vid in ids:
+        for rep in range(reps):
+            eng.db.x("DELETE FROM videos WHERE video_id=?", (vid,))
+            for f in (eng.dl_dir).rglob(f"{vid}_360p.mp4"):
+                f.unlink(missing_ok=True)
+            ch = "UCBENCH" + "0" * 17
+            t = time.perf_counter_ns()
+            eng.db.x("INSERT INTO videos(video_id, channel_id, url, engine, detected_at, state) VALUES(?,?,?,?,?,?)",
+                     (vid, ch, video_url(vid), "BENCH", iso(), "QUEUED"))
+            r = eng.process({"vid": vid, "ch": ch, "t_recv_ns": t, "t_enq_ns": t})
+            row = dict(eng.db.one("SELECT * FROM videos WHERE video_id=?", (vid,)))
+            row.update(rep=rep, result=r)
+            rows.append(row)
+            log(f"BENCH360 {vid} #{rep + 1}/{reps}: {r} total {row.get('total_ms')} ms | " +
+                " ".join(f"{k}={row.get(k)}" for k in STEP_COLS[:-2]))
+    out = base / "BENCH360.csv"
+    with open(out, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["video_id", "rep", "result", "size", "kind"] + STEP_COLS)
+        for r in rows:
+            w.writerow([r["video_id"], r["rep"], r["result"], r.get("size"), r.get("kind")] + [r.get(c) for c in STEP_COLS])
+    ok = [r for r in rows if r["result"] == "DONE"]
+    print(f"\nBENCH360: {len(ok)}/{len(rows)} lượt DONE → {out}")
+    print(f"{'bước':<22}{'median':>10}{'p90':>10}{'max':>10}   (ms; lượt #1 mỗi video là lượt 'nguội')")
+    for c in STEP_COLS:
+        vals = [float(r[c]) for r in ok if r.get(c) is not None]
+        if vals:
+            print(f"{c:<22}{pct(vals, 50):>10.1f}{pct(vals, 90):>10.1f}{max(vals):>10.1f}")
+    shutil.rmtree(eng.dl_dir, ignore_errors=True)
+    return rows
+
+
 def bench(cfg, base, ids, reps=3):
     """TEST 4 trên máy thật: mỗi lần chạy RESOLVE LẠI (không dùng link cũ), thử nhiều cấu hình tải, ghi BENCHMARK.csv."""
     log = Log(base / "logs")
@@ -2763,6 +2897,7 @@ def main(argv=None):
     ap.add_argument("--resubscribe", action="store_true", help="dùng với --diag: đăng ký lại cả danh sách rồi chờ hub xác minh")
     ap.add_argument("--verify-post", default="", help="kiểm lại 1 request bị từ chối đã lưu trong logs/rejected_posts")
     ap.add_argument("--hubtest", action="store_true", help="kiểm tra sâu hub (đăng ký đồng bộ + callback thử) → HUBTEST_REPORT.md")
+    ap.add_argument("--bench360", nargs="*", help="đo đường tải thật N lượt/video → BENCH360.csv (median/p90 từng bước)")
     a = ap.parse_args(argv)
     base = BASE_DIR
     os.chdir(base)
@@ -2773,6 +2908,9 @@ def main(argv=None):
             print(f"⚠️ '{a.video}' không phải ID/link video YouTube hợp lệ — bỏ qua TEST3")
         r = selftest(cfg, base, vid)
         return 0 if all(s != "FAIL" for _, s, _ in r) else 1
+    if a.bench360 is not None:
+        bench360(cfg, base, [v for v in (extract_vid(x) for x in a.bench360) if v], max(1, a.reps if a.reps != 3 else 10))
+        return 0
     if a.hubtest:
         hubtest(cfg, base)
         return 0

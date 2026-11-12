@@ -109,6 +109,28 @@ hub.challenge) / `health-get` (GET không có challenge, ví dụ DIAG hay trìn
 được làm bằng **DIAG.bat → 3 (`--hubtest`)** trên máy bạn. Test với hub giả theo đặc tả: sync thành công thì 204;
 hub không gọi tới được thì 409 kèm lý do, và báo cáo kết luận đúng.
 
+## 860 ms không giải thích được (video IU5CqGkeK2k)
+
+**Đối chiếu code:** total_ms = (nhận push → bắt đầu lấy link) + lấy link + tải (đã gồm TTFB) + **[tải xong → kết thúc]**.
+Bản cũ chỉ đo ffprobe trong đoạn cuối. 5.4 + 516.2 + 796.9 + 53.2 = 1371.7, nên 860.1 ms nằm trong 3 thao tác chưa được
+đo: `db.upd(state="VERIFYING")` (gồm chờ khoá), các bước kiểm tra, và `os.replace`.
+
+**Không tái hiện được trên máy test.** Bench 10 lượt (Linux, máy chủ giả có TTFB 500 ms, 40 Mbps): db_verifying 0.1 ms,
+rename 0.0–0.9 ms, các khoảng hở 0.0 ms, lệch tổng 0.0 ms. Các lần SELFTEST trên Windows trước đó (1352 ms, 1476 ms,
+1980 ms) cũng không có khoảng hở: các bước cộng lại khớp tổng. Khoảng 860 ms chỉ xuất hiện ở lần chạy đó trên máy bạn.
+Hai ứng viên: Windows Defender giữ thao tác đổi tên file .mp4 vừa ghi, hoặc SQLite chờ khoá/checkpoint.
+
+**Đã làm:**
+1. Đo riêng từng thao tác bằng perf_counter_ns và lưu vào database + log `⏱️ BƯỚC`: DB_VERIFYING_MS (kèm thời gian chờ
+   khoá và TÊN LUỒNG đang giữ khoá), PRE_VERIFY_GAP_MS, FFPROBE_MS, RENAME_MS, POST_VERIFY_GAP_MS, và độ lệch tổng
+   (`sum_check_ms` ≈ 0). Có test kiểm tổng khớp, và test giả lập luồng khác giữ khoá SQLite 400 ms: log ghi đúng tên luồng.
+2. **Bỏ đổi tên theo yêu cầu** (`atomic_rename=false`): tải thẳng vào tên cuối. Toàn vẹn: DONE chỉ khi ffprobe đạt VÀ
+   đúng dung lượng YouTube báo; tải thiếu → FAILED + xoá file; tắt giữa chừng → phát hiện file thiếu dung lượng và tải lại
+   (đều có test). Bật lại đổi tên: `atomic_rename=true` (có thử lại khi Windows báo file đang bị giữ).
+3. `--bench360` / BENCH360.bat: 10 lượt trên đúng đường tải thật, median/p90 từng bước.
+
+**Số đo 10 lượt Shorts THẬT: PENDING.** Máy test không vào được YouTube. Chạy BENCH360.bat trên máy bạn.
+
 ## Review đối kháng
 
 Riêng các thay đổi WebSub đã qua 2 vòng review: vòng 3 xác nhận 13 lỗi, vòng 4 xác nhận thêm 3 lỗi do chính các bản sửa gây ra. **Đã sửa cả 16, mỗi lỗi có test hồi quy.**
@@ -117,7 +139,7 @@ Riêng các thay đổi WebSub đã qua 2 vòng review: vòng 3 xác nhận 13 l
 
 | # | Bài test | Kết quả | Ghi chú |
 |---|---|---|---|
-| A | Bộ test tự động `tests/test_ws360.py` | **61/61 PASS**, chạy 3 lần liên tiếp đều qua | hub WebSub giả (đúng đặc tả), máy chủ video giả, Excel thật, ffmpeg thật |
+| A | Bộ test tự động `tests/test_ws360.py` | **67/67 PASS**, chạy 3 lần liên tiếp đều qua | hub WebSub giả (đúng đặc tả), máy chủ video giả, Excel thật, ffmpeg thật |
 | B | Chỉ dùng WebSub, không polling/API | **PASS** | |
 | C | Đăng ký → hub gọi xác minh → VERIFIED, lease 432000 s | **PASS** (hub giả) | hub thật: chạy SELFTEST / DIAG trên máy bạn |
 | D | Kênh hub không xác minh: không bao giờ tính là đã xác minh, tự gửi lại theo lịch | **PASS** | |
