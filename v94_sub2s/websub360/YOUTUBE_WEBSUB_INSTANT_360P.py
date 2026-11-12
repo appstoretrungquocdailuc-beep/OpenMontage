@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-YOUTUBE WEBSUB INSTANT 360P — phát hiện video mới (WebSub + Data API + Atom feed) → TẢI 360P NGAY
+YOUTUBE WEBSUB INSTANT 360P — phát hiện video mới CHỈ bằng WebSub/PubSubHubbub → TẢI 360P NGAY
                                  và GHI URL VÀO EXCEL (cột D theo Channel ID cột K) SONG SONG.
 
 Đường nóng:  sự kiện hợp lệ → chống trùng (SQLite + RAM) → HÀNG ĐỢI TẢI ƯU TIÊN  ┐  (độc lập)
@@ -14,13 +14,13 @@ Chạy:   python YOUTUBE_WEBSUB_INSTANT_360P.py              (giao diện PySide
         python YOUTUBE_WEBSUB_INSTANT_360P.py --headless   (không giao diện)
         python YOUTUBE_WEBSUB_INSTANT_360P.py --selftest [--video ID]   (TEST 1–3, 5 → TEST_REPORT.md)
         python YOUTUBE_WEBSUB_INSTANT_360P.py --bench ID [ID ...] [--reps 3]  (TEST 4 → BENCHMARK.csv)
+        python YOUTUBE_WEBSUB_INSTANT_360P.py --diag [--resubscribe]   (chẩn đoán từng kênh WebSub → DIAG_REPORT.md)
 
-Không in API key / secret / URL media có chữ ký ra log.
+Không in secret WebSub / URL media có chữ ký ra log.
 """
 from __future__ import annotations
 
 import argparse
-import asyncio
 import copy
 import csv
 import hashlib
@@ -53,10 +53,6 @@ try:
 except ImportError:  # pragma: no cover
     requests = None
 try:
-    import httpx
-except ImportError:  # pragma: no cover
-    httpx = None
-try:
     import yt_dlp
 except ImportError:  # pragma: no cover
     yt_dlp = None
@@ -74,8 +70,11 @@ ATOM = "{http://www.w3.org/2005/Atom}"
 YT = "{http://www.youtube.com/xml/schemas/2015}"
 AT = "{http://purl.org/atompub/tombstones/1.0}"
 # Topic theo tài liệu YouTube "Subscribe to push notifications" (developers.google.com/youtube/v3/guides/push_notifications)
+# WebSub TOPIC (đăng ký với hub) — dạng /xml/feeds/... theo tài liệu YouTube "Subscribe to push notifications".
 TOPIC_FMT = "https://www.youtube.com/xml/feeds/videos.xml?channel_id={}"
-FEED_FMT = "https://www.youtube.com/feeds/videos.xml?channel_id={}"
+# Kiến trúc DUY NHẤT: WebSub → Video ID → tải 360p; song song ghi Excel. KHÔNG có feed polling / Data API / quét định kỳ.
+# Trang kênh chỉ dùng trong DIAG (chạy tay) để kiểm tra Channel ID tồn tại — không dùng để phát hiện video.
+CHANNEL_PAGE_FMT = "https://www.youtube.com/channel/{}"
 STATES_ACTIVE = ("DETECTED", "QUEUED", "RESOLVING", "DOWNLOADING", "VERIFYING", "RETRY_WAIT")
 
 DEFAULT_CONFIG = {
@@ -85,19 +84,12 @@ DEFAULT_CONFIG = {
     "col_url": "D",
     "excel_enabled": True,
     "download_enabled": True,
-    "api_enabled": True,
-    "feed_enabled": True,
-    "websub_enabled": True,
     "callback_url": "",                # trống = tự đọc URL https từ ngrok (http://127.0.0.1:4040)
     "listen_host": "0.0.0.0",
     "listen_port": 8765,
     "websub_path": "/websub",
     "hub_url": "https://pubsubhubbub.appspot.com/subscribe",
     "lease_seconds": 432000,
-    "api_keys_file": "api_keys.txt",
-    "api_daily_units_per_key": 8000,   # chừa 20% quota/key cho việc khác
-    "api_min_interval_sec": 15.0,
-    "feed_interval_sec": 60.0,
     "max_age_minutes": 30,             # video có 'published' cũ hơn → coi là CẬP NHẬT video cũ, không tải
     "download_dir": "DOWNLOADS",
     "workers": 3,
@@ -105,6 +97,7 @@ DEFAULT_CONFIG = {
     "retry_schedule_sec": [1, 2, 3, 5, 8, 13, 20, 30, 45, 60],
     "max_concurrent_downloads": 3,
     "v9_path": "",                     # đường dẫn V9_4_SUB2S.py (chỉ dùng để benchmark so sánh)
+    "verify_retry_sec": [120, 300, 600, 1800, 3600],   # hub chưa gọi xác minh sau X s → gửi lại (giãn dần)
 }
 
 
@@ -178,7 +171,7 @@ def safe_parse_xml(raw: bytes):
 
 
 def parse_atom(raw: bytes) -> list[dict]:
-    """Atom (WebSub push hoặc feed) → [{video_id, channel_id, title, published, updated, deleted}]."""
+    """Atom của WebSub push → [{video_id, channel_id, title, published, updated, deleted}]."""
     root = safe_parse_xml(raw)
     out = []
     for e in root.iter(f"{ATOM}entry"):
@@ -285,6 +278,8 @@ class DB:
     CREATE TABLE IF NOT EXISTS subs(channel_id TEXT PRIMARY KEY, callback TEXT, requested_at REAL,
       verified_at REAL, lease_seconds INTEGER, state TEXT, last_push REAL, error TEXT);
     CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
+    CREATE TABLE IF NOT EXISTS hub_events(id INTEGER PRIMARY KEY AUTOINCREMENT, at REAL, channel_id TEXT, kind TEXT,
+      mode TEXT, http INTEGER, accepted INTEGER, detail TEXT);
     """
 
     def __init__(self, path: Path):
@@ -295,10 +290,13 @@ class DB:
         with self.lock:
             self.con.executescript(self.SCHEMA)
             self.con.execute("PRAGMA synchronous=NORMAL")
-            try:                                          # nâng cấp DB cũ
-                self.con.execute("ALTER TABLE excel_jobs ADD COLUMN order_key TEXT")
-            except sqlite3.OperationalError:
-                pass
+            for alter in ("ALTER TABLE excel_jobs ADD COLUMN order_key TEXT",     # nâng cấp DB cũ
+                          "ALTER TABLE subs ADD COLUMN attempts INTEGER DEFAULT 0",
+                          "ALTER TABLE subs ADD COLUMN last_http INTEGER"):
+                try:
+                    self.con.execute(alter)
+                except sqlite3.OperationalError:
+                    pass
 
     def tx(self, stmts):
         """Nhiều câu lệnh trong MỘT giao dịch (không bao giờ ghi nửa chừng)."""
@@ -917,6 +915,23 @@ def ffmpeg_mux(vfile: Path, afile: Path | None, out: Path) -> float:
     return ms(t0, time.perf_counter_ns())
 
 
+def load_shared_secret(base: Path, db: "DB | None" = None) -> str:
+    """MỘT secret HMAC cho cả thư mục (tool chính, SELFTEST, DIAG). Hub lưu thuê bao theo (callback, topic):
+    nếu mỗi chế độ dùng secret khác nhau, lần đăng ký sau sẽ ghi đè secret và tool chính bỏ nhầm push thật."""
+    f = base / "websub_secret.txt"
+    try:
+        v = f.read_text(encoding="utf-8").strip()
+        if re.fullmatch(r"[0-9a-f]{32,128}", v):
+            return v
+    except OSError:
+        pass
+    v = (db.meta_get("websub_secret") if db is not None else None) or secrets.token_hex(24)   # giữ secret cũ nếu có
+    tmp = f.with_suffix(".tmp")
+    tmp.write_text(v, encoding="utf-8")
+    os.replace(tmp, f)
+    return v
+
+
 # =============================== ENGINE =============================== #
 class Engine:
     def __init__(self, cfg: dict, base: Path, log: Log, on_stats=None, db_name="database.sqlite", lock_name="ws360.lock"):
@@ -943,35 +958,32 @@ class Engine:
         self.pending_hub = {}                 # channel → (mode, thời điểm) yêu cầu ta THỰC SỰ gửi tới hub
         self.hub_lock = threading.Lock()
         self.resolver = Resolver(log)
-        self.secret = self.db.meta_get("websub_secret") or secrets.token_hex(24)
+        self.secret = load_shared_secret(base, self.db)
         self.db.meta_set("websub_secret", self.secret)
         self.threads = []
         self.httpd = None
         self.callback = ""
         self.stats = {"detected": 0, "downloading": 0, "done": 0, "failed": 0, "excel_ok": 0, "excel_pending": 0,
-                      "excel_err": 0, "websub_verified": 0, "webhook": "OFF", "api": "OFF", "feed": "OFF",
+                      "excel_err": 0, "websub_verified": 0, "webhook": "OFF",
                       "last": {}, "speed_mbps": 0.0, "pushes": 0}
         self.flags = {"download": bool(cfg.get("download_enabled", True)), "excel": bool(cfg.get("excel_enabled", True)),
-                      "api": bool(cfg.get("api_enabled", True)), "feed": bool(cfg.get("feed_enabled", True))}
-        self.api_keys = self._load_keys()
-        self.key_dead = {}
-        self.feed_state = {}
+}
         self.dl_dir = base / cfg.get("download_dir", "DOWNLOADS")
         self.dl_dir.mkdir(parents=True, exist_ok=True)
 
     # ---------------- vòng đời ---------------- #
-    def start(self, websub=True, api=True, feed=True, workers=True, excel_watch=True):
+    def start(self, websub=True, workers=True, excel_watch=True):
         with self.life_lock:                              # start/stop không bao giờ chạy chồng nhau
             self._acquire_instance_lock()
             self.stop_ev.clear()
             try:
-                self._start_inner(websub, api, feed, workers, excel_watch)
+                self._start_inner(websub, workers, excel_watch)
             except Exception:
                 self.stop_ev.set()
                 self._stop_inner()
                 raise
 
-    def _start_inner(self, websub, api, feed, workers, excel_watch):
+    def _start_inner(self, websub, workers, excel_watch):
         self.reload_channels(initial=True)
         self.recover()
         self.resolver.warm()
@@ -981,13 +993,9 @@ class Engine:
             self._spawn(self._excel_worker, "EXCEL")
         if excel_watch:
             self._spawn(self._excel_watch, "EXCEL-WATCH")
-        if websub and self.cfg.get("websub_enabled", True):
+        if websub:
             self.start_webhook()
             self._spawn(self._websub_subscriber, "WEBSUB-SUB")
-        if api:
-            self._spawn(self._api_loop, "API")
-        if feed:
-            self._spawn(self._feed_thread, "FEED")
         self._spawn(self._stats_loop, "STATS")
         if workers and FFPROBE:
             self._spawn(self._ff_keepwarm, "FF-WARM")
@@ -1065,12 +1073,6 @@ class Engine:
         t.start()
         self.threads.append(t)
 
-    def _load_keys(self):
-        p = self.base / self.cfg.get("api_keys_file", "api_keys.txt")
-        if not p.exists():
-            return []
-        return [l.strip() for l in p.read_text(encoding="utf-8-sig").splitlines() if l.strip() and not l.startswith("#")]
-
     # ---------------- Excel → danh sách kênh ---------------- #
     def reload_channels(self, initial=False):
         try:
@@ -1116,7 +1118,7 @@ class Engine:
     # ---------------- XỬ LÝ SỰ KIỆN (đường nóng) ---------------- #
     def on_event(self, ch: str, vid: str, engine: str, published: datetime | None = None, title="",
                  t_recv_ns: int | None = None) -> str:
-        """Gọi từ webhook/API/feed. KHÔNG chặn: chỉ chống trùng + đưa vào 2 hàng đợi độc lập."""
+        """Gọi từ webhook WebSub. KHÔNG chặn: chỉ chống trùng + đưa vào 2 hàng đợi độc lập."""
         t_recv_ns = t_recv_ns or time.perf_counter_ns()
         if not VID_RE.match(vid or "") or not norm_channel(ch):
             return "invalid"
@@ -1161,12 +1163,6 @@ class Engine:
                                                  meta.get("detected_at") or iso(), meta.get("published"), state, enq_ms))
         if enq_ms is not None:
             self.db.upd(vid, enqueue_ms=enq_ms)
-
-    def _is_recent(self, published) -> bool:
-        """Video đăng trong cửa sổ max_age_minutes → coi là MỚI (kể cả lúc lấy mốc ban đầu)."""
-        if published is None:
-            return False
-        return (now_utc() - published).total_seconds() <= float(self.cfg.get("max_age_minutes", 30)) * 60
 
     def _mark_seen(self, vid, ch, why):
         with self.seen_lock:
@@ -1496,6 +1492,7 @@ class Engine:
                 if q.get("hub.mode") == "denied":
                     chd = norm_channel(q.get("hub.topic", ""))
                     if chd and eng.monitored(chd):
+                        eng.hub_event(chd, "denied", "denied", 200, 0, q.get("hub.reason", "")[:200])
                         eng.db.x("UPDATE subs SET state='DENIED', error=? WHERE channel_id=?", (q.get("hub.reason", "")[:200], chd))
                         eng.log(f"⚠️ WebSub hub TỪ CHỐI kênh {chd}: {q.get('hub.reason', '')[:120]}")
                     return self._reply(200)
@@ -1511,7 +1508,15 @@ class Engine:
                     ok_mode = asked and not eng.monitored(ch)    # không để lệnh huỷ cũ cắt đăng ký mới
                 else:
                     ok_mode = False
-                if ok_mode and len(q["hub.challenge"]) <= 512:
+                if not ok_mode:
+                    why = ("không đọc được Channel ID trong hub.topic" if not ch else
+                           "tool chưa từng gửi yêu cầu '" + mode + "' cho kênh này (hoặc đã quá 6 giờ)" if not asked else
+                           "kênh không còn trong Excel" if mode == "subscribe" else
+                           "kênh vẫn đang theo dõi → từ chối lệnh huỷ cũ" if mode == "unsubscribe" else f"mode lạ '{mode}'")
+                    eng.hub_event(ch or q.get("hub.topic", "")[:80], "verify", mode, 404, 0, why)
+                    eng.log(f"🚫 XÁC MINH BỊ TỪ CHỐI | kênh {ch} | mode={mode} | lý do: {why}")
+                    return self._reply(404)
+                if len(q["hub.challenge"]) <= 512:
                     if mode == "subscribe":
                         try:
                             lease = int(q.get("hub.lease_seconds") or eng.cfg.get("lease_seconds", 432000))
@@ -1520,11 +1525,15 @@ class Engine:
                         lease = max(60, min(lease, int(eng.cfg.get("lease_seconds", 432000)), 10 * 86400))
                         eng.db.x("INSERT INTO subs(channel_id, callback, verified_at, lease_seconds, state) VALUES(?,?,?,?,'VERIFIED') "
                                  "ON CONFLICT(channel_id) DO UPDATE SET verified_at=excluded.verified_at, callback=excluded.callback, "
-                                 "lease_seconds=excluded.lease_seconds, state='VERIFIED', error=NULL",
+                                 "lease_seconds=excluded.lease_seconds, state='VERIFIED', error=NULL, attempts=0",
                                  (ch, eng.callback, time.time(), lease))
+                        eng.hub_event(ch, "verify", mode, 200, 1, f"lease {lease}s")
+                        eng.log(f"✅ Hub XÁC MINH kênh {ch} | lease {lease}s")
                     else:
                         eng.db.x("UPDATE subs SET state='UNSUBSCRIBED' WHERE channel_id=?", (ch,))
+                        eng.hub_event(ch, "verify", mode, 200, 1, "huỷ")
                     return self._reply(200, q["hub.challenge"].encode())   # giữ pending: hub có thể gửi lại xác minh
+                eng.hub_event(ch or "", "verify", mode, 404, 0, "hub.challenge quá dài")
                 return self._reply(404)
 
             def do_POST(self):
@@ -1621,6 +1630,13 @@ class Engine:
             cb = cb.rstrip("/") + self.cfg.get("websub_path", "/websub")
         return cb
 
+    def hub_event(self, ch, kind, mode, http, accepted, detail=""):
+        try:
+            self.db.x("INSERT INTO hub_events(at, channel_id, kind, mode, http, accepted, detail) VALUES(?,?,?,?,?,?,?)",
+                      (time.time(), ch, kind, mode, http, accepted, str(detail)[:300]))
+        except Exception:
+            pass
+
     def hub_asked(self, ch, mode) -> bool:
         with self.hub_lock:
             t = self.pending_hub.get((ch, mode))
@@ -1652,10 +1668,14 @@ class Engine:
             try:
                 code, body = self._hub("subscribe", ch, cb)
                 st = "REQUESTED" if code in (202, 204) else "ERROR"
-                self.db.x("INSERT INTO subs(channel_id, callback, requested_at, state, error) VALUES(?,?,?,?,?) "
+                self.db.x("INSERT INTO subs(channel_id, callback, requested_at, state, error, attempts, last_http) VALUES(?,?,?,?,?,1,?) "
                           "ON CONFLICT(channel_id) DO UPDATE SET callback=excluded.callback, requested_at=excluded.requested_at, "
                           "state=CASE WHEN subs.state='VERIFIED' AND subs.callback=excluded.callback THEN 'VERIFIED' ELSE excluded.state END, "
-                          "error=excluded.error", (ch, cb, time.time(), st, None if st != "ERROR" else f"HTTP {code} {body}"))
+                          "error=excluded.error, attempts=COALESCE(subs.attempts,0)+1, last_http=excluded.last_http",
+                          (ch, cb, time.time(), st, None if st != "ERROR" else f"HTTP {code} {body}", code))
+                self.hub_event(ch, "subscribe", "subscribe", code, int(st != "ERROR"), body[:160] if st == "ERROR" else "")
+                if st == "ERROR":
+                    self.log(f"❌ Hub trả HTTP {code} khi đăng ký kênh {ch}: {body[:120]}")
                 ok += st != "ERROR"
             except Exception as e:  # noqa: BLE001
                 self.db.x("INSERT INTO subs(channel_id, callback, requested_at, state, error) VALUES(?,?,?,?,?) "
@@ -1680,14 +1700,19 @@ class Engine:
             cb = self.resolve_callback()
             if not cb:
                 self.stats["webhook"] = "CHƯA CÓ URL CÔNG KHAI (chạy ngrok hoặc điền callback_url)"
-                self.stop_ev.wait(15)
+                self.stop_ev.wait(min(15.0, float(self.cfg.get("websub_loop_sec", 30))))
                 continue
+            sec_sig = hashlib.sha256(self.secret.encode()).hexdigest()[:16]
             if cb != self.callback:
                 self.callback = cb
-                if cb != last_cb:
-                    self.log(f"🔁 Callback WebSub {'đổi' if last_cb else 'mới'}: {cb} → đăng ký lại toàn bộ")
-                    self.db.x("UPDATE subs SET state='STALE' WHERE callback IS NOT ?", (cb,))
+                sec_changed = self.db.meta_get("subs_secret_sig") not in (None, sec_sig)
+                if cb != last_cb or sec_changed:
+                    why = "secret HMAC đổi (hub có thể đang giữ secret cũ)" if cb == last_cb else \
+                        f"callback {'đổi' if last_cb else 'mới'}: {cb}"
+                    self.log(f"🔁 WebSub: {why} → đăng ký lại TOÀN BỘ kênh")
+                    self.db.x("UPDATE subs SET state='STALE'")
                 self.db.meta_set("websub_callback", cb)
+                self.db.meta_set("subs_secret_sig", sec_sig)
                 last_cb = cb
                 n = self.subscribe_all()
                 self.log(f"📡 WebSub: gửi đăng ký {n}/{len(self.channels)} kênh (HTTP 202 = hub NHẬN YÊU CẦU, chưa phải đã xác minh)")
@@ -1704,9 +1729,14 @@ class Engine:
                     renew.append(r["channel_id"])
                 elif r["state"] == "VERIFIED" and r["verified_at"] and now > r["verified_at"] + 0.8 * lease and since_req > 600:
                     renew.append(r["channel_id"])          # gia hạn ở 80% lease, không gửi lại quá 1 lần / 10 phút
-                elif r["state"] in ("REQUESTED", "ERROR", "STALE", "EXPIRED", "UNSUBSCRIBED", "REMOVED", "DENIED") \
-                        and since_req > 600:
-                    renew.append(r["channel_id"])
+                elif r["state"] in ("REQUESTED", "ERROR", "STALE", "EXPIRED", "UNSUBSCRIBED", "REMOVED", "DENIED"):
+                    sched = list(self.cfg.get("verify_retry_sec") or [120, 300, 600, 1800, 3600])
+                    k = max(0, int(r["attempts"] or 1) - 1)
+                    wait = sched[min(k, len(sched) - 1)]
+                    if since_req > wait:
+                        self.log(f"🔁 Kênh {r['channel_id']} chưa được hub xác minh sau {since_req:.0f}s (trạng thái {r['state']}, "
+                                 f"HTTP lần gửi {r['last_http']}, lần {r['attempts']}) → gửi lại")
+                        renew.append(r["channel_id"])
             missing = [c for c in self.channels if not self.db.one("SELECT 1 FROM subs WHERE channel_id=?", (c,))]
             if renew or missing:
                 self.subscribe_all(renew + missing)
@@ -1714,134 +1744,7 @@ class Engine:
                 "SELECT COUNT(*) c FROM subs WHERE state='VERIFIED' AND callback=? AND verified_at + lease_seconds > ?",
                 (self.callback, time.time()))["c"]
             self.stats["webhook"] = f"{self.callback}"
-            self.stop_ev.wait(30)
-
-    # ---------------- DATA API (dự phòng) ---------------- #
-    def _api_loop(self):
-        if not self.api_keys or requests is None:
-            self.stats["api"] = "TẮT (không có api_keys.txt)"
-            return
-        ses = requests.Session()
-        baseline = set()
-        kidx = 0
-        while not self.stop_ev.is_set():
-            if not self.flags["api"]:
-                self.stats["api"] = "TẮT"
-                self.stop_ev.wait(2)
-                continue
-            chans = list(self.channels)
-            if not chans:
-                self.stop_ev.wait(5)
-                continue
-            alive = [k for k in self.api_keys if self.key_dead.get(k, 0) < time.time()]
-            if not alive:
-                self.stats["api"] = "HẾT QUOTA (mọi key)"
-                self.stop_ev.wait(60)
-                continue
-            budget = len(alive) * float(self.cfg.get("api_daily_units_per_key", 8000))
-            per_ch = max(float(self.cfg.get("api_min_interval_sec", 15)), len(chans) * 86400.0 / budget)
-            gap = per_ch / len(chans)
-            self.stats["api"] = f"BẬT | {len(alive)} key | mỗi kênh ~{per_ch:.0f}s"
-            for ch in chans:
-                if self.stop_ev.is_set() or not self.flags["api"]:
-                    break
-                key = alive[kidx % len(alive)]
-                kidx += 1
-                t_send = time.perf_counter_ns()
-                try:
-                    r = ses.get("https://www.googleapis.com/youtube/v3/playlistItems",
-                                params={"part": "contentDetails", "playlistId": "UU" + ch[2:], "maxResults": 5, "key": key,
-                                        "fields": "items(contentDetails(videoId,videoPublishedAt))"}, timeout=(2, 5))
-                    if r.status_code == 200:
-                        for it in r.json().get("items", []):
-                            cd = it.get("contentDetails") or {}
-                            vid = cd.get("videoId")
-                            pub = parse_time(cd.get("videoPublishedAt"))
-                            if ch not in baseline and not self._is_recent(pub):
-                                self._mark_seen(vid, ch, "baseline-api")
-                                continue
-                            self.on_event(ch, vid, "API", pub, "", t_send)
-                        baseline.add(ch)
-                    elif r.status_code == 403 and "quota" in r.text.lower():
-                        self.key_dead[key] = time.time() + 3600 * 6
-                        self.log(f"⚠️ API key …{key[-4:]} hết quota → nghỉ 6 giờ")
-                    elif r.status_code in (403, 429):
-                        self.stop_ev.wait(30)
-                    elif r.status_code == 404:
-                        self.log(f"⚠️ API: kênh {ch} không có danh sách uploads (sai Channel ID?)")
-                except Exception as e:  # noqa: BLE001
-                    self.stats["api"] = f"LỖI MẠNG {type(e).__name__}"
-                    self.stop_ev.wait(5)
-                self.stop_ev.wait(gap)
-
-    # ---------------- ATOM FEED POLLING (dự phòng / backfill) ---------------- #
-    def _feed_thread(self):
-        if httpx is None:
-            self.stats["feed"] = "TẮT (thiếu httpx)"
-            return
-        asyncio.run(self._feed_main())
-
-    async def _feed_main(self):
-        lim = httpx.Limits(max_connections=8, max_keepalive_connections=8, keepalive_expiry=60)
-        async with httpx.AsyncClient(timeout=httpx.Timeout(6.0, connect=3.0), limits=lim, http2=False,
-                                     headers={"User-Agent": f"{VERSION} feed-check"}) as cli:
-            sem = asyncio.Semaphore(4)
-            nxt = {}
-            while not self.stop_ev.is_set():
-                if not self.flags["feed"]:
-                    self.stats["feed"] = "TẮT"
-                    await asyncio.sleep(2)
-                    continue
-                chans = list(self.channels)
-                base_iv = float(self.cfg.get("feed_interval_sec", 60))
-                now = time.time()
-                due = [c for c in chans if nxt.get(c, 0) <= now]
-                for i, ch in enumerate(due):
-                    nxt[ch] = now + base_iv + (i % 10)          # rải đều, không dồn cùng lúc
-
-                async def one(ch):
-                    async with sem:
-                        await self._feed_one(cli, ch)
-                if due:
-                    await asyncio.gather(*(one(c) for c in due), return_exceptions=True)
-                self.stats["feed"] = f"BẬT | {len(chans)} kênh / {base_iv:.0f}s"
-                await asyncio.sleep(1.0)
-
-    async def _feed_one(self, cli, ch):
-        st = self.feed_state.setdefault(ch, {"etag": None, "lm": None, "base": False, "fail": 0})
-        hdr = {}
-        if st["etag"]:
-            hdr["If-None-Match"] = st["etag"]
-        if st["lm"]:
-            hdr["If-Modified-Since"] = st["lm"]
-        t_send = time.perf_counter_ns()
-        try:
-            r = await cli.get(FEED_FMT.format(ch), headers=hdr)
-        except Exception:
-            st["fail"] += 1
-            return
-        if r.status_code == 304:
-            return
-        if r.status_code != 200:
-            st["fail"] += 1
-            if r.status_code == 404 and st["fail"] in (1, 10):
-                self.log(f"⚠️ Feed: kênh {ch} trả 404 (sai Channel ID?)")
-            return
-        st["fail"] = 0
-        st["etag"] = r.headers.get("ETag")
-        st["lm"] = r.headers.get("Last-Modified")
-        try:
-            entries = parse_atom(r.content)
-        except Exception:
-            return
-        for e in entries:
-            if not e["video_id"]:
-                continue
-            if not st["base"] and not self._is_recent(e["published"]):
-                self._mark_seen(e["video_id"], ch, "baseline-feed")
-                continue
-            self.on_event(ch, e["video_id"], "FEED", e["published"], e["title"], t_send)
-        st["base"] = True
+            self.stop_ev.wait(float(self.cfg.get("websub_loop_sec", 30)))
 
     def _ff_keepwarm(self):
         """Windows nạp ffprobe/ffmpeg (DLL + quét antivirus) lần đầu ~0.3–0.6 s. Chạy '-version' lúc khởi động
@@ -1900,7 +1803,7 @@ def run_gui(cfg, base):
     top.addWidget(b_start)
     top.addWidget(b_stop)
     chk = {}
-    for k, label in (("download", "Auto Download 360p"), ("excel", "Ghi Excel"), ("api", "API fallback"), ("feed", "Polling fallback")):
+    for k, label in (("download", "Auto Download 360p"), ("excel", "Ghi Excel")):
         c = QCheckBox(label)
         c.setChecked(bool(cfg.get(f"{k}_enabled", True)))
         chk[k] = c
@@ -1910,7 +1813,7 @@ def run_gui(cfg, base):
     grid = QGridLayout()
     labels = {}
     names = [("channels", "Tổng kênh"), ("websub_verified", "WebSub đã xác minh"), ("webhook", "Webhook"),
-             ("api", "API"), ("feed", "Polling"), ("detected", "Video mới"), ("downloading", "Đang tải"),
+             ("pushes", "Push WebSub nhận"), ("detected", "Video mới"), ("downloading", "Đang tải"),
              ("done", "Tải xong"), ("failed", "Lỗi tải"), ("speed_mbps", "Tốc độ (Mbps)"), ("resolver_ms", "Resolver (ms)"),
              ("download_ms", "Tải (ms)"), ("mux_ms", "Mux (ms)"), ("total_ms", "Tổng (ms)"), ("excel", "Excel")]
     for i, (k, t) in enumerate(names):
@@ -2020,7 +1923,7 @@ def selftest(cfg, base, video_id=None, wait_verify=90):
             pass
     eng = Engine(tcfg, base, log, db_name=db_test.name, lock_name="ws360_selftest.lock")
     try:
-        eng.start(websub=True, api=False, feed=False)
+        eng.start(websub=True)
     except Exception as e:  # noqa: BLE001
         rec("SELFTEST khởi động", "FAIL", f"{type(e).__name__}: {e}")
         _write_selftest_report(base, res, log)
@@ -2067,6 +1970,16 @@ def selftest(cfg, base, video_id=None, wait_verify=90):
             lease = eng.db.one("SELECT MIN(lease_seconds) a, MAX(lease_seconds) b FROM subs WHERE state='VERIFIED'")
             rec("TEST2c đăng ký hub thật + xác minh", "PASS" if v == len(chans) else ("FAIL" if v == 0 else "PARTIAL"),
                 f"gửi {n}/{len(chans)} (HTTP 202) | hub GỌI XÁC MINH {v}/{len(chans)} | lease {lease['a']}–{lease['b']}s")
+            for chx in chans:                                         # từng kênh CHƯA xác minh: in đủ bằng chứng
+                rr = eng.db.one("SELECT * FROM subs WHERE channel_id=?", (chx,))
+                if rr and rr["state"] == "VERIFIED":
+                    continue
+                ev = eng.db.all("SELECT * FROM hub_events WHERE channel_id=? ORDER BY id DESC LIMIT 3", (chx,))
+                hd = hub_details(cfg, cb, chx, eng.secret)
+                rec(f"TEST2c-kênh {chx}", "FAIL",
+                    f"trạng thái {rr['state'] if rr else 'không có'} | HTTP đăng ký {rr['last_http'] if rr else '-'} | "
+                    f"xác minh: {[(e['kind'], e['mode'], e['http'], 'OK' if e['accepted'] else 'TỪ CHỐI', e['detail']) for e in ev] or 'hub CHƯA gọi tới callback'} | "
+                    f"hub Google báo: {' / '.join(hd['lines'][:6]) or hd['http']}")
         # POST hợp lệ / không hợp lệ (qua chính webhook)
         body = (f'<?xml version="1.0"?><feed xmlns:yt="http://www.youtube.com/xml/schemas/2015" '
                 f'xmlns="http://www.w3.org/2005/Atom"><entry><yt:videoId>AAAAAAAAAAA</yt:videoId>'
@@ -2136,6 +2049,110 @@ def _write_selftest_report(base, res, log):
         for n, s, d in res:
             f.write(f"| {n} | **{s}** | {str(d).replace('|', '/')} |\n")
     log(f"📄 Đã ghi {rep}")
+
+
+def _strip_html(t: str) -> str:
+    t = re.sub(r"(?is)<(script|style).*?</\1>", " ", t)
+    t = re.sub(r"(?s)<br\s*/?>|</(tr|p|div|li|h\d)>", "\n", t)
+    t = re.sub(r"(?s)<[^>]+>", " ", t)
+    import html as _h
+    return "\n".join(" ".join(l.split()) for l in _h.unescape(t).splitlines() if l.strip())
+
+
+def hub_details(cfg, cb, ch, secret, timeout=10) -> dict:
+    """Hỏi CHÍNH hub Google trạng thái thuê bao (trang subscription-details). Không in secret ra log."""
+    url = cfg["hub_url"].rsplit("/", 1)[0] + "/subscription-details"
+    try:
+        r = requests.get(url, params={"hub.callback": cb, "hub.topic": TOPIC_FMT.format(ch), "hub.secret": secret},
+                         timeout=timeout)
+        txt = _strip_html(r.text)
+        keep = [l for l in txt.splitlines() if re.search(r"(?i)state|verif|expir|deliver|error|lease|stat|callback|topic|time", l)]
+        return {"http": r.status_code, "lines": keep[:14]}
+    except Exception as e:  # noqa: BLE001
+        return {"http": None, "lines": [f"{type(e).__name__}: {e}"]}
+
+
+def http_status(url, timeout=8, **kw):
+    try:
+        r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                                                        "Accept-Language": "en-US,en;q=0.8"}, **kw)
+        return r.status_code, r.text
+    except Exception as e:  # noqa: BLE001
+        return None, f"{type(e).__name__}: {e}"
+
+
+def diag(cfg, base, resubscribe=False, wait_s=120):
+    """Chẩn đoán TỪNG kênh WebSub: DB thuê bao + nhật ký xác minh + chi tiết từ hub Google + trang kênh (kiểm tra ID)."""
+    log = Log(base / "logs")
+    out = [f"# DIAG WebSub — {VERSION} — {datetime.now():%Y-%m-%d %H:%M:%S}", ""]
+    eng = Engine(cfg, base, log)
+    chans, bad = eng.excel.read_channels()
+    eng.channels = chans
+    out.append(f"Excel: {len(chans)} kênh, giá trị sai: {bad}")
+    cb = eng.resolve_callback()
+    out.append(f"Callback: {cb or 'KHÔNG CÓ (ngrok chưa chạy / callback_url trống)'}")
+    out.append(f"Topic WebSub dùng để đăng ký: {TOPIC_FMT.format('<CHANNEL_ID>')}")
+    out.append("Phát hiện video: CHỈ WebSub (không feed polling, không Data API). Trang kênh chỉ dùng ở đây để kiểm tra ID.")
+    if cb:
+        try:
+            r = requests.get(cb, timeout=8, headers={"ngrok-skip-browser-warning": "1"})
+            out.append(f"Callback trả lời GET: HTTP {r.status_code} '{r.text[:30]}' (mong đợi 200 'WS360 OK' khi tool chính/selftest đang chạy)")
+        except Exception as e:  # noqa: BLE001
+            out.append(f"Callback KHÔNG trả lời: {type(e).__name__}: {e}")
+    if resubscribe:
+        if not cb:
+            out.append("--resubscribe: BỎ QUA vì chưa có callback công khai")
+        elif not port_free(cfg.get("listen_host", "0.0.0.0"), cfg.get("listen_port", 8765)):
+            out.append("--resubscribe: BỎ QUA — cổng đang bận (tool chính đang chạy; tool chính tự gửi lại theo lịch). "
+                       "Tắt tool chính nếu muốn chẩn đoán đăng ký lại ngay.")
+        else:
+            eng.start(websub=False, workers=False, excel_watch=False)
+            eng.start_webhook()
+            eng.callback = cb
+            n = eng.subscribe_all()
+            out.append(f"Đã gửi đăng ký lại {n}/{len(chans)} kênh; chờ hub xác minh tối đa {wait_s}s…")
+            end = time.time() + wait_s
+            while time.time() < end:
+                v = eng.db.one("SELECT COUNT(*) c FROM subs WHERE state='VERIFIED' AND callback=? AND verified_at > ?",
+                               (cb, end - wait_s - 1))["c"]
+                if v >= len(chans):
+                    break
+                time.sleep(2)
+    out += ["", "| # | Channel ID | Dòng Excel | Trạng thái DB | HTTP đăng ký | Lần gửi | Xác minh gần nhất | Hub Google báo | "
+            "Trang kênh | Kết luận |", "|---|" + "---|" * 9]
+    for i, (ch, rows) in enumerate(chans.items(), start=1):
+        r = eng.db.one("SELECT * FROM subs WHERE channel_id=?", (ch,))
+        ev = eng.db.all("SELECT * FROM hub_events WHERE channel_id=? ORDER BY id DESC LIMIT 3", (ch,))
+        evs = "; ".join(f"{datetime.fromtimestamp(e['at']):%H:%M:%S} {e['kind']}/{e['mode']} {e['http']} "
+                        f"{'OK' if e['accepted'] else 'TỪ CHỐI'} {e['detail'] or ''}".strip() for e in ev) or "chưa có"
+        hd = hub_details(cfg, cb, ch, eng.secret) if cb and requests else {"http": None, "lines": []}
+        hds = " / ".join(hd["lines"][:6]) if hd["lines"] else f"HTTP {hd['http']}"
+        pc, ptxt = http_status(CHANNEL_PAGE_FMT.format(ch))
+        page_ok = pc == 200 and ch in (ptxt or "") and "This channel doesn" not in (ptxt or "")
+        state = r["state"] if r else "CHƯA ĐĂNG KÝ"
+        if state == "VERIFIED":
+            concl = "OK — đã xác minh"
+        elif pc is not None and not page_ok:
+            concl = f"Trang kênh trả HTTP {pc} / không thấy kênh → Channel ID có thể SAI hoặc kênh bị xoá/ẩn; kiểm tra ô cột K"
+        elif r is None:
+            concl = "CHƯA từng gửi đăng ký (chưa có callback lúc tool chạy, hoặc kênh mới thêm) — chạy DIAG chọn 2"
+        elif ev and not ev[0]["accepted"] and ev[0]["kind"] == "verify":
+            concl = f"Hub ĐÃ gọi xác minh nhưng tool TỪ CHỐI: {ev[0]['detail']}"
+        elif not any(e["kind"] == "verify" for e in ev):
+            concl = "Hub CHƯA gọi xác minh tới callback (xem cột Hub Google báo; tool sẽ gửi lại theo lịch 2/5/10/30/60 phút)"
+        else:
+            concl = f"trạng thái {state}"
+        out.append(f"| {i} | {ch} | {rows} | {state} | {r['last_http'] if r else '-'} | {r['attempts'] if r else 0} | {evs} | "
+                   f"{hds} | {pc}{' (tồn tại)' if page_ok else ''} | {concl} |")
+        time.sleep(0.3)
+    if resubscribe and eng.httpd:
+        eng.stop()
+    rep = base / "DIAG_REPORT.md"
+    rep.write_text("\n".join(o.replace("\n", " ") if o.startswith("|") else o for o in out) + "\n", encoding="utf-8")
+    for o in out:
+        print(o)
+    log(f"📄 Đã ghi {rep}")
+    return out
 
 
 def bench(cfg, base, ids, reps=3):
@@ -2219,6 +2236,8 @@ def main(argv=None):
     ap.add_argument("--bench", nargs="*")
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--config", default="config.json")
+    ap.add_argument("--diag", action="store_true", help="chẩn đoán từng kênh WebSub → DIAG_REPORT.md")
+    ap.add_argument("--resubscribe", action="store_true", help="dùng với --diag: đăng ký lại cả danh sách rồi chờ hub xác minh")
     a = ap.parse_args(argv)
     base = BASE_DIR
     os.chdir(base)
@@ -2229,6 +2248,9 @@ def main(argv=None):
             print(f"⚠️ '{a.video}' không phải ID/link video YouTube hợp lệ — bỏ qua TEST3")
         r = selftest(cfg, base, vid)
         return 0 if all(s != "FAIL" for _, s, _ in r) else 1
+    if a.diag:
+        diag(cfg, base, resubscribe=a.resubscribe)
+        return 0
     if a.bench is not None:
         bench(cfg, base, [v for v in (extract_vid(x) for x in (a.bench or [])) if v], a.reps)
         return 0
