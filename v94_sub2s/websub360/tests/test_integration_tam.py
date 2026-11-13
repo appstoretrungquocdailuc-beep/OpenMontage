@@ -598,3 +598,31 @@ def test_pipeline_report_from_real_confirmed_jobs(tmp_path, tam, monkeypatch, gv
     assert len(rep["rows"]) == 2 and all(r["post_confirmed_ms"] is not None for r in rep["rows"])
     md = (tmp_path / "PIPELINE_REPORT.md").read_text(encoding="utf-8")
     assert "POST_CONFIRMED_MS" in md and "PHÁT HIỆN→POST_CONFIRMED" in md and "P95" in md
+
+
+@need_ff
+def test_browse_only_detection_flows_into_same_tiktok_pipeline_dry_run(tmp_path, tam, monkeypatch, gvs, media):
+    from test_browse import FakeInnerTube, seed_old
+    it = FakeInnerTube()
+    try:
+        fk = FakeTikTok(tam, monkeypatch)
+        seed_old(it, CH[0])
+        e, br = engine(tmp_path, [(P1, CH[0])], tam, detection_mode="BROWSE_ONLY", browse_url=it.browse_url,
+                       browse_player_url=it.player_url, browse_uploads_period_sec=0.2, browse_max_rps=50,
+                       browse_connect_timeout=1.0, browse_read_timeout=2.0, tiktok_dry_run=True)
+        monkeypatch.setattr(e.resolver, "resolve", lambda v, deadline_s=2.5: T.plan_prog(gvs, media, v))
+        e.start()
+        br.start()
+        end = time.time() + 5
+        while time.time() < end and not e.browse._s("uploads", CH[0]).first_ok:
+            time.sleep(0.05)
+        it.add(CH[0], "BRWTIKTOK01", "4 seconds ago", "Tiêu đề Browse")
+        j = wait_job(br, "BRWTIKTOK01:" + P1)
+        assert j["state"] == "DRY_RUN_DONE"                                   # chạy thử: KHÔNG bấm Post
+        assert len(fk.uploads) == 1 and Path(fk.uploads[0][1]).name == "Tiêu đề Browse.mp4"
+        assert br.db.one("SELECT COUNT(*) c FROM upload_jobs WHERE video_id='BRWTIKTOK01'")["c"] == 1
+        jp = tmp_path / "tam_post_journal.jsonl"
+        assert not jp.exists() or "POSTING" not in jp.read_text(encoding="utf-8")
+        e.stop()
+    finally:
+        it.close()

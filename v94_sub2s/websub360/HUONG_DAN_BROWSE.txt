@@ -1,0 +1,55 @@
+WS360 + InnerTube BROWSE (nguyên lý quét V39) — HƯỚNG DẪN (Windows Server 2022 / Windows 10–11)
+==============================================================================================
+
+ĐÂY LÀ BẢN THỬ NGHIỆM RIÊNG. Giải nén vào THƯ MỤC MỚI (vd C:\WS360_BROWSE_TEST), KHÔNG chép đè thư mục WS360 production.
+Thư mục mới có database.sqlite / check.xlsx / config.json RIÊNG → không xung đột SQLite/Excel với bản đang chạy.
+Chép vào thư mục mới: ffmpeg.exe + ffprobe.exe, một BẢN SAO check.xlsx (vd đổi tên từ check.xlsx của production),
+và (nếu thử API) api_keys.txt. Khi thử TikTok: tick "Chạy thử (KHÔNG bấm Post)" và dùng profile THỬ — một profile Genlogin
+không mở được ở 2 tool cùng lúc.
+
+CÁC CHẾ ĐỘ PHÁT HIỆN (ô "Nguồn phát hiện" trên giao diện, hoặc "detection_mode" trong config.json, hoặc --mode)
+  WEBSUB ONLY | API ONLY | WEBSUB + API PARALLEL   — giữ nguyên như cũ.
+  API + BROWSE (API_BROWSE)  — YouTube Data API và InnerTube Browse chạy SONG SONG, độc lập. Nguồn nào thấy video trước
+      (và đã xác minh độ mới) thì tải ngay; nguồn còn lại thấy cùng video → bỏ qua (log duplicate_ignored=…).
+      Tick "kèm WebSub" để thêm WebSub làm nguồn thứ 3 (cần ngrok). Quota API quản lý như trước.
+  BROWSE ONLY (BROWSE_ONLY) — chỉ Browse. KHÔNG gọi YouTube Data API (kể cả để xác minh), KHÔNG cần api_keys.txt,
+      KHÔNG cần WebSub/ngrok. Chạy 24/7: START_BROWSE_ONLY_24_7.bat (không giao diện, tự chạy lại nếu thoát).
+
+BROWSE QUÉT GÌ (lấy từ V39)
+  PRIMARY  BROWSE_UPLOADS   (danh sách Uploads của kênh) — mục tiêu 0,75 s/kênh  ("browse_uploads_period_sec")
+  SECONDARY BROWSE_VIDEOS_TAB (tab Videos)               — mục tiêu 3 s/kênh     ("browse_videos_period_sec")
+  Nhịp là MỤC TIÊU, bị chặn bởi RPS tổng ("browse_max_rps" 16, "browse_videos_max_rps" 4). Ví dụ 20 kênh ở 16 RPS →
+  thực tế ≈ 1,25 s/kênh. Mỗi kênh không bao giờ có 2 request chồng nhau.
+  403/429: chỉ 1 kênh bị → kênh đó nghỉ riêng 5→60 s; ≥ 2 kênh bị trong 5 s → nghỉ CHUNG 6–10 s + giảm RPS 40%, rồi tăng lại
+  từ từ sau 30 lượt thành công. Không vượt CAPTCHA, không lách giới hạn IP.
+
+AN TOÀN — KHÔNG ĐĂNG VIDEO CŨ
+  - Lần chạy ĐẦU: mọi video đang có trên kênh = mốc (baseline, lưu SQLite). Chỉ video có chữ tuổi chứng minh ≤ 30 phút
+    (vd "8 seconds ago") mới được xử lý.
+  - Khởi động lại: baseline giữ nguyên; video xuất hiện lúc tool tắt được XÁC MINH từng cái (RESTART_GAP).
+  - Mọi video lạ đều phải được XÁC MINH độ mới trước khi tải:
+      1) chữ tuổi có sẵn trong phản hồi Browse ("5 seconds ago") — không tốn request (đã kiểm: phản hồi thật CÓ chữ này);
+      2) InnerTube player → publishDate (không phải Data API);
+      3) chỉ ở API + BROWSE: Data API videos.list (1 đơn vị quota);
+      không kết luận được → BROWSE_UNVERIFIED: ghi lý do, KHÔNG tải, KHÔNG đăng.
+  - Video cũ hiện lại (đổi riêng tư→công khai, đổi kệ…) → "1 year ago" → CŨ, bỏ qua. ≥ 5 ID lạ cùng lúc → SHAPE_CHANGE.
+  - JSON của YouTube đổi cấu trúc → BROWSE_SHAPE_EMPTY / BROWSE_PARSE_ERROR (báo lỗi, KHÔNG coi là "không có video").
+
+LOG
+  🌐 BROWSE_DETECTED <ID> | source=BROWSE_UPLOADS | age=3.0s (≤4s, ROW_TEXT: '…') | BROWSE_RESPONSE_MS=145 | kênh …
+  🔥 BROWSE_DETECTED <ID> | WINNER=BROWSE | source=BROWSE_UPLOADS | [BROWSE] VIDEO MỚI …
+  📡 API_DETECTED <ID> | WINNER=BROWSE | duplicate_ignored=API | API chậm hơn 2350 ms
+  🏁 DETECTION_TO_DOWNLOAD_DONE <ID> = … ms (WINNER=BROWSE)
+  🎬 TikTok … DOWNLOAD_DONE_TO_TIKTOK_ATTACH=… ms   |   ⏱️ TIKTOK_STAGES … POST_READY_MS … POST_CONFIRMED_MS …
+  📊 BROWSE_RESPONSE_MS P50 / P90 / P95 | đọc JSON P50 | lượt | RPS | 403 | 429 | mạng | JSON lỗi | mới/cũ/chưa xác minh  (mỗi 60 s)
+  Không in API key/cookie (khoá dạng AIza… luôn bị che).
+
+KIỂM TRA & BÁO CÁO
+  BROWSE_PROBE.bat     — gọi Browse 1 lần cho vài kênh, in từng video + chữ tuổi + kết luận (kiểm parser trên VPS của bạn).
+  BAO_CAO_BROWSE.bat   — BROWSE_REPORT.md: nguồn nào thắng (P50/P90/P95 dẫn trước), Browse thắng API bao nhiêu lần,
+                         video Browse bỏ sót, tỷ lệ xác minh, 403/429, quota API thực tế, và thời gian
+                         DETECTION_TO_DOWNLOAD_DONE / DONE→ATTACH / POST_READY / POST_CONFIRMED theo nguồn thắng.
+  So với WS360 cũ: chạy song song bản cũ (WebSub/API, thư mục production) và bản thử (API + BROWSE, thư mục mới) trên CÙNG
+  danh sách kênh vài ngày, rồi so 2 báo cáo. Cần ≥ 10 video thật mới kết luận.
+
+QUAY LẠI BẢN CŨ: dùng thư mục production như trước (không bị đụng). Mã nguồn trước khi thêm Browse: backup\*_truoc_browse.py.

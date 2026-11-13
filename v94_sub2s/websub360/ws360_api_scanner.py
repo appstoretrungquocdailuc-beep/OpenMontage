@@ -557,6 +557,31 @@ class ApiScanner:
                 return
         self.log(f"⚠️ API kênh {ch}: {why}")
 
+    def video_published(self, vid):
+        """Data API videos.list (1 đơn vị, tính vào quota project như mọi lời gọi khác) → (published datetime|None, lý do).
+        Chỉ dùng để xác minh ứng viên BROWSE ở chế độ API + BROWSE."""
+        got = self._take(self.clock())
+        if got is None:
+            return None, "Data API: hết quota/không có key dùng được"
+        pr, key = got
+        base = self.url.rsplit("/", 1)[0] + "/videos"
+        try:
+            status, rh, body = self.http(f"{base}?part=snippet&id={vid}&fields=items(snippet(publishedAt,channelId))",
+                                         {"X-goog-api-key": key}, float(self.cfg.get("api_timeout_sec", 4.0)))
+        except Exception as e:  # noqa: BLE001
+            self._refund(pr)
+            return None, f"Data API lỗi mạng {type(e).__name__}"
+        if status != 200:
+            return None, f"Data API HTTP {status}"
+        try:
+            items = json.loads(body.decode("utf-8", "replace")).get("items") or []
+        except ValueError:
+            return None, "Data API JSON lỗi"
+        if not items:
+            return None, "Data API chưa có video (chưa index)"
+        p_ = parse_iso((items[0].get("snippet") or {}).get("publishedAt"))
+        return (p_, f"Data API publishedAt {(items[0].get('snippet') or {}).get('publishedAt')}") if p_ else (None, "Data API thiếu publishedAt")
+
     # ---------------------------------------------------------------- giao diện
     def snapshot(self) -> dict:
         hot, cold = self.ivs

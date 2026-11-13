@@ -129,7 +129,26 @@ DEFAULT_CONFIG = {
     "api_timeout_sec": 4.0,
     "api_quota_log_sec": 300,
     "api_url": "",                     # trống = https://www.googleapis.com/youtube/v3/activities
-    "alert_wav": "",                   # file .wav phát khi có video mới (Windows); trống = tắt
+    "alert_wav": "",
+    # ---- InnerTube BROWSE (từ V39) — chế độ API_BROWSE / BROWSE_ONLY ----
+    "browse_uploads_period_sec": 0.75, # MỤC TIÊU mỗi kênh (bị chặn bởi browse_max_rps; không phải tốc độ đã đạt)
+    "browse_videos_tab": True,         # bề mặt phụ: tab Videos
+    "browse_videos_period_sec": 3.0,
+    "browse_max_rps": 16.0,            # RPS tổng tối đa (Uploads); 403/429 → tự giảm + nghỉ
+    "browse_videos_max_rps": 4.0,
+    "browse_workers": 8,
+    "browse_videos_workers": 4,
+    "browse_connect_timeout": 0.45,
+    "browse_read_timeout": 0.95,
+    "browse_with_websub": False,       # API_BROWSE: bật thêm WebSub làm nguồn thứ 3 (cần ngrok)
+    "browse_verify_with_api": True,    # API_BROWSE: ứng viên không có chữ tuổi/publishDate → xác minh bằng Data API (1 đơn vị)
+    "browse_stats_log_sec": 60,
+    "browse_url": "",                  # trống = https://www.youtube.com/youtubei/v1/browse
+    "browse_player_url": "",
+    "browse_client_version": "",       # trống = phiên bản client WEB của yt-dlp đã cài (chỉ đọc hằng số)
+    "browse_api_key": "",              # trống = khoá WEB CÔNG KHAI của InnerTube (như V39)
+    "browse_fast_parse": True,         # đọc nhanh 12 video đầu từ JSON thô (≈1 ms thay vì 13–18 ms), đối chiếu định kỳ
+    "browse_fast_verify_every": 50,    # cứ N lượt giải mã đầy đủ 1 lần để đối chiếu; lệch → tự tắt đọc nhanh                   # file .wav phát khi có video mới (Windows); trống = tắt
     # ---- LỚP MẠNG TẢI 360P ----
     "net_mode": "fast",                # fast: đo DNS/TCP/TLS/chờ máy chủ + DNS cache | legacy: đúng bản trước (rollback)
     "net_warm": True,                  # giữ kết nối ấm tới máy chủ Innertube + máy chủ video vừa dùng (GET /generate_204)
@@ -142,7 +161,7 @@ DEFAULT_CONFIG = {
     "filename_title_max": 0,           # 0 = không tự cắt (chỉ cắt khi vượt giới hạn đường dẫn Windows)
     "filename_max_path": 240,          # tổng độ dài đường dẫn tối đa (Windows giới hạn 260)
 }
-MODES = ("WEBSUB_ONLY", "API_ONLY", "PARALLEL")
+MODES = ("WEBSUB_ONLY", "API_ONLY", "PARALLEL", "API_BROWSE", "BROWSE_ONLY")
 
 
 # =============================== TIỆN ÍCH =============================== #
@@ -328,6 +347,8 @@ def norm_mode(v) -> str:
     v = str(v or "").strip().upper().replace(" ", "_").replace("+", "_")
     if v in MODES:
         return v
+    if "BROWSE" in v:
+        return "API_BROWSE" if "API" in v else "BROWSE_ONLY"
     if "API" in v and "WEBSUB" in v or v in ("RACE", "BOTH", "PARALLEL_RACE"):
         return "PARALLEL"
     if v.startswith("API"):
@@ -1340,13 +1361,15 @@ class Engine:
         self.nudged = set()           # (video, nguồn) đã kích thử lại sớm — mỗi nguồn tối đa 1 lần / video
         self.name_lock = threading.Lock()
         self.api = None               # ApiScanner khi chế độ có API
+        self.browse = None            # BrowseScanner (InnerTube Browse) khi chế độ có BROWSE
         self.websub_on = False
         self.threads = []
         self.httpd = None
         self.callback = ""
         self.stats = {"detected": 0, "downloading": 0, "done": 0, "failed": 0, "excel_ok": 0, "excel_pending": 0,
                       "excel_err": 0, "websub_verified": 0, "webhook": "OFF",
-                      "last": {}, "speed_mbps": 0.0, "pushes": 0, "wins_websub": 0, "wins_api": 0, "mode": self.mode}
+                      "last": {}, "speed_mbps": 0.0, "pushes": 0, "wins_websub": 0, "wins_api": 0, "wins_browse": 0,
+                      "mode": self.mode}
         self.flags = {"download": bool(cfg.get("download_enabled", True)), "excel": bool(cfg.get("excel_enabled", True)),
 }
         self.dl_dir = base / cfg.get("download_dir", "DOWNLOADS")
@@ -1357,18 +1380,21 @@ class Engine:
         """websub/api theo detection_mode. api=None: bật API chỉ khi là lần chạy ĐẦY ĐỦ (websub=True) — SELFTEST/DIAG/HUBTEST
         (websub=False) không bao giờ tiêu quota API."""
         api = websub if api is None else api
+        full = api                                        # Browse cũng chỉ chạy ở lần chạy ĐẦY ĐỦ (không SELFTEST/DIAG)
+        ws_on = self.mode in ("WEBSUB_ONLY", "PARALLEL") or (self.mode == "API_BROWSE" and bool(self.cfg.get("browse_with_websub")))
         with self.life_lock:                              # start/stop không bao giờ chạy chồng nhau
             self._acquire_instance_lock()
             self.stop_ev.clear()
             try:
-                self._start_inner(websub and self.mode != "API_ONLY", workers, excel_watch,
-                                  api and self.mode in ("API_ONLY", "PARALLEL"))
+                self._start_inner(websub and ws_on, workers, excel_watch,
+                                  api and self.mode in ("API_ONLY", "PARALLEL", "API_BROWSE"),
+                                  browse=full and self.mode in ("API_BROWSE", "BROWSE_ONLY"))
             except Exception:
                 self.stop_ev.set()
                 self._stop_inner()
                 raise
 
-    def _start_inner(self, websub, workers, excel_watch, api=False):
+    def _start_inner(self, websub, workers, excel_watch, api=False, browse=False):
         self.websub_on = bool(websub)
         self.reload_channels(initial=True)
         self.recover()
@@ -1388,7 +1414,13 @@ class Engine:
             self.api = ApiScanner(self, self.cfg, self.log, self.base)
             if not self.api.start():
                 self.api = None
+        if browse:
+            sys.path.insert(0, str(BASE_DIR))
+            from ws360_browse import BrowseScanner
+            self.browse = BrowseScanner(self, self.cfg, self.log)
+            self.browse.start()
         self.log(f"🏁 Chế độ phát hiện: {self.mode} | WebSub {'BẬT' if websub else 'TẮT'} | API {'BẬT' if self.api else 'TẮT'}"
+                 f" | BROWSE {'BẬT' if self.browse else 'TẮT'}"
                  + (" (thiếu key → thực tế chỉ còn WebSub)" if self.mode == "PARALLEL" and api and not self.api else "")
                  + (" (thiếu key → KHÔNG có nguồn phát hiện nào!)" if self.mode == "API_ONLY" and api and not self.api else ""))
         self._spawn(self._stats_loop, "STATS")
@@ -1444,6 +1476,12 @@ class Engine:
             self._stop_inner()
 
     def _stop_inner(self):
+        if getattr(self, "browse", None) is not None:      # ngừng nguồn Browse trước (không phát hiện thêm khi đang tắt)
+            try:
+                self.browse.stop()
+            except Exception:
+                pass
+            self.browse = None
         if getattr(self, "warmer", None) is not None:
             self.warmer.stop()
             self.warmer = None
@@ -1551,7 +1589,7 @@ class Engine:
             age = (now_utc() - published).total_seconds()
             # API: CHỈ theo tuổi (≤ max_age_minutes). Cửa sổ 'lúc tool tắt' dành riêng cho WebSub (hub gửi lại sau sự cố);
             # API không có cơ chế gửi lại → dùng cửa sổ đó sẽ biến video cũ (vd 19 giờ) thành 'VIDEO MỚI' lúc khởi động.
-            fresh = self.is_fresh_video(published) if engine == "API" else self.is_new_video(published)
+            fresh = self.is_fresh_video(published) if engine in ("API", "BROWSE") else self.is_new_video(published)
             if not fresh:
                 # KHÔNG đánh dấu 'đã thấy' vĩnh viễn: chỉ ghi nhật ký để có thể xem lại
                 self.hub_event(ch, "push-old", "", None, 0, f"{vid} published {iso(published)} tuổi {int(age)}s ({engine})")
@@ -1608,10 +1646,12 @@ class Engine:
                           "VALUES(?,?,?,?,?,?)", (vid, ch, url, "PENDING", iso(), okey)))
         self.db.tx(stmts)                                 # các bản ghi cùng 1 giao dịch
         self.stats["detected"] += 1
-        self.stats["wins_api" if engine == "API" else "wins_websub"] += 1
+        self.stats[f"wins_{engine.lower()}"] = self.stats.get(f"wins_{engine.lower()}", 0) + 1
         self._alert()
         age_s = f" | tuổi {(now_utc() - published).total_seconds():.1f}s" if published else ""
-        self.log(f"🔥 {engine}_DETECTED {vid} | WINNER={engine} | [{engine}] VIDEO MỚI | kênh {ch} | nhận→hàng đợi "
+        self.log(f"🔥 {engine}_DETECTED {vid} | WINNER={engine}"
+                 + (f" | source={extra['browse_source']}" if extra.get("browse_source") else "")
+                 + f" | [{engine}] VIDEO MỚI | kênh {ch} | nhận→hàng đợi "
                  f"{enq_ms:.3f} ms{age_s}" + (" | mốc khởi động API" if extra.get("baseline") else "") + f" | {title[:60]}")
         return "queued"
 
@@ -1638,7 +1678,7 @@ class Engine:
         row = self.db.one("SELECT state, title FROM videos WHERE video_id=?", (vid,))
         if row is not None and title and not (row["title"] or "").strip():
             self.db.x("UPDATE videos SET title=? WHERE video_id=? AND (title IS NULL OR title='')", (title, vid))
-        self.log(f"📡 {engine}_DETECTED {vid} | WINNER={win} | {engine} chậm hơn "
+        self.log(f"📡 {engine}_DETECTED {vid} | WINNER={win} | duplicate_ignored={engine} | {engine} chậm hơn "
                  + (f"{lag:.0f} ms" if lag is not None else "? ms") + f" | trạng thái tải: {row['state'] if row else '?'}")
         if row is not None and row["state"] == "RETRY_WAIT":
             self._nudge(vid, engine)
@@ -2699,6 +2739,8 @@ class Engine:
                         s["tiktok"] = br.snapshot()
                     if self.api is not None:
                         s["api"] = self.api.snapshot()
+                    if self.browse is not None:
+                        s["browse"] = self.browse.snapshot()
                     self.on_stats(s)
                 except Exception:
                     pass
@@ -2755,7 +2797,8 @@ def run_gui(cfg, base):
     # ---- hàng NGUỒN PHÁT HIỆN (RACE MODE) ----
     det = QHBoxLayout()
     cb_det = QComboBox()
-    det_labels = {"WEBSUB_ONLY": "WEBSUB ONLY", "API_ONLY": "API ONLY", "PARALLEL": "WEBSUB + API PARALLEL"}
+    det_labels = {"WEBSUB_ONLY": "WEBSUB ONLY", "API_ONLY": "API ONLY", "PARALLEL": "WEBSUB + API PARALLEL",
+                  "API_BROWSE": "API + BROWSE", "BROWSE_ONLY": "BROWSE ONLY (không API, không ngrok)"}
     for k, t in det_labels.items():
         cb_det.addItem(t, k)
     cb_det.setCurrentIndex(list(det_labels).index(norm_mode(cfg.get("detection_mode", "PARALLEL"))))
@@ -2767,7 +2810,9 @@ def run_gui(cfg, base):
     sp_iv.setToolTip("Nhịp NHANH NHẤT mỗi kênh. Tool tự giãn theo quota thật (không bao giờ vượt quota).")
     kf = Path(cfg.get("api_keys_file") or "api_keys.txt")
     lb_keys = QLabel(f"File key: {kf.name}" + ("" if (kf if kf.is_absolute() else base / kf).exists() else " (CHƯA CÓ)"))
-    for wdg in (QLabel("Nguồn phát hiện:"), cb_det, QLabel("API nhanh nhất:"), sp_iv, lb_keys):
+    c_bws = QCheckBox("kèm WebSub (API + BROWSE)")
+    c_bws.setChecked(bool(cfg.get("browse_with_websub")))
+    for wdg in (QLabel("Nguồn phát hiện:"), cb_det, c_bws, QLabel("API nhanh nhất:"), sp_iv, lb_keys):
         det.addWidget(wdg)
     det.addStretch(1)
     lay.addLayout(det)
@@ -2794,7 +2839,8 @@ def run_gui(cfg, base):
              ("pushes", "Push WebSub nhận"), ("detected", "Video mới"), ("downloading", "Đang tải"),
              ("done", "Tải xong"), ("failed", "Lỗi tải"), ("speed_mbps", "Tốc độ (Mbps)"), ("resolver_ms", "Resolver (ms)"),
              ("download_ms", "Tải (ms)"), ("mux_ms", "Mux (ms)"), ("total_ms", "Tổng (ms)"), ("excel", "Excel"),
-             ("mode", "Chế độ phát hiện"), ("wins", "Thắng: WebSub / API"), ("api_status", "API"),
+             ("mode", "Chế độ phát hiện"), ("wins", "Thắng: WebSub / API / Browse"), ("api_status", "API"),
+             ("browse_status", "BROWSE"), ("browse_ms", "BROWSE_RESPONSE_MS P50/P90/P95"), ("browse_err", "Browse 403/429/mạng/JSON"),
              ("api_quota", "API_QUOTA_USED"), ("api_interval", "Nhịp quét API"), ("api_polls", "API gọi / lỗi / ms"),
              ("tt_speed", "Trạng thái profile"), ("tt_genlogin", "Genlogin/Selenium"), ("tt_opened", "Profile đã mở"), ("tt_ready", "Profile READY"),
              ("tt_waiting", "Job chờ đăng"), ("tt_uploading", "Đang đăng"), ("tt_confirmed", "POST_CONFIRMED"),
@@ -2831,8 +2877,13 @@ def run_gui(cfg, base):
                  "tt_last": (f"{tl.get('vid')} {tl.get('result')} | DONE→gắn {tl.get('done_to_attach_ms')} ms | "
                              f"WebSub→xác nhận {tl.get('websub_to_confirm_ms')} ms") if tl else None}
         a = s.get("api") or {}
+        b_ = s.get("browse") or {}
+        extra.update({"browse_status": (f"{b_.get('status')} | {b_.get('polls')} lượt | RPS {b_.get('rps')} | mới {b_.get('fresh')} / "
+                                        f"cũ {b_.get('old')} / chưa xác minh {b_.get('unverified')}") if b_ else "TẮT",
+                      "browse_ms": f"{b_.get('p50')} / {b_.get('p90')} / {b_.get('p95')}" if b_ else None,
+                      "browse_err": f"{b_.get('e403')} / {b_.get('e429')} / {b_.get('net')} / {b_.get('parse')}" if b_ else None})
         extra.update({"mode": det_labels.get(s.get("mode"), s.get("mode")),
-                      "wins": f"{s.get('wins_websub', 0)} / {s.get('wins_api', 0)}",
+                      "wins": f"{s.get('wins_websub', 0)} / {s.get('wins_api', 0)} / {s.get('wins_browse', 0)}",
                       "api_status": (f"{a.get('status')} | {a.get('keys')} key / {a.get('projects')} project | "
                                      f"phát hiện {a.get('detected')}") if a else "TẮT",
                       "api_quota": a.get("quota"), "api_interval": (f"{a.get('interval')}" + (
@@ -2858,9 +2909,11 @@ def run_gui(cfg, base):
         cfg["prewarm_mode"] = cb_mode.currentText()
         cfg["open_concurrency"] = sp_open.value()
         cfg["detection_mode"] = cb_det.currentData()
+        cfg["browse_with_websub"] = c_bws.isChecked()
         cfg["api_min_interval_sec"] = sp_iv.value()
         cb_det.setEnabled(False)
         sp_iv.setEnabled(False)
+        c_bws.setEnabled(False)
         e = Engine(cfg, base, log, on_stats=br.stats.emit)
         state["eng"] = e
         if cfg["tiktok_enabled"]:
@@ -2897,7 +2950,7 @@ def run_gui(cfg, base):
             finally:
                 br.stopped.emit()
         threading.Thread(target=_bg, daemon=True).start()
-    br.stopped.connect(lambda: (b_start.setEnabled(True), b_stop.setEnabled(False), cb_det.setEnabled(True), sp_iv.setEnabled(True)))
+    br.stopped.connect(lambda: (b_start.setEnabled(True), b_stop.setEnabled(False), cb_det.setEnabled(True), sp_iv.setEnabled(True), c_bws.setEnabled(True)))
     br.started.connect(lambda: b_stop.setEnabled(True))
     b_start.clicked.connect(start)
     b_stop.clicked.connect(stop)
@@ -3965,6 +4018,114 @@ def bench(cfg, base, ids, reps=3):
     log(f"📄 Đã ghi {out}")
 
 
+def browse_report(base: Path, db_name="database.sqlite", hours=168.0) -> dict:
+    """Số liệu THẬT (database.sqlite) cho các chế độ có BROWSE → BROWSE_REPORT.md: thắng/thua giữa các nguồn, BROWSE_RESPONSE_MS,
+    403/429, xác minh, quota API, bỏ sót, và thời gian tải/đăng theo nguồn thắng (median/P90/P95)."""
+    db = DB(base / db_name)
+    for t in ("CREATE TABLE IF NOT EXISTS browse_verify(video_id TEXT PRIMARY KEY, channel_id TEXT, source TEXT, verdict TEXT, "
+              "method TEXT, age_lo REAL, age_hi REAL, reason TEXT, at TEXT, response_ms REAL)",
+              "CREATE TABLE IF NOT EXISTS browse_stats(ts REAL, polls INTEGER, p50 REAL, p90 REAL, p95 REAL, n403 INTEGER, "
+              "n429 INTEGER, nerr INTEGER, nparse INTEGER, fresh INTEGER, old INTEGER, unverified INTEGER)"):
+        db.x(t)
+    since = time.time() - hours * 3600
+    det = db.all("SELECT * FROM detections WHERE baseline=0 AND t_wall>=? ORDER BY t_wall", (since,))
+    by = {}
+    for r in det:
+        by.setdefault(r["video_id"], {})[r["source"]] = r
+    srcs = sorted({r["source"] for r in det})
+    md = [f"# BROWSE REPORT — {iso()} — {len(by)} video trong {hours:.0f} giờ qua (dữ liệu THẬT từ database.sqlite)", ""]
+    md += ["## Nguồn nào phát hiện trước", "", "| Nguồn | phát hiện | thắng | thua | dẫn trước khi thắng (ms) P50 / P90 / P95 |", "|---|---|---|---|---|"]
+    res = {"sources": {}}
+    for sname in srcs:
+        rs = [d[sname] for d in by.values() if sname in d]
+        won = [d for d in by.values() if sname in d and d[sname]["winner"]]
+        leads = [o["lag_ms"] for d in won for k, o in d.items() if k != sname and o["lag_ms"] is not None]
+        res["sources"][sname] = {"detected": len(rs), "wins": len(won)}
+        f_ = lambda v: "-" if v is None else f"{v:.0f}"
+        md.append(f"| {sname} | {len(rs)} | {len(won)} | {len(rs) - len(won)} | {f_(pct(leads, 50))} / {f_(pct(leads, 90))} / {f_(pct(leads, 95))} |")
+    if "BROWSE" in srcs:
+        missed = [v for v, d in by.items() if "BROWSE" not in d and any(x["mode"] in ("API_BROWSE", "BROWSE_ONLY") for x in d.values())]
+        bw = sum(1 for d in by.values() if "BROWSE" in d and "API" in d and d["BROWSE"]["winner"])
+        aw = sum(1 for d in by.values() if "BROWSE" in d and "API" in d and d["API"]["winner"])
+        res.update(browse_missed=len(missed), browse_beat_api=bw, api_beat_browse=aw)
+        md += ["", f"Browse thắng API: **{bw}** lần | API thắng Browse: **{aw}** lần | video Browse BỎ SÓT (nguồn khác thấy, Browse không): "
+               f"**{len(missed)}**" + (f" ({', '.join(missed[:10])})" if missed else "")]
+    vr = db.all("SELECT verdict, method, COUNT(*) n FROM browse_verify GROUP BY verdict, method")
+    if vr:
+        tot = sum(r["n"] for r in vr)
+        ok = sum(r["n"] for r in vr if r["verdict"] in ("FRESH", "OLD"))
+        res["verify_rate"] = round(100 * ok / tot, 1)
+        md += ["", "## Xác minh độ mới ứng viên Browse", "", f"Xác minh được: **{ok}/{tot} ({res['verify_rate']}%)**", "",
+               "| Kết luận | Cách xác minh | số |", "|---|---|---|"] + [f"| {r['verdict']} | {r['method']} | {r['n']} |" for r in vr]
+        un = db.all("SELECT video_id, reason FROM browse_verify WHERE verdict='UNVERIFIED' ORDER BY at DESC LIMIT 10")
+        if un:
+            md += ["", "UNVERIFIED gần nhất (không tải, không đăng):"] + [f"- {r['video_id']}: {r['reason']}" for r in un]
+    st = db.all("SELECT * FROM browse_stats WHERE ts>=? ORDER BY ts", (since,))
+    if st:
+        last = st[-1]
+        md += ["", "## Mạng Browse", "", f"BROWSE_RESPONSE_MS (median các lần chốt mỗi phút): P50 {pct([r['p50'] for r in st if r['p50']], 50)} / "
+               f"P90 {pct([r['p90'] for r in st if r['p90']], 50)} / P95 {pct([r['p95'] for r in st if r['p95']], 50)} | "
+               f"403 lớn nhất trong 1 phiên: {max(r['n403'] or 0 for r in st)} | 429: {max(r['n429'] or 0 for r in st)} | "
+               f"lỗi mạng: {max(r['nerr'] or 0 for r in st)} | JSON lỗi: {max(r['nparse'] or 0 for r in st)} | lượt quét phiên cuối: {last['polls']}"]
+    try:
+        q = db.all("SELECT * FROM api_quota ORDER BY day DESC LIMIT 20")
+    except sqlite3.Error:
+        q = []
+    if q:
+        md += ["", "## Quota YouTube Data API thực tế (theo ngày Thái Bình Dương)", "", "| Ngày | project | đã dùng |", "|---|---|---|"] + \
+              [f"| {r['day']} | {r['project']} | {r['used']} |" for r in q]
+    rows = []
+    try:
+        jobs = db.all("SELECT u.job_id FROM upload_jobs u JOIN videos v ON v.video_id=u.video_id WHERE u.state IN ('CONFIRMED','DRY_RUN_DONE')")
+    except sqlite3.Error:                                 # chưa bật TikTok lần nào → chưa có bảng upload_jobs
+        jobs = []
+    for r in jobs:
+        x = _pipe_row(db, r["job_id"])
+        if x:
+            x["winner"] = (db.one("SELECT engine FROM videos WHERE video_id=?", (x["video_id"],)) or {"engine": "?"})["engine"]
+            rows.append(x)
+    if not rows:
+        vids = db.all("SELECT engine, total_ms FROM videos WHERE state='DONE' AND total_ms IS NOT NULL")
+        rows = [{"winner": r["engine"], "detect_to_done_ms": r["total_ms"]} for r in vids]
+    if rows:
+        md += [""] + _pipe_table(rows, "Thời gian theo nguồn thắng (DETECTION_TO_DOWNLOAD_DONE / DONE→ATTACH / POST_READY_MS / POST_CONFIRMED_MS)",
+                                 groups_key="winner")
+    (base / "BROWSE_REPORT.md").write_text("\n".join(md) + "\n", encoding="utf-8")
+    print("\n".join(md))
+    return res
+
+
+def browse_probe(cfg, base, channels):
+    """Chẩn đoán: 1 lượt Browse (Uploads + tab Videos) cho từng kênh → in mỗi dòng: Video ID, chữ tuổi, kết luận (KHÔNG tải, KHÔNG
+    ghi Excel/DB thật: dùng database_PROBE.sqlite riêng). Dùng để kiểm tra parser trên dữ liệu thật của VPS."""
+    sys.path.insert(0, str(BASE_DIR))
+    from ws360_browse import BrowseScanner, parse_relative_age
+    log = Log(base / "logs")
+    eng = Engine(dict(cfg, excel_enabled=False, download_enabled=False), base, log, db_name="database_PROBE.sqlite",
+                 lock_name="ws360_probe.lock")
+    chans = [c for c in (norm_channel(x) for x in channels) if c]
+    if not chans:
+        eng.reload_channels(initial=True)
+        chans = list(eng.channels)[:5]
+    bs = BrowseScanner(eng, eng.cfg, log)
+    lim = float(cfg.get("max_age_minutes", 30)) * 60
+    for c in chans:
+        for surf in bs.surfaces:
+            r = bs.browse(c, surf)
+            print(f"\n== {c} [{surf}] HTTP {r['status']} | {r['ms']:.0f} ms | parse {r.get('parse_ms', 0):.1f} ms ({r.get('how')}) | "
+                  f"{len(r['rows'])} dòng {r['err']}")
+            for row in r["rows"][:6]:
+                ra = parse_relative_age(row.get("age_text"))
+                verdict = ("CHƯA CÔNG CHIẾU" if ra == "SCHEDULED" else ("MỚI (≤%d phút)" % (lim // 60) if ra[1] <= lim else "CŨ")) \
+                    if ra else "không có chữ tuổi → cần player/API xác minh"
+                print(f"   {row['video_id']} | '{row.get('age_text', '')}' → {verdict} | {row.get('title', '')[:50]}")
+    try:
+        eng.db.con.close()
+    except Exception:
+        pass
+    return 0
+
+
 def race_report(db: "DB", out_dir: Path | None = None) -> dict:
     """So sánh WebSub ↔ API trên dữ liệu THẬT trong database.sqlite (bảng detections). Không suy diễn: video chỉ 1 nguồn
     thấy được ghi riêng; không đủ dữ liệu → PENDING."""
@@ -4047,6 +4208,8 @@ def main(argv=None):
                     "N vòng, không API/Excel/TAM/TikTok → DOWNLOAD_ONLY_BENCHMARK.md/.csv")
     ap.add_argument("--bench-pipeline", nargs="*", help="toàn tuyến thật CHẠY THỬ (không bấm Post): tải → TikTok → POST_READY; cần --profile")
     ap.add_argument("--profile", default="", help="--bench-pipeline: Profile ID Genlogin dùng để đo")
+    ap.add_argument("--browse-report", action="store_true", help="thống kê Browse/API/WebSub + tải/đăng theo nguồn thắng → BROWSE_REPORT.md")
+    ap.add_argument("--browse-probe", nargs="*", help="gọi Browse 1 lần cho các Channel ID (hoặc cột K) và in dòng + chữ tuổi + kết luận")
     ap.add_argument("--pipeline-report", action="store_true", help="median/P90/P95 từng giai đoạn từ các job đăng thật → PIPELINE_REPORT.md")
     ap.add_argument("--integrated", action="store_true", help="bật sẵn tự đăng TikTok (TAM) khi mở giao diện / headless")
     ap.add_argument("--dry-run-post", action="store_true", help="tích hợp: chạy tới khi nút Post sáng rồi DỪNG, không bấm")
@@ -4085,6 +4248,11 @@ def main(argv=None):
     if a.pipeline_report:
         pipeline_report(base)
         return 0
+    if a.browse_report:
+        browse_report(base)
+        return 0
+    if a.browse_probe is not None:
+        return browse_probe(cfg, base, a.browse_probe)
     if a.bench_pipeline is not None:
         ids = [v for v in (extract_vid(x) for x in a.bench_pipeline) if v]
         if not ids or not a.profile:
