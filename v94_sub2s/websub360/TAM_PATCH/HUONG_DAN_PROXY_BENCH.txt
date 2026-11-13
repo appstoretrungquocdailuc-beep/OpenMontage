@@ -1,0 +1,43 @@
+PROXY UPLOAD BENCHMARK (TEST ONLY) — so sánh 2 proxy xem proxy nào làm nút Post TikTok sáng nhanh hơn
+=====================================================================================================
+
+CHỨC NĂNG NÀY KHÔNG BAO GIỜ BẤM POST. Mỗi lượt chỉ: gắn video vào TikTok Studio → đợi TikTok xử lý → đo lúc nút Post
+sáng → DỪNG → làm sạch trang Upload. Hai lớp bảo vệ: luôn chạy thử (dry-run) + một chốt chặn huỷ mọi lần bấm.
+Không ghi vào nhật ký đăng (tam_post_journal.jsonl), không tạo job, không đụng database/Excel của WS360.
+
+CHUẨN BỊ
+1. Chép tam_INSTANT_POST.py (bản 5.3.0) + PROXY_BENCH_TIKTOK.bat vào thư mục TAM (cạnh Genlogin.py, chromedriver.exe).
+   Bản cũ đã lưu trong backup\. GENLOGIN_API_TOKEN giữ để trống như file bạn gửi (điền lại nếu bạn có điền).
+2. Trong Genlogin: lưu sẵn 2 cấu hình proxy A và B. Dùng 1 profile + 1 tài khoản TikTok THỬ (đã đăng nhập).
+3. Chuẩn bị 1 file MP4 cố định (vd 360p, 3–9 MB). Dùng CÙNG file cho cả A và B.
+4. Tắt WS360/TAM đang mở profile thử đó.
+
+CHẠY
+1. Nhấp đúp PROXY_BENCH_TIKTOK.bat → cửa sổ "PROXY UPLOAD BENCHMARK — TEST ONLY".
+2. Nhập Profile ID, bấm "📂 Chọn file MP4", đặt tên Proxy A / Proxy B (CHỈ là tên để nhận diện — KHÔNG nhập user/pass).
+3. "Lượt mỗi khối" n = 3 (mặc định) → thứ tự A×3, B×6, A×3 (kiểu A-B-B-A) → mỗi proxy 6 lượt. Muốn chắc hơn: n = 5 → 10 lượt/proxy.
+4. Bấm "▶ BẮT ĐẦU TEST". Mỗi khi cần đổi proxy (3 lần: đặt A, đổi B, đổi lại A):
+   - tool ĐÓNG phiên Genlogin của profile → hiện hộp thoại;
+   - bạn mở Genlogin, sửa profile, chọn proxy được yêu cầu, lưu → bấm OK;
+   - tool mở lại profile, kiểm tra IP công khai qua chính trình duyệt đó. IP KHÔNG ĐỔI so với proxy kia → tool không đo,
+     yêu cầu đổi lại (tối đa 3 lần). Không bao giờ đổi proxy giữa lúc đang upload.
+5. Thời gian: mỗi lượt ≈ thời gian upload + xử lý + nạp lại trang (thường 10–30 s) → n=3 khoảng 5–10 phút.
+
+KẾT QUẢ
+- Bảng trên cửa sổ: Proxy | Lượt thử | File MB | Post Ready (ms) | Thành công/Lỗi, và dòng KẾT LUẬN.
+- File trong thư mục PROXY_BENCH\ cạnh TAM: proxy_bench_<ngày giờ>.md (bảng + tổng hợp), .csv (từng lượt), .json.
+- Đo mỗi lượt: PROFILE_START_MS (lượt đầu sau khi mở profile), FILE_ATTACH_MS, POST_READY_MS (file gắn xong → nút Post sẵn sàng),
+  UPLOAD_TRANSFER_MS (ước lượng — chỉ có khi trình duyệt ghi nhận được yêu cầu upload; trống = không đo được), CPU/RAM Chrome
+  và Python, loại lỗi (TIMEOUT / MẠNG / LỖI).
+- Tổng hợp mỗi proxy: median, P90 POST_READY, tỷ lệ lỗi.
+- KẾT LUẬN chỉ chọn proxy THẮNG khi ĐỒNG THỜI: (1) khoảng tin cậy 95% của chênh lệch không chứa 0, (2) kiểm định Mann–Whitney
+  p < 0,05, (3) chênh ≥ max(150 ms, 7%), (4) tỷ lệ lỗi không cao hơn, và mỗi proxy ≥ 5 lượt thành công. Không đủ → "CHƯA KHÁC BIỆT RÕ"
+  hoặc "CHƯA KẾT LUẬN" → chạy thêm (tăng n). Mô phỏng: 2 proxy giống hệt → báo nhầm ~3%; chênh thật 1,5 s → phát hiện ~100%.
+- IP trong báo cáo được che bớt (vd 103.45.x.x #a1b2c3); không ghi user/pass proxy ở đâu cả.
+
+LƯU Ý
+- Kết quả đúng cho MẠNG + MÁY + GIỜ bạn chạy. Chạy lại vào giờ cao điểm nếu bạn hay đăng giờ đó.
+- TikTok có thể giữ bản nháp sau mỗi lượt chạy thử; tool nạp lại trang Upload trước lượt sau. Nếu TikTok hiện hộp thoại
+  "tiếp tục chỉnh sửa?" làm không thấy ô chọn file → lượt đó báo lỗi; đóng hộp thoại bằng tay rồi chạy lại.
+- Dòng lệnh (không giao diện):
+  python tam_INSTANT_POST.py --proxy-bench-cli --profile 12345 --file "D:\video.mp4" --proxy-a Viettel --proxy-b FPT --per-block 3

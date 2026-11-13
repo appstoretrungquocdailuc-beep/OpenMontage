@@ -116,3 +116,99 @@ def test_bench_watch_cli_modes_x_page_states_reports_p90_p95(lab, monkeypatch, c
     finally:
         for f in set(Path(tam.BASE_DIR).glob("tam_bench_watch_*.json")) - before:
             f.unlink()
+
+
+def _proxy_bench(lab, monkeypatch, tmp_path, ips, asks, **kw):
+    tam = lab["tam"]
+    tam.TARGET_UPLOAD_URL = f"{lab['base']}/tiktokstudio/upload?nodes=60"
+    opened, closed = [], []
+    monkeypatch.setattr(tam, "_open_one", lambda pid: opened.append(pid) or lab["drv"])
+    monkeypatch.setattr(tam, "_close_one", lambda pid, drv, keep: closed.append(pid))
+    seq = iter(ips)
+    pb = tam.ProxyBench("PB1", lab["file"], "Viettel", "FPT", 3, log=lambda m: None,
+                        ask_switch=lambda label, pid, attempt: asks.append((label, attempt)) or True,
+                        out_dir=str(tmp_path / "PROXY_BENCH"), ip_fn=lambda drv: next(seq), **kw)
+    return pb, opened, closed
+
+
+def test_proxy_bench_abba_test_only_never_clicks_and_reports(lab, monkeypatch, tmp_path):
+    asks = []
+    pb, opened, closed = _proxy_bench(lab, monkeypatch, tmp_path, ["1.1.1.1", "2.2.2.2", "1.1.1.1"], asks)
+    tam = lab["tam"]
+    seen = []
+    real = tam.upload_video_to_tiktok_ex
+
+    def spy(*a, **k):
+        seen.append((k.get("dry_run"), k["hooks"].before_click()))    # TEST ONLY: luôn dry-run + hook chặn bấm
+        return real(*a, **k)
+    monkeypatch.setattr(tam, "upload_video_to_tiktok_ex", spy)
+    jp = tam.CFG.journal_path
+    j_before = open(jp, encoding="utf-8").read() if os.path.exists(jp) else ""
+    out = pb.run()
+    assert pb.plan() == ["Viettel"] * 3 + ["FPT"] * 6 + ["Viettel"] * 3          # A-B-B-A theo khối
+    assert [a for a, _ in asks] == ["Viettel", "FPT", "Viettel"]                   # chỉ đổi proxy 2 lần (+ lần đặt đầu)
+    assert len(opened) == 3 and len(closed) == 3                                   # đóng phiên cũ trước mỗi lần đổi
+    rows = out["rows"]
+    assert len(rows) == 12 and all(r["result"] == "OK" and not r["clicked"] for r in rows)
+    assert all(d is True and bc is False for d, bc in seen)
+    assert not lab["page"].evaluate("() => window.__mock.marks.postClick")       # trang không nhận cú bấm nào
+    assert sum(1 for r in rows if r["profile_start_ms"] is not None) == 3          # chỉ lượt đầu sau mỗi lần mở profile
+    assert all(r["post_ready_ms"] and r["file_attach_ms"] is not None for r in rows)
+    s = out["summary"]
+    assert s["Viettel"]["runs"] == 6 and s["FPT"]["runs"] == 6 and s["FPT"]["error_rate"] == 0.0
+    md = Path(out["files"][0]).read_text(encoding="utf-8")
+    assert "| Proxy | Lượt thử | File MB | Post Ready (ms) | Thành công/Lỗi |" in md and "1.1.1.1" not in md   # IP che bớt
+    assert ("THẮNG" in out["verdict"]) or ("CHƯA" in out["verdict"])
+    j_after = open(jp, encoding="utf-8").read() if os.path.exists(jp) else ""
+    assert j_after == j_before                                                     # journal đăng production KHÔNG đổi
+
+
+def test_proxy_bench_refuses_to_test_when_ip_did_not_change(lab, monkeypatch, tmp_path):
+    asks = []
+    # lần 1 (A) IP 1.1.1.1; đổi sang B nhưng IP vẫn 1.1.1.1 ×3 → không chạy lượt B nào, dừng
+    pb, opened, closed = _proxy_bench(lab, monkeypatch, tmp_path, ["1.1.1.1"] + ["1.1.1.1"] * 3, asks)
+    out = pb.run()
+    assert [a for a, _ in asks] == ["Viettel", "FPT", "FPT", "FPT"]
+    assert {r["proxy"] for r in out["rows"]} == {"Viettel"} and len(out["rows"]) == 3
+    assert "CHƯA KẾT LUẬN" in out["verdict"]
+
+
+def test_proxy_bench_verdict_needs_real_significance():
+    """Quy tắc chọn proxy thắng: 2 proxy GIỐNG HỆT → hiếm khi (≤ 6%) báo thắng; chênh thật 1,5 s → gần như luôn phát hiện."""
+    import random as R
+    tam = __import__("ws360_tam_bridge").load_tam(str(HERE / "fixtures" / "tam_INSTANT_POST.py"))
+    assert round(tam.mann_whitney_p([1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]), 4) == 0.0022     # giá trị chuẩn U=0, n=6/6
+    rnd = R.Random(11)
+    pb = tam.ProxyBench("X", __file__, "A", "B", 3)
+    fp = 0
+    for _ in range(150):
+        pb.rows = [{"proxy": p, "run": i, "result": "OK", "post_ready_ms": 3000 + rnd.gauss(0, 400)} for p in "AB" for i in range(6)]
+        fp += "THẮNG" in pb.verdict(pb.summary())
+    assert fp / 150 <= 0.06, fp
+    hit = 0
+    for _ in range(60):
+        pb.rows = [{"proxy": "A", "run": i, "result": "OK", "post_ready_ms": 2000 + rnd.gauss(0, 300)} for i in range(6)] + \
+                  [{"proxy": "B", "run": i, "result": "OK", "post_ready_ms": 3500 + rnd.gauss(0, 300)} for i in range(6)]
+        hit += "THẮNG: A" in pb.verdict(pb.summary())
+    assert hit / 60 >= 0.95, hit
+    pb.rows = [{"proxy": "A", "run": i, "result": "OK", "post_ready_ms": 2000} for i in range(6)] + \
+              [{"proxy": "B", "run": i, "result": "OK" if i < 3 else "TIMEOUT", "post_ready_ms": 1500} for i in range(6)]
+    assert "CHƯA KẾT LUẬN" in pb.verdict(pb.summary())                          # B chỉ 3 lượt thành công
+    pb.rows = [{"proxy": "A", "run": i, "result": "OK" if i < 5 else "TIMEOUT", "post_ready_ms": 1500} for i in range(7)] + \
+              [{"proxy": "B", "run": i, "result": "OK", "post_ready_ms": 3000 + i} for i in range(7)]
+    assert "CHƯA CHỌN" in pb.verdict(pb.summary())                              # nhanh hơn nhưng lỗi nhiều hơn → không chọn
+
+
+def test_proxy_bench_window_builds(monkeypatch):
+    pytest.importorskip("PySide6")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    tam = __import__("ws360_tam_bridge").load_tam(str(HERE / "fixtures" / "tam_INSTANT_POST.py"))
+    if not tam.HAS_QT:
+        pytest.skip("PySide6 không nạp được")
+    shown = {}
+    monkeypatch.setattr(tam.QApplication, "exec", lambda self: shown.setdefault("ok", 0))
+    assert tam.run_proxy_bench_gui() == 0
+    w = [x for x in tam.QApplication.topLevelWidgets() if "PROXY UPLOAD BENCHMARK" in x.windowTitle()]
+    assert w and "TEST ONLY" in w[0].windowTitle()
+    texts = " ".join(b.text() for b in w[0].findChildren(tam.QPushButton))
+    assert "Chọn file MP4" in texts and "BẮT ĐẦU TEST" in texts

@@ -30,6 +30,7 @@ Công cụ dòng lệnh:                python tam_INSTANT_POST.py --help
 import argparse
 import collections
 import contextlib
+import csv
 import datetime
 import difflib
 import enum
@@ -53,7 +54,7 @@ from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 BACKEND_NAME = "tam_INSTANT_POST"
-BACKEND_VERSION = "5.2.0"
+BACKEND_VERSION = "5.3.0"
 BACKEND_API_LEVEL = 5          # GUI bắt buộc khớp số này (chống GUI mới chạy backend cũ)
 
 
@@ -5037,6 +5038,463 @@ def cli_bench_watch(pid: str, files: List[str], repeat: int, yes: bool, keep_ope
         _close_one(pid, drv, keep_open)
 
 
+# ======================================================================================
+# PROXY UPLOAD BENCHMARK (TEST ONLY) — so sánh 2 proxy A/B trên CÙNG profile, CÙNG file, CÙNG tài khoản.
+#  * LUÔN dry-run (gắn file → chờ nút Post sáng → DỪNG). Thêm lớp bảo vệ thứ 2: hook before_click trả False (huỷ mọi lần bấm).
+#  * Đổi proxy: đóng phiên Genlogin → NGƯỜI DÙNG đổi proxy của profile trong Genlogin → mở lại → kiểm tra IP công khai ĐÃ ĐỔI.
+#    (Tool không tự sửa cấu hình proxy qua API Genlogin chưa được kiểm chứng; không bao giờ nhận/ghi user/pass proxy.)
+#  * Thứ tự A-B-B-A theo khối: A×n, B×2n, A×n (mỗi proxy 2n lượt, chỉ đổi proxy 2 lần).
+#  * Dữ liệu riêng: thư mục PROXY_BENCH/ (json/csv/md + perf riêng). Không ghi journal đăng, không tạo job, không đụng SQLite WS360.
+# ======================================================================================
+IP_CHECK_URLS = ("https://api.ipify.org?format=json", "https://www.cloudflare.com/cdn-cgi/trace")
+
+
+def _mask_ip(ip: Optional[str]) -> str:
+    if not ip:
+        return "?"
+    parts = re.split(r"[.:]", ip)
+    tag = hashlib.sha1(ip.encode()).hexdigest()[:6]
+    return (".".join(parts[:2]) + ".x.x" if "." in ip else ":".join(parts[:2]) + ":…") + f" #{tag}"
+
+
+def check_public_ip(drv, urls=IP_CHECK_URLS, timeout_s: float = 15.0) -> Optional[str]:
+    """IP công khai mà TRÌNH DUYỆT của profile đang đi ra (qua proxy). Mở trang kiểm tra IP trong chính tab đó."""
+    for u in urls:
+        try:
+            drv.get(u)
+            t = str(drv.execute_script("return document.body ? document.body.innerText : ''") or "")
+            m = re.search(r'"ip"\s*:\s*"([^"]+)"', t) or re.search(r"(?m)^ip=(\S+)", t)
+            if m:
+                return m.group(1).strip()
+        except Exception:
+            continue
+    return None
+
+
+def _ram_snapshot(drv) -> Dict[str, Optional[float]]:
+    out = {"python_mb": None, "chrome_mb": None}   # type: Dict[str, Optional[float]]
+    if psutil is None:
+        return out
+    try:
+        out["python_mb"] = round(psutil.Process(os.getpid()).memory_info().rss / 1e6, 1)
+    except Exception:
+        pass
+    port = _debug_port(drv)
+    if port:
+        try:
+            for conn in psutil.net_connections(kind="tcp"):
+                if conn.status == "LISTEN" and conn.laddr and conn.laddr.port == port and conn.pid:
+                    p = psutil.Process(conn.pid)
+                    out["chrome_mb"] = round(sum(q.memory_info().rss for q in [p] + p.children(recursive=True)) / 1e6, 1)
+                    break
+        except Exception:
+            pass
+    return out
+
+
+def mann_whitney_p(a: List[float], b: List[float]) -> float:
+    """p hai phía của Mann–Whitney U. CHÍNH XÁC (liệt kê mọi cách chia) khi số tổ hợp ≤ 50.000, ngược lại xấp xỉ chuẩn."""
+    import itertools
+    import math
+    a, b = [float(x) for x in a], [float(x) for x in b]
+    na, nb = len(a), len(b)
+    if not na or not nb:
+        return 1.0
+    allv = a + b
+    order = sorted(range(len(allv)), key=lambda i: allv[i])
+    ranks = [0.0] * len(allv)
+    i = 0
+    while i < len(order):                                # hạng trung bình cho giá trị bằng nhau
+        j = i
+        while j + 1 < len(order) and allv[order[j + 1]] == allv[order[i]]:
+            j += 1
+        for k_ in range(i, j + 1):
+            ranks[order[k_]] = (i + j) / 2.0 + 1
+        i = j + 1
+    u_of = lambda idx: sum(ranks[x] for x in idx) - na * (na + 1) / 2.0
+    u = u_of(range(na))
+    mu = na * nb / 2.0
+    if math.comb(na + nb, na) <= 50000:
+        dev = abs(u - mu)
+        tot = hit = 0
+        for comb in itertools.combinations(range(na + nb), na):
+            tot += 1
+            if abs(u_of(comb) - mu) >= dev - 1e-9:
+                hit += 1
+        return hit / tot
+    sd = math.sqrt(na * nb * (na + nb + 1) / 12.0)
+    z = (abs(u - mu) - 0.5) / sd if sd else 0.0
+    return math.erfc(z / math.sqrt(2))
+
+
+def _classify_err(status: str, reason: str) -> str:
+    r = (reason or "").lower()
+    if status == "DRY_RUN":
+        return ""
+    if "nút post chưa sẵn sàng" in r or "timeout" in r or "hết " in r and "giây" in r:
+        return "TIMEOUT"
+    if any(k in r for k in ("net::", "err_", "mất kết nối", "connection", "proxy", "tunnel", "dns")):
+        return "MẠNG"
+    if status == "KILLED":
+        return "DỪNG"
+    return "LỖI"
+
+
+class ProxyBench:
+    """Lõi benchmark (dùng chung cho cửa sổ GUI và dòng lệnh). ask_switch(label, pid, attempt) -> bool phải CHẶN tới khi người dùng
+    xác nhận đã đổi proxy trong Genlogin (False = huỷ)."""
+
+    def __init__(self, pid: str, file: str, label_a: str = "A", label_b: str = "B", per_block: int = 3,
+                 log: Callable[[str], None] = print, ask_switch: Optional[Callable[[str, str, int], bool]] = None,
+                 should_stop: Callable[[], bool] = lambda: False, out_dir: Optional[str] = None,
+                 ready_timeout_s: Optional[float] = None, on_row: Optional[Callable[[Dict[str, Any]], None]] = None,
+                 ip_fn: Optional[Callable[[Any], Optional[str]]] = None, keep_open: bool = False):
+        self.pid = str(pid).strip()
+        self.file = os.path.abspath(file)
+        self.labels = (str(label_a).strip() or "A", str(label_b).strip() or "B")
+        self.per_block = max(3, int(per_block))                 # ≥ 3 → mỗi proxy ≥ 6 lượt (yêu cầu tối thiểu 5)
+        self.log = log
+        self.ask_switch = ask_switch or (lambda label, pid, attempt: input(
+            f"👉 Mở Genlogin, đổi proxy của profile {pid} sang [{label}], lưu, rồi nhấn Enter (gõ 'q' để huỷ): ").strip().lower() != "q")
+        self.should_stop = should_stop
+        self.out_dir = out_dir or os.path.join(BASE_DIR, "PROXY_BENCH")
+        self.ready_timeout_s = ready_timeout_s
+        self.on_row = on_row
+        self.ip_fn = ip_fn or check_public_ip
+        self.keep_open = keep_open
+        self.rows = []      # type: List[Dict[str, Any]]
+        self.ips = {}       # type: Dict[str, str]
+
+    def plan(self) -> List[str]:
+        a, b = self.labels
+        n = self.per_block
+        return [a] * n + [b] * (2 * n) + [a] * n                 # A-B-B-A theo khối
+
+    def _switch(self, label: str, drv):
+        """Đóng phiên cũ → người dùng đổi proxy → mở lại → xác nhận IP. Trả (drv, profile_start_ms) hoặc (None, lý do)."""
+        if drv is not None:
+            _close_one(self.pid, drv, False)                     # KHÔNG đổi proxy khi phiên còn mở / đang upload
+            self.log(f"🔒 Đã đóng phiên Genlogin của profile {self.pid}.")
+        for attempt in range(1, 4):
+            if self.should_stop():
+                return None, "đã dừng"
+            if not self.ask_switch(label, self.pid, attempt):
+                return None, "người dùng huỷ"
+            t0 = time.perf_counter_ns()
+            drv = _open_one(self.pid)
+            start_ms = (time.perf_counter_ns() - t0) / 1e6
+            if drv is None:
+                self.log(f"❌ Không mở được profile {self.pid} với proxy [{label}] — kiểm tra Genlogin/proxy rồi thử lại.")
+                continue
+            ip = self.ip_fn(drv)
+            other = [l for l, v in self.ips.items() if l != label and v == ip and ip]
+            if ip is None:
+                self.log(f"⚠️ [{label}] không kiểm tra được IP công khai (proxy không kết nối được?).")
+            elif other:
+                self.log(f"⛔ [{label}] IP {_mask_ip(ip)} TRÙNG với proxy [{other[0]}] — proxy CHƯA được đổi. Đổi lại rồi xác nhận.")
+            elif label in self.ips and self.ips[label] != ip:
+                self.log(f"⚠️ [{label}] IP khác lần trước ({_mask_ip(self.ips[label])} → {_mask_ip(ip)}) — proxy xoay IP? Vẫn tiếp tục.")
+            if ip is None or other:
+                _close_one(self.pid, drv, False)
+                continue
+            self.ips.setdefault(label, ip)
+            get_fsm(self.pid).dirty = True                       # tab vừa mở trang kiểm tra IP → lượt đầu nạp lại trang Upload sạch
+            self.log(f"🌐 Proxy [{label}] OK — IP ra ngoài {_mask_ip(ip)} | mở profile {start_ms:.0f} ms")
+            return drv, start_ms
+        return None, "không xác nhận được kết nối proxy sau 3 lần"
+
+    def _one(self, drv, label: str, k: int, profile_start_ms: Optional[float]) -> Dict[str, Any]:
+        snap = {}   # type: Dict[str, Any]
+
+        def hook(msg):
+            if "[Timing] T1" in msg:
+                snap.update(c0=_cpu_snapshot(drv))
+            elif "💡 [READY]" in msg:
+                snap.update(c1=_cpu_snapshot(drv), ram=_ram_snapshot(drv))
+        size = (stat_file(self.file) or (0, 0))[0]
+        tr = PerfTrace(label=f"proxy-{label}#{k}", profile=self.pid, mode="PROXY-BENCH", n_files=1, n_bytes=size)
+        tr.mark_unknown("FILE_READY", "bench")
+        guard = JobHooks(before_click=lambda: False)             # lớp bảo vệ 2: dù có gì sai, KHÔNG BAO GIỜ bấm Post
+        res = upload_video_to_tiktok_ex(drv, [self.file], logger_func=hook, check_force_kill=self.should_stop, pid=self.pid,
+                                        mode="PROXY-BENCH", trace=tr, hooks=guard, dry_run=True)
+        rec = tr.record()
+        msx = rec.get("ms") or {}
+        fl = rec.get("flags") or {}
+
+        def d(a, b):
+            ma, mb = tr.marks.get(a), tr.marks.get(b)
+            pa, pb = getattr(ma, "py_ns", None), getattr(mb, "py_ns", None)
+            return None if pa is None or pb is None else round((pb - pa) / 1e6, 1)
+        st = res.status.value
+        reason = re.sub(r"(?i)(https?://)[^@\s/]+:[^@\s/]+@", r"\1***@", str(res.reason or ""))[:200]   # không lộ user:pass nếu có
+        c0, c1 = snap.get("c0") or {}, snap.get("c1") or {}
+        row = {"proxy": label, "run": k, "file_mb": round(size / 1e6, 2), "result": "OK" if st == "DRY_RUN" else st,
+               "error": _classify_err(st, reason), "reason": "" if st == "DRY_RUN" else reason,
+               "profile_start_ms": None if profile_start_ms is None else round(profile_start_ms),
+               "page_reload_ms": d("JOB_START", "PAGE_READY"), "file_attach_ms": d("SEND_KEYS_START", "SEND_KEYS_END"),
+               "post_ready_ms": d("SEND_KEYS_END", "PROCESSING_READY"), "attach_to_ready_page_ms": msx.get("AttachToReadyPage"),
+               "upload_transfer_ms": fl.get("x_net_span_ms"), "cpu_chrome_s": None, "cpu_python_s": None,
+               "ram_chrome_mb": (snap.get("ram") or {}).get("chrome_mb"), "ram_python_mb": (snap.get("ram") or {}).get("python_mb"),
+               "vis": fl.get("vis_ready"), "clicked": bool(res.clicked)}
+        for key in ("chrome", "python"):
+            if c0.get(key) is not None and c1.get(key) is not None:
+                row[f"cpu_{key}_s"] = round(c1[key] - c0[key], 3)
+        return row
+
+    def run(self) -> Dict[str, Any]:
+        if not os.path.isfile(self.file) or not self.file.lower().endswith(".mp4"):
+            raise ValueError(f"cần 1 file .mp4 có thật: {self.file}")
+        os.makedirs(self.out_dir, exist_ok=True)
+        saved = (CFG.rec_enable, CFG.upload_url_re, CFG.ready_timeout_s, CFG.stage)
+        CFG.rec_enable = True                                    # ghi thụ động (Resource Timing/long task) GIỐNG nhau cho A và B
+        CFG.upload_url_re = CFG.upload_url_re or r"upload"       # ước lượng UPLOAD_TRANSFER_MS (không khớp → để trống)
+        CFG.stage = "direct"
+        if self.ready_timeout_s:
+            CFG.ready_timeout_s = float(self.ready_timeout_s)
+        plan = self.plan()
+        self.log(f"🧪 PROXY BENCH (TEST ONLY — KHÔNG BẤM POST): profile {self.pid} | file {os.path.basename(self.file)} "
+                 f"({(stat_file(self.file) or (0, 0))[0] / 1e6:.2f} MB) | thứ tự {'-'.join(plan)}")
+        drv, cur, start_ms = None, None, None
+        k = {l: 0 for l in self.labels}
+        try:
+            for label in plan:
+                if self.should_stop():
+                    self.log("⏹ Đã dừng theo yêu cầu.")
+                    break
+                if label != cur:
+                    drv, start_ms = self._switch(label, drv)
+                    if drv is None:
+                        self.log(f"❌ Dừng benchmark: {start_ms}")
+                        break
+                    cur = label
+                k[label] += 1
+                try:
+                    row = self._one(drv, label, k[label], start_ms)
+                except Exception as e:  # noqa: BLE001 — lỗi một lượt không làm hỏng cả bài đo
+                    row = {"proxy": label, "run": k[label], "file_mb": round((stat_file(self.file) or (0, 0))[0] / 1e6, 2),
+                           "result": "LỖI", "error": _classify_err("ERR", str(e)), "reason": str(e)[:200], "clicked": False}
+                start_ms = None                                  # PROFILE_START chỉ tính ở lượt đầu sau khi mở profile
+                self.rows.append(row)
+                if self.on_row:
+                    self.on_row(row)
+                self.log(f"   [{label}] lượt {row['run']}: POST_READY {row.get('post_ready_ms')} ms | gắn file "
+                         f"{row.get('file_attach_ms')} ms | truyền {row.get('upload_transfer_ms') or '?'} ms | {row['result']}"
+                         + (f" ({row['error']}: {row['reason'][:80]})" if row.get("error") else ""))
+                # làm sạch trang Upload trước lượt sau (ngoài phần đo)
+                if not prepare_upload_page(drv, self.log, self.should_stop, get_fsm(self.pid)):
+                    self.log("⚠️ Không nạp lại được trang Upload sạch — mở lại profile ở lượt sau.")
+                    get_fsm(self.pid).dirty = True
+        finally:
+            CFG.rec_enable, CFG.upload_url_re, CFG.ready_timeout_s, CFG.stage = saved
+            if drv is not None:
+                _close_one(self.pid, drv, self.keep_open)
+        return self.report()
+
+    def summary(self) -> Dict[str, Any]:
+        out = {}
+        for l in self.labels:
+            rs = [r for r in self.rows if r["proxy"] == l]
+            ok = [r["post_ready_ms"] for r in rs if r["result"] == "OK" and r.get("post_ready_ms") is not None]
+            pr = _pct_list(ok)
+            out[l] = {"runs": len(rs), "ok": len(ok), "error_rate": round(100.0 * (len(rs) - len(ok)) / len(rs), 1) if rs else None,
+                      "post_ready_median": pr.get("median"), "post_ready_p90": pr.get("p90"),
+                      "file_attach_median": _pct_list([r.get("file_attach_ms") for r in rs if r["result"] == "OK"]).get("median"),
+                      "transfer_median": _pct_list([r.get("upload_transfer_ms") for r in rs if r["result"] == "OK"]).get("median"),
+                      "profile_start_median": _pct_list([r.get("profile_start_ms") for r in rs]).get("median"),
+                      "cpu_chrome_median": _pct_list([r.get("cpu_chrome_s") for r in rs if r["result"] == "OK"]).get("median"),
+                      "ram_chrome_median": _pct_list([r.get("ram_chrome_mb") for r in rs if r["result"] == "OK"]).get("median"),
+                      "errors": {e: sum(1 for r in rs if r.get("error") == e) for e in {r.get("error") for r in rs if r.get("error")}},
+                      "_vals": ok}
+        return out
+
+    def verdict(self, s: Dict[str, Any]) -> str:
+        a, b = self.labels
+        va, vb = s[a]["_vals"], s[b]["_vals"]
+        if len(va) < 5 or len(vb) < 5:
+            return f"CHƯA KẾT LUẬN: cần ≥ 5 lượt THÀNH CÔNG mỗi proxy (đang có {a}={len(va)}, {b}={len(vb)})."
+        dlt, lo, hi = bootstrap_median_diff(va, vb)              # dương = B chậm hơn A
+        p = mann_whitney_p(va, vb)
+        ea, eb = s[a]["error_rate"] or 0, s[b]["error_rate"] or 0
+        margin = max(150.0, 0.07 * min(statistics.median(va), statistics.median(vb)))
+        ci = (f"chênh median {b}−{a} = {dlt:+.0f} ms, KTC95% [{lo:+.0f}; {hi:+.0f}], Mann–Whitney p={p:.3f}, "
+              f"ngưỡng thực tế {margin:.0f} ms")
+        # thắng = CẢ BA: khoảng tin cậy không chứa 0, kiểm định hạng p<0,05, chênh đủ lớn để có ý nghĩa thực tế
+        sig = (lo > 0 or hi < 0) and p < 0.05 and abs(dlt) >= margin
+        if sig and dlt > 0 and ea <= eb:
+            return f"✅ PROXY THẮNG: {a} — POST_READY nhanh hơn ổn định ({ci}); lỗi {ea}% ≤ {eb}%."
+        if sig and dlt < 0 and eb <= ea:
+            return f"✅ PROXY THẮNG: {b} — POST_READY nhanh hơn ổn định ({ci}); lỗi {eb}% ≤ {ea}%."
+        if sig:
+            return f"⚠️ CHƯA CHỌN: proxy nhanh hơn lại lỗi nhiều hơn ({ci}; lỗi {a}={ea}%, {b}={eb}%). Chạy thêm."
+        return f"➖ CHƯA KHÁC BIỆT RÕ ({ci}). Không chọn proxy nào — chạy thêm lượt (tăng 'lượt mỗi khối')."
+
+    def report(self) -> Dict[str, Any]:
+        s = self.summary()
+        v = self.verdict(s)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = os.path.join(self.out_dir, f"proxy_bench_{ts}")
+        lines = [f"# PROXY UPLOAD BENCHMARK (TEST ONLY — không bấm Post) — {ts}", "",
+                 f"Profile {self.pid} | file {os.path.basename(self.file)} | thứ tự {'-'.join(self.plan())} | IP: " +
+                 ", ".join(f"{l} {_mask_ip(ip)}" for l, ip in self.ips.items()), "", f"**{v}**", "",
+                 "| Proxy | Lượt thử | File MB | Post Ready (ms) | Thành công/Lỗi |", "|---|---|---|---|---|"]
+        for r in self.rows:
+            lines.append(f"| {r['proxy']} | {r['run']} | {r.get('file_mb')} | {r.get('post_ready_ms') if r.get('post_ready_ms') is not None else '-'} | "
+                         f"{'Thành công' if r['result'] == 'OK' else 'Lỗi ' + (r.get('error') or r['result'])} |")
+        lines += ["", "| Proxy | lượt | thành công | tỷ lệ lỗi | POST_READY median | P90 | gắn file | truyền (ước lượng) | mở profile | CPU Chrome s | RAM Chrome MB | lỗi |",
+                  "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+        for l in self.labels:
+            x = s[l]
+            lines.append(f"| {l} | {x['runs']} | {x['ok']} | {x['error_rate']}% | {x['post_ready_median']} | {x['post_ready_p90']} | "
+                         f"{x['file_attach_median']} | {x['transfer_median']} | {x['profile_start_median']} | {x['cpu_chrome_median']} | "
+                         f"{x['ram_chrome_median']} | {x['errors'] or '-'} |")
+        lines += ["", "POST_READY = file đã gắn xong → nút Post sẵn sàng. Chỉ chọn proxy thắng khi chênh lệch có ý nghĩa thống kê "
+                  "(bootstrap 95%) và tỷ lệ lỗi không cao hơn. Đo trên TikTok thật — không dựa vào Speedtest."]
+        with open(base + ".md", "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        with open(base + ".json", "w", encoding="utf-8") as f:
+            json.dump({"profile": self.pid, "file": os.path.basename(self.file), "plan": self.plan(), "verdict": v,
+                       "ip_tags": {l: _mask_ip(ip) for l, ip in self.ips.items()}, "rows": self.rows,
+                       "summary": {l: {k_: v_ for k_, v_ in x.items() if k_ != "_vals"} for l, x in s.items()}},
+                      f, ensure_ascii=False, indent=1)
+        keys = list(dict.fromkeys(k_ for r in self.rows for k_ in r)) or ["proxy"]
+        with open(base + ".csv", "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=keys)
+            w.writeheader()
+            for r in self.rows:
+                w.writerow(r)
+        self.log(f"\n{v}\n📄 Kết quả: {base}.md / .csv / .json")
+        return {"verdict": v, "summary": s, "rows": self.rows, "files": [base + ".md", base + ".csv", base + ".json"]}
+
+
+def cli_proxy_bench(pid: str, file: str, a: str, b: str, per_block: int, timeout_s: Optional[float]) -> int:
+    pb = ProxyBench(pid, file, a, b, per_block, ready_timeout_s=timeout_s)
+    pb.run()
+    return 0
+
+
+def run_proxy_bench_gui() -> int:
+    """Cửa sổ riêng PROXY UPLOAD BENCHMARK (TEST ONLY). Không dùng chung cấu hình đăng thật của TAM."""
+    if not HAS_QT:
+        print("❌ Cần PySide6 cho giao diện. Dùng dòng lệnh: --proxy-bench-cli")
+        return 2
+    from PySide6.QtWidgets import QTableWidget, QTableWidgetItem, QGridLayout
+    app = QApplication.instance() or QApplication(sys.argv)
+
+    class Sig(QObject):
+        line = Signal(str)
+        row = Signal(dict)
+        ask = Signal(str, str, int)
+        done = Signal(str)
+
+    sig = Sig()
+    w = QWidget()
+    w.setWindowTitle(f"PROXY UPLOAD BENCHMARK — TEST ONLY — {BACKEND_NAME} v{BACKEND_VERSION}")
+    w.resize(980, 720)
+    lay = QVBoxLayout(w)
+    warn = QLabel("TEST ONLY — chỉ gắn file và đo tới lúc nút Post sáng. TUYỆT ĐỐI KHÔNG BẤM POST, không đăng video nào.")
+    warn.setStyleSheet("color:#fff;background:#b00020;padding:6px;font-weight:bold")
+    lay.addWidget(warn)
+    g = QGridLayout()
+    e_pid = QLineEdit()
+    e_file = QLineEdit()
+    b_file = QPushButton("📂 Chọn file MP4")
+    e_a, e_b = QLineEdit("Proxy A"), QLineEdit("Proxy B")
+    sp_n = QSpinBox()
+    sp_n.setRange(3, 20)
+    sp_n.setValue(3)
+    sp_to = QSpinBox()
+    sp_to.setRange(20, 300)
+    sp_to.setValue(int(CFG.ready_timeout_s))
+    for i, (lb, wd) in enumerate((("Profile ID Genlogin (tài khoản THỬ):", e_pid), ("File MP4 cố định:", e_file),
+                                  ("Tên proxy A (chỉ để nhận diện, KHÔNG nhập user/pass):", e_a), ("Tên proxy B:", e_b),
+                                  ("Lượt mỗi khối (A×n, B×2n, A×n):", sp_n), ("Giới hạn chờ nút Post (giây):", sp_to))):
+        g.addWidget(QLabel(lb), i, 0)
+        g.addWidget(wd, i, 1)
+    g.addWidget(b_file, 1, 2)
+    lay.addLayout(g)
+    row_b = QHBoxLayout()
+    b_start, b_stop = QPushButton("▶ BẮT ĐẦU TEST"), QPushButton("⏹ DỪNG")
+    b_stop.setEnabled(False)
+    row_b.addWidget(b_start)
+    row_b.addWidget(b_stop)
+    row_b.addStretch(1)
+    lay.addLayout(row_b)
+    table = QTableWidget(0, 5)
+    table.setHorizontalHeaderLabels(["Proxy", "Lượt thử", "File MB", "Post Ready (ms)", "Thành công/Lỗi"])
+    lay.addWidget(table, 1)
+    verdict = QLabel("")
+    verdict.setWordWrap(True)
+    verdict.setStyleSheet("font-weight:bold")
+    lay.addWidget(verdict)
+    logw = QTextEdit()
+    logw.setReadOnly(True)
+    lay.addWidget(logw, 1)
+    stop_flag = {"v": False}
+    answer = {"ok": False, "ev": threading.Event()}
+
+    def pick():
+        p, _ = QFileDialog.getOpenFileName(w, "Chọn video MP4", "", "Video MP4 (*.mp4)")
+        if p:
+            e_file.setText(p)
+    b_file.clicked.connect(pick)
+    sig.line.connect(logw.append)
+
+    def add_row(r):
+        i = table.rowCount()
+        table.insertRow(i)
+        vals = (r["proxy"], r["run"], r.get("file_mb"), r.get("post_ready_ms") if r.get("post_ready_ms") is not None else "-",
+                "Thành công" if r["result"] == "OK" else f"Lỗi {r.get('error') or r['result']}")
+        for j, v in enumerate(vals):
+            table.setItem(i, j, QTableWidgetItem(str(v)))
+    sig.row.connect(add_row)
+
+    def ask(label, pid, attempt):
+        msg = (f"Profile {pid} đã được ĐÓNG.\n\n1. Mở ứng dụng Genlogin.\n2. Sửa profile {pid}: chọn proxy [{label}] (cấu hình đã lưu sẵn), lưu.\n"
+               f"3. Bấm OK — tool sẽ mở lại profile và kiểm tra IP đã đổi.\n\n(lần {attempt}/3) — Cancel để huỷ bài test.")
+        r = QMessageBox.question(w, f"Đổi proxy sang [{label}]", msg, QMessageBox.Ok | QMessageBox.Cancel)
+        answer["ok"] = (r == QMessageBox.Ok)
+        answer["ev"].set()
+    sig.ask.connect(ask)
+
+    def ask_blocking(label, pid, attempt):
+        answer["ev"].clear()
+        sig.ask.emit(label, pid, attempt)
+        answer["ev"].wait()
+        return answer["ok"]
+
+    def finished(v):
+        verdict.setText(v)
+        b_start.setEnabled(True)
+        b_stop.setEnabled(False)
+    sig.done.connect(finished)
+
+    def start():
+        if not e_pid.text().strip() or not os.path.isfile(e_file.text().strip()):
+            QMessageBox.warning(w, "Thiếu thông tin", "Nhập Profile ID và chọn 1 file MP4 có thật.")
+            return
+        table.setRowCount(0)
+        verdict.setText("")
+        stop_flag["v"] = False
+        b_start.setEnabled(False)
+        b_stop.setEnabled(True)
+        pb = ProxyBench(e_pid.text().strip(), e_file.text().strip(), e_a.text(), e_b.text(), sp_n.value(),
+                        log=sig.line.emit, ask_switch=ask_blocking, should_stop=lambda: stop_flag["v"],
+                        ready_timeout_s=sp_to.value(), on_row=lambda r: sig.row.emit(dict(r)))
+
+        def work():
+            try:
+                out = pb.run()
+                sig.done.emit(out["verdict"])
+            except Exception as ex:  # noqa: BLE001
+                sig.line.emit(f"❌ Lỗi: {type(ex).__name__}: {ex}")
+                sig.done.emit("Bài test dừng vì lỗi — xem log.")
+        threading.Thread(target=work, daemon=True, name="PROXY-BENCH").start()
+    b_start.clicked.connect(start)
+    b_stop.clicked.connect(lambda: stop_flag.__setitem__("v", True))
+    w.show()
+    return app.exec()
+
+
 def _attach_prepare(drv, pid: str, watch: str, kill=lambda: False):
     """Mỗi lượt đo: trang Upload SẠCH vừa nạp (cùng trạng thái cho tool và tay). Trả (sync, info, rec_ok, m0) hoặc None."""
     fsm = get_fsm(pid)
@@ -5404,6 +5862,8 @@ def build_parser() -> "argparse.ArgumentParser":
     g.add_argument("--calibrate-confirm", action="store_true", help="quan sát (không bấm gì) khi bạn tự đăng 1 video; cần --profile")
     g.add_argument("--bench-overhead", action="store_true", help="đo chi phí chờ nút event vs poll trên profile thật; cần --profile")
     g.add_argument("--bench-upload", action="store_true", help="chạy thử tới lúc nút Post sáng rồi DỪNG (không đăng); cần --profile --files")
+    g.add_argument("--proxy-bench", action="store_true", help="cửa sổ PROXY UPLOAD BENCHMARK (TEST ONLY, không bấm Post)")
+    g.add_argument("--proxy-bench-cli", action="store_true", help="như --proxy-bench nhưng dòng lệnh; cần --profile --file")
     g.add_argument("--bench-watch", action="store_true", help="A/B/C cơ chế theo dõi nút Post trên TikTok thật (DRY-RUN, không bấm Post); cần --profile --files")
     g.add_argument("--bench-attach", action="store_true", help="đo AttachToReady (file được chọn -> nút Post sáng): đăng tay vs tool, không đăng; cần --profile --files")
     ap.add_argument("--attach-mode", choices=["tool", "manual", "both"], default="both", help="--bench-attach: tool | manual (bạn tự chọn file) | both (xen kẽ ABBA)")
@@ -5424,6 +5884,10 @@ def build_parser() -> "argparse.ArgumentParser":
     ap.add_argument("--variant", help="nhãn ghi vào PERF (TAM_VARIANT)")
     ap.add_argument("--wait-mode", choices=["event", "sparse", "lite", "poll"], help="đặt TAM_WAIT_MODE cho lần chạy này (event=A, sparse=B, lite=C)")
     ap.add_argument("--modes", default="ABC", help="--bench-watch: các chế độ so sánh (mặc định ABC)")
+    ap.add_argument("--file", help="--proxy-bench-cli: 1 file MP4 cố định")
+    ap.add_argument("--proxy-a", default="A", help="--proxy-bench-cli: tên proxy A (chỉ để nhận diện)")
+    ap.add_argument("--proxy-b", default="B", help="--proxy-bench-cli: tên proxy B")
+    ap.add_argument("--per-block", type=int, default=3, help="--proxy-bench-cli: lượt mỗi khối (A×n, B×2n, A×n)")
     ap.add_argument("--page-states", default="fresh", help="--bench-watch: fresh,idle,front (trạng thái trang lúc gắn file)")
     ap.add_argument("--idle-s", type=float, default=120.0, help="--bench-watch --page-states idle: số giây trang rảnh trước khi gắn")
     ap.add_argument("--stage", choices=["direct", "ram"], help="đặt TAM_STAGE cho lần chạy này")
@@ -5471,6 +5935,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not a.profile:
             ap.error("--bench-overhead cần --profile")
         return cli_bench_overhead(a.profile, a.secs or 10.0, a.keep_open)
+    if a.proxy_bench:
+        return run_proxy_bench_gui()
+    if a.proxy_bench_cli:
+        if not a.profile or not a.file:
+            ap.error("--proxy-bench-cli cần --profile và --file")
+        return cli_proxy_bench(a.profile, a.file, a.proxy_a, a.proxy_b, a.per_block, a.secs)
     if a.bench_watch:
         if not a.profile or not a.files:
             ap.error("--bench-watch cần --profile và --files")
