@@ -1,0 +1,14 @@
+DOWNLOAD ONLY BENCHMARK — so sánh tốc độ tải WS360 trên VPS Tokyo và trên PC (cùng thuật toán)
+==========================================================================================
+1. Tạo 1 thư mục mới trên VPS (vd C:\WS360_BENCH), giải nén gói WS360_DOWNLOAD_BENCH_VPS.zip vào đó.
+2. Chép ffprobe.exe (BẮT BUỘC, để xác minh video) và aria2c.exe (tuỳ chọn, để so sánh) vào cùng thư mục.
+3. Nhấp đúp DOWNLOAD_ONLY_BENCHMARK.bat → Enter (= video pk7HiB167VY) → chờ khoảng 1–3 phút.
+4. Gửi 2 file DOWNLOAD_ONLY_BENCHMARK.md và DOWNLOAD_ONLY_BENCHMARK.csv.
+5. Trên PC: chạy CÙNG file .bat trong thư mục WS360 (gói WS360 đầy đủ đã có lệnh này) → gửi kết quả PC để đặt cạnh nhau.
+
+Tool làm gì: (1) thử từng client resolver android_vr / android / web_embedded 1 lần để biết IP máy này có bị YouTube
+chặn ("Sign in to confirm you're not a bot") không; (2) 5 vòng × 3 phương án, thứ tự xoay vòng:
+http_cold (downloader của tool, kết nối nguội), http_warm (kết nối giữ ấm như khi tool chạy), aria2c (cùng resolver,
+phần tải bằng aria2c). Mỗi lượt lấy link MỚI, xoá file cũ trước; 403 → lấy link mới. Không quét API, không ghi Excel,
+không mở TAM, không đăng TikTok; database riêng, database.sqlite không bị đụng tới; video tải về bị xoá sau khi đo.
+yt-dlp chỉ dùng khi CẢ 3 client Innertube đều thất bại (cột Resolver sẽ ghi "YTDLP (dự phòng)").

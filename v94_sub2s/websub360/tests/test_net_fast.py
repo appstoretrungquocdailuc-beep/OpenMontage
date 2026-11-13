@@ -163,3 +163,48 @@ def test_bench_dl_runs_every_variant_with_fresh_download_each_time(tmp_path, gvs
     md = (tmp_path / "BENCH_DL.md").read_text(encoding="utf-8")
     assert "| legacy |" in md and "≤1000 ms" in md and (tmp_path / "BENCH_DL.csv").exists()
     assert not (tmp_path / "DOWNLOADS_BENCH").exists() and ws._NET_MODE == "fast"
+
+
+@T.need_ff
+def test_download_only_benchmark_production_path_fresh_url_on_403_and_touches_nothing_else(tmp_path, gvs, media, monkeypatch):
+    calls = []
+    first = {"done": False}
+
+    def resolve(self, v, deadline_s=2.5):
+        calls.append(v)
+        if not first["done"]:                                    # lượt đầu: link trả 403 (vd hết hạn) → phải lấy link MỚI
+            first["done"] = True
+            return dict(T.plan_prog(gvs, media, v + "_x", mode="status", code=403), client="android", net={}, title="t")
+        return dict(T.plan_prog(gvs, media, v), client="android", net={"new_conn": True}, title="t", source="INNERTUBE_ANDROID")
+    monkeypatch.setattr(ws.Resolver, "resolve", resolve)
+    monkeypatch.setattr(ws.Resolver, "_player", lambda self, v, c: {"verdict": "ok", "pick": {"kind": "progressive", "video": {"itag": 18}},
+                                                                  "counts": {"has18": True}, "reason": "OK"})
+    monkeypatch.setattr(NET.NetWarmer, "warm_now", lambda self: None)
+    monkeypatch.setattr(ws, "ARIA2C", "aria2c-gia")
+    aria = []
+
+    def fake_aria2(url, dest, n, info):                       # aria2c giả: chép đúng dữ liệu (để kiểm bước xác minh)
+        aria.append((url, n))
+        dest.write_bytes(media["prog"])
+        info.update(bytes=len(media["prog"]))
+        return len(media["prog"])
+    monkeypatch.setattr(ws, "download_aria2", fake_aria2)
+    (tmp_path / "database.sqlite").write_bytes(b"PROD")            # DB production phải giữ nguyên
+    (tmp_path / "check.xlsx").write_bytes(b"EXCEL")
+    out = ws.download_bench_only(dict(ws.DEFAULT_CONFIG, retry_schedule_sec=[0.1, 0.2]), tmp_path, ["pk7HiB167VY"], reps=5)
+    rows = out["rows"]
+    assert len(rows) == 15 and all(r["result"] == "DONE" for r in rows), [r.get("error") for r in rows]
+    assert {r["variant"] for r in rows} == {"http_cold", "http_warm", "aria2c"}
+    assert len(out["probe"]) == 3 and {p["client"] for p in out["probe"]} == {"android_vr", "android", "web_embedded"}
+    r403 = [r for r in rows if (r.get("attempts") or 0) >= 2]
+    assert r403 and len(calls) >= 16                               # 403 → resolve LẠI (không dùng URL cũ)
+    assert len(aria) == 5 and all(u.endswith("/vp/pk7HiB167VY") for u, _ in aria)
+    for r in rows:
+        for c in ("RESOLVER_MS", "TRANSFER_MS", "DOWNLOAD_MS", "VERIFY_MS", "TOTAL_MS"):
+            assert r.get(c) is not None, (r["variant"], c)
+        if r["variant"] != "aria2c":
+            assert r["TTFB_MS"] is not None and r["resolver_source"] == "INNERTUBE_ANDROID"
+    assert (tmp_path / "database.sqlite").read_bytes() == b"PROD" and (tmp_path / "check.xlsx").read_bytes() == b"EXCEL"
+    assert not (tmp_path / "DOWNLOADS_DLBENCH").exists()
+    md = (tmp_path / "DOWNLOAD_ONLY_BENCHMARK.md").read_text(encoding="utf-8")
+    assert "TOTAL_MS med / P90" in md and "| aria2c |" in md and "Resolver trên IP máy này" in md

@@ -3407,6 +3407,184 @@ def bench360(cfg, base, ids, reps=10):
     return rows
 
 
+DLB_COLS = ["RESOLVER_MS", "TTFB_MS", "TRANSFER_MS", "DOWNLOAD_MS", "VERIFY_MS", "TOTAL_MS"]
+
+
+def _dlb_aria2(eng, vid, dest_dir, n):
+    """Cùng resolver WS360 (link MỚI) → aria2c tải itag 18 → ffprobe + đúng dung lượng. 403/hết hạn → lấy link MỚI 1 lần."""
+    out = {"attempts": 0}
+    t0 = time.perf_counter_ns()
+    last = None
+    for attempt in range(2):
+        out["attempts"] = attempt + 1
+        tr = time.perf_counter_ns()
+        plan = eng.resolver.resolve(vid)                         # KHÔNG dùng lại URL cũ: mỗi lần thử resolve lại
+        out["RESOLVER_MS"] = ms(tr, time.perf_counter_ns())
+        out["resolver_source"] = plan.get("source")
+        pick = plan["pick"]
+        if pick["kind"] != "progressive":
+            raise Fatal(f"không có 360p progressive (kind {pick['kind']}) — aria2c chỉ so sánh với itag 18")
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / f".{vid}.aria.part.mp4"
+        dest.unlink(missing_ok=True)
+        info = {}
+        td = time.perf_counter_ns()
+        try:
+            n_bytes = download_aria2(pick["video"]["url"], dest, n, info)
+        except Exception as e:  # noqa: BLE001 — aria2c không trả mã HTTP chi tiết: thử lại với link mới
+            last = e
+            continue
+        out["DOWNLOAD_MS"] = ms(td, time.perf_counter_ns())
+        out["TRANSFER_MS"] = out["DOWNLOAD_MS"]                   # aria2c: không tách được byte đầu → truyền = cả lần tải
+        tv = time.perf_counter_ns()
+        v = ffprobe_info(dest)
+        out["VERIFY_MS"] = ms(tv, time.perf_counter_ns())
+        exp = int(pick["video"].get("clen") or 0)
+        if not v.get("ok") or (exp and n_bytes != exp):
+            dest.unlink(missing_ok=True)
+            raise IOError(f"xác minh thất bại: ffprobe {v.get('ok')} | {n_bytes}/{exp} byte")
+        out.update(TOTAL_MS=ms(t0, time.perf_counter_ns()), size=n_bytes, itags=str(pick["video"].get("itag")))
+        dest.unlink(missing_ok=True)
+        return out
+    raise IOError(f"aria2c lỗi sau 2 link mới: {type(last).__name__}: {redact(str(last))[:120]}")
+
+
+def download_bench_only(cfg, base, ids, reps=5, variants=("http_cold", "http_warm", "aria2c"), aria2_conns=4):
+    """DOWNLOAD BENCHMARK ONLY — ĐÚNG thuật toán WS360: resolver Android Innertube race (android_vr / android / web_embedded,
+    yt-dlp chỉ là dự phòng khi cả 3 hỏng) → itag 18 → tải → ffprobe + đúng dung lượng.
+      http_cold : Engine.process production, mọi kết nối đóng trước lượt (như video đầu / sau khi rảnh lâu)
+      http_warm : Engine.process production, kết nối giữ ấm như tool chính
+      aria2c    : cùng resolver, phần tải bằng aria2c (-x N), cùng bước xác minh
+    KHÔNG quét API/WebSub, KHÔNG ghi Excel, KHÔNG mở TAM, KHÔNG đăng TikTok. Database + thư mục tải RIÊNG (xoá sau khi đo).
+    Mỗi lượt lấy link MỚI; 403 → production tự resolve lại (không dùng URL hết hạn)."""
+    log = Log(base / "logs")
+    bcfg = dict(cfg, download_dir="DOWNLOADS_DLBENCH", excel_enabled=False, tiktok_enabled=False, net_warm=False,
+                detection_mode="WEBSUB_ONLY", retry_schedule_sec=[0.5, 1.0])   # chỉ khi đo: 2 lần thử lại ngắn (link MỚI mỗi lần)
+    eng = Engine(bcfg, base, log, db_name="database_DLBENCH.sqlite", lock_name="ws360_dlbench.lock")
+    variants = [v for v in variants if v in ("http_cold", "http_warm", "aria2c")]
+    if "aria2c" in variants and not ARIA2C:
+        variants.remove("aria2c")
+        log("⚠️ Không thấy aria2c.exe (cạnh tool / bin\\ / PATH) → bỏ phương án aria2c")
+    if FFPROBE:
+        subprocess.run([FFPROBE, "-version"], capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    global NET_LEARN
+    learned = []
+    NET_LEARN = learned.append
+    ch = "UCDLBENCH" + "0" * 15
+    rows, probe = [], []
+    host = os.environ.get("COMPUTERNAME") or (os.uname().nodename if hasattr(os, "uname") else "?")
+    log(f"⬇️ DOWNLOAD ONLY BENCHMARK | máy {host} | {len(ids)} video × {reps} vòng × {'/'.join(variants)} | lớp mạng {_NET_MODE} | "
+        f"ffprobe {'có' if FFPROBE else 'KHÔNG'} | aria2c {'có' if ARIA2C else 'không'}")
+    try:
+        # 1) IP máy này có dùng được resolver Innertube không? (mỗi client 1 lần, kết nối nguội)
+        for vid in ids:
+            for c in Resolver.CLIENTS:
+                pool().clear()
+                t = time.perf_counter_ns()
+                try:
+                    r = eng.resolver._player(vid, c) or {}
+                except Exception as e:  # noqa: BLE001
+                    r = {"verdict": "error", "reason": f"{type(e).__name__}: {str(e)[:80]}"}
+                pk = r.get("pick") or {}
+                probe.append({"video_id": vid, "client": c, "ms": ms(t, time.perf_counter_ns()), "verdict": r.get("verdict"),
+                              "itag": (pk.get("video") or {}).get("itag"), "kind": pk.get("kind"),
+                              "has18": (r.get("counts") or {}).get("has18"), "reason": str(r.get("reason") or "")[:90]})
+                x = probe[-1]
+                log(f"🔎 RESOLVER {c:12} {vid}: {x['verdict']} | {x['ms']:.0f} ms | itag18 {'CÓ' if x['has18'] else 'không'} | "
+                    f"chọn itag {x['itag']} ({x['kind']}) | {x['reason']}")
+        # 2) các lượt đo, thứ tự xoay vòng
+        for k in range(1, reps + 1):
+            for vid in ids:
+                order = variants[(k - 1) % len(variants):] + variants[:(k - 1) % len(variants)]
+                for var in order:
+                    p_ = pool()
+                    if var in ("http_cold", "aria2c"):
+                        p_.clear()
+                        if NET is not None:
+                            with NET.DNS.lock:
+                                NET.DNS.m.clear()
+                    if var == "http_warm" and NET is not None and _NET_MODE == "fast":
+                        w = NET.NetWarmer(pool, log, (eng.resolver.host_override or "www.youtube.com",), 3, 6, 40)
+                        for u in learned[-6:]:
+                            w.learn(u)
+                        w.warm_now()
+                    shutil.rmtree(eng.dl_dir / ch, ignore_errors=True)       # không bao giờ dùng file đã tải sẵn
+                    row = {"variant": var, "video_id": vid, "run": k}
+                    if var == "aria2c":
+                        try:
+                            row.update(result="DONE", **_dlb_aria2(eng, vid, eng.dl_dir / ch, aria2_conns))
+                        except Exception as e:  # noqa: BLE001
+                            row.update(result="FAILED", error=f"{type(e).__name__}: {redact(str(e))[:160]}")
+                    else:
+                        eng.db.x("DELETE FROM videos WHERE video_id=?", (vid,))
+                        t = time.perf_counter_ns()
+                        eng.db.x("INSERT INTO videos(video_id, channel_id, url, engine, detected_at, state) VALUES(?,?,?,?,?,?)",
+                                 (vid, ch, video_url(vid), "DLBENCH", iso(), "QUEUED"))
+                        res = eng.process({"vid": vid, "ch": ch, "t_recv_ns": t, "t_enq_ns": t})
+                        while res == "RETRY_WAIT":                    # vd 403: chính production chờ ngắn rồi resolve LINK MỚI
+                            r0 = eng.db.one("SELECT next_try FROM videos WHERE video_id=?", (vid,))
+                            time.sleep(max(0.0, float(r0["next_try"] or 0) - time.time()))
+                            res = eng.process({"vid": vid, "ch": ch, "t_recv_ns": t, "t_enq_ns": t})
+                        r = dict(eng.db.one("SELECT * FROM videos WHERE video_id=?", (vid,)))
+                        net = json.loads(r.get("net") or "{}")
+                        rn, mn = net.get("resolver") or {}, net.get("media") or {}
+                        row.update(result=res, RESOLVER_MS=r.get("resolver_ms"), TTFB_MS=mn.get("ttfb_ms"), TRANSFER_MS=mn.get("transfer_ms"),
+                                   DOWNLOAD_MS=r.get("download_ms"), VERIFY_MS=r.get("ffprobe_ms"), TOTAL_MS=r.get("total_ms"),
+                                   attempts=r.get("attempts"), size=r.get("size"), itags=r.get("itags"),
+                                   resolver_source=(f"INNERTUBE_{str(rn.get('client')).upper()}" if rn.get("client") else
+                                                    ("YTDLP (dự phòng)" if res == "DONE" else None)),
+                                   media_new_conns=mn.get("new_conns"), media_server_wait_ms=mn.get("server_wait_ms"),
+                                   error="" if res == "DONE" else redact(str(r.get("error") or res))[:160])
+                    sz = row.get("size") or 0
+                    row["MiB"] = round(sz / 1048576, 2) if sz else None
+                    row["MiB_s"] = round(sz / 1048576 / (row["TRANSFER_MS"] / 1000), 2) if sz and row.get("TRANSFER_MS") else None
+                    rows.append(row)
+                    log(f"⬇️ {var:9} {vid} vòng {k}/{reps}: {row['result']} | RESOLVER_MS {row.get('RESOLVER_MS')} ({row.get('resolver_source')}) "
+                        f"| TTFB_MS {row.get('TTFB_MS')} | TRANSFER_MS {row.get('TRANSFER_MS')} ({row.get('MiB_s')} MiB/s) | "
+                        f"VERIFY_MS {row.get('VERIFY_MS')} | TOTAL_MS {row.get('TOTAL_MS')}"
+                        + (f" | {row['error']}" if row.get("error") else ""))
+                    time.sleep(0.5)
+    finally:
+        NET_LEARN = None
+        shutil.rmtree(eng.dl_dir, ignore_errors=True)
+        try:
+            eng.db.con.close()
+        except Exception:
+            pass
+    md = [f"# DOWNLOAD ONLY BENCHMARK — {iso()} — máy {host}", "",
+          "Thuật toán WS360: resolver Android Innertube race (android_vr / android / web_embedded; yt-dlp chỉ dự phòng) → itag 18 → "
+          "tải → ffprobe + đúng dung lượng. TTFB_MS = gửi request tải → byte đầu (gồm DNS/TCP/TLS/chờ máy chủ); TRANSFER_MS = byte đầu → "
+          "byte cuối (aria2c: cả lần tải vì không tách được); DOWNLOAD_MS = toàn bộ bước tải; VERIFY_MS = ffprobe; TOTAL_MS = bắt đầu "
+          "resolver → file đã xác minh. Mỗi lượt link MỚI, file cũ bị xoá trước.", "",
+          "## Resolver trên IP máy này (mỗi client 1 lần, kết nối nguội)", "", "| Video | Client | Kết quả | ms | itag 18 | Lý do |",
+          "|---|---|---|---|---|---|"]
+    md += [f"| {x['video_id']} | {x['client']} | {x['verdict']} | {x['ms']:.0f} | {'có' if x['has18'] else 'không'} | {x['reason']} |" for x in probe]
+    md += ["", "## Từng lượt", "", "| Phương án | Video | Vòng | Kết quả | " + " | ".join(DLB_COLS) + " | MiB/s | Resolver |",
+           "|---|---|---|---|" + "---|" * len(DLB_COLS) + "---|---|"]
+    for x in rows:
+        md.append(f"| {x['variant']} | {x['video_id']} | {x['run']} | {x['result']} | " +
+                  " | ".join("-" if x.get(c) is None else f"{x[c]:.0f}" for c in DLB_COLS) + f" | {x.get('MiB_s') or '-'} | {x.get('resolver_source') or '-'} |")
+    md += ["", "## Median / P90", "", "| Phương án | OK | " + " | ".join(f"{c} med / P90" for c in DLB_COLS) + " |",
+           "|---|---|" + "---|" * len(DLB_COLS)]
+    summary = {}
+    for var in variants:
+        ok = [x for x in rows if x["variant"] == var and x["result"] == "DONE"]
+        summary[var] = {c: (pct([x[c] for x in ok if x.get(c) is not None], 50), pct([x[c] for x in ok if x.get(c) is not None], 90))
+                        for c in DLB_COLS}
+        summary[var]["ok"] = f"{len(ok)}/{sum(1 for x in rows if x['variant'] == var)}"
+        md.append(f"| {var} | {summary[var]['ok']} | " + " | ".join(
+            "-" if summary[var][c][0] is None else f"{summary[var][c][0]:.0f} / {summary[var][c][1]:.0f}" for c in DLB_COLS) + " |")
+    md += ["", "So sánh PC ↔ VPS: chạy CÙNG lệnh trên cả 2 máy và đặt 2 bảng 'Median / P90' cạnh nhau."]
+    (base / "DOWNLOAD_ONLY_BENCHMARK.md").write_text("\n".join(md) + "\n", encoding="utf-8")
+    with open(base / "DOWNLOAD_ONLY_BENCHMARK.csv", "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=list(dict.fromkeys(k for x in rows for k in x)) or ["variant"])
+        w.writeheader()
+        for x in rows:
+            w.writerow(x)
+    print("\n".join(md))
+    return {"rows": rows, "summary": summary, "probe": probe}
+
+
 BENCH_DL_VARIANTS = {
     # tên: (cấu hình, chuẩn bị trước mỗi lượt)
     "legacy":        ({"net_mode": "legacy", "range_connections": 1}, "cold"),     # đúng bản trước, kết nối nguội (như sau lúc rảnh)
@@ -3865,6 +4043,8 @@ def main(argv=None):
     ap.add_argument("--bench360", nargs="*", help="đo đường tải thật N lượt/video → BENCH360.csv (median/p90 từng bước)")
     ap.add_argument("--bench-dl", nargs="*", help="so sánh các phương án mạng/tải trên video thật → BENCH_DL.md/.csv (≥20 lượt mỗi phương án)")
     ap.add_argument("--variants", default="", help="--bench-dl: danh sách phương án, cách nhau dấu phẩy")
+    ap.add_argument("--download-bench", nargs="*", help="DOWNLOAD ONLY BENCHMARK: đúng thuật toán tải WS360 (http nguội/ấm + aria2c), "
+                    "N vòng, không API/Excel/TAM/TikTok → DOWNLOAD_ONLY_BENCHMARK.md/.csv")
     ap.add_argument("--bench-pipeline", nargs="*", help="toàn tuyến thật CHẠY THỬ (không bấm Post): tải → TikTok → POST_READY; cần --profile")
     ap.add_argument("--profile", default="", help="--bench-pipeline: Profile ID Genlogin dùng để đo")
     ap.add_argument("--pipeline-report", action="store_true", help="median/P90/P95 từng giai đoạn từ các job đăng thật → PIPELINE_REPORT.md")
@@ -3894,6 +4074,13 @@ def main(argv=None):
         return 0 if all(s != "FAIL" for _, s, _ in r) else 1
     if a.bench360 is not None:
         bench360(cfg, base, [v for v in (extract_vid(x) for x in a.bench360) if v], max(1, a.reps if a.reps != 3 else 10))
+        return 0
+    if a.download_bench is not None:
+        ids = [v for v in (extract_vid(x) for x in (a.download_bench or ["pk7HiB167VY"])) if v]
+        if not ids:
+            print("Không nhận ra Video ID / link YouTube.")
+            return 2
+        download_bench_only(cfg, base, ids, a.reps if a.reps != 3 else 5)
         return 0
     if a.pipeline_report:
         pipeline_report(base)
