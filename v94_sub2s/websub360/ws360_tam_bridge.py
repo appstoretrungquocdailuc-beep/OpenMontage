@@ -148,6 +148,12 @@ class TikTokBridge:
             marks TEXT, done_to_enqueue_ms REAL, enqueue_to_received_ms REAL, received_to_attach_ms REAL,
             done_to_attach_ms REAL, attach_to_post_ready_ms REAL, click_to_confirm_ms REAL, websub_to_confirm_ms REAL,
             dry_run INTEGER DEFAULT 0)""")
+        for col in ("profile_wait_ms REAL", "page_reload_ms REAL", "page_reloaded INTEGER", "file_attach_ms REAL",
+                    "post_ready_ms REAL", "post_confirmed_ms REAL", "wait_mode TEXT"):
+            try:
+                self.db.x(f"ALTER TABLE upload_jobs ADD COLUMN {col}")
+            except Exception:  # noqa: BLE001 — cột đã có
+                pass
 
     # ------------------------------------------------------------------ vòng đời
     def start(self):
@@ -178,8 +184,29 @@ class TikTokBridge:
                  + (" | ⚠️ CHẠY THỬ: KHÔNG bấm Post" if self.cfg.get("tiktok_dry_run") else ""))
         for pid in pids:
             self._slot(pid)
-        for pid in pre:
-            threading.Thread(target=self._ensure_open, args=(pid,), daemon=True, name=f"OPEN-{pid}").start()
+        self.stats["speed"] = f"ĐANG CHUẨN BỊ 0/{len(pre)} profile"
+        ths = [threading.Thread(target=self._ensure_open, args=(pid,), daemon=True, name=f"OPEN-{pid}") for pid in pre]
+        t0 = time.perf_counter_ns()
+        [t.start() for t in ths]
+
+        def announce():
+            for t in ths:
+                while t.is_alive() and not self.stop_ev.is_set():
+                    t.join(0.5)
+                    ok = sum(1 for p in pre if self.slots[p].state == "READY")
+                    self.stats["speed"] = f"ĐANG CHUẨN BỊ {ok}/{len(pre)} profile"
+            ok = [p for p in pre if self.slots[p].state == "READY"]
+            el = _ms(t0, time.perf_counter_ns())
+            if len(ok) == len(pre):
+                self.stats["speed"] = f"SẴN SÀNG TỐC ĐỘ TỐI ĐA ({len(ok)}/{len(pre)})"
+                self.log(f"🚀 TikTok: SẴN SÀNG TỐC ĐỘ TỐI ĐA — {len(ok)}/{len(pre)} profile READY sau {el:.0f} ms "
+                         f"(video phát hiện trong lúc chuẩn bị đã được lưu bền vững và đăng ngay khi profile READY)")
+            else:
+                bad = [p for p in pre if p not in ok]
+                self.stats["speed"] = f"CHỈ {len(ok)}/{len(pre)} READY"
+                self.log(f"⚠️ TikTok: chỉ {len(ok)}/{len(pre)} profile READY sau {el:.0f} ms — chưa sẵn sàng: {', '.join(bad[:10])} "
+                         f"(job của các profile này vẫn được giữ và thử mở lại)")
+        threading.Thread(target=announce, daemon=True, name="TT-SPEED").start()
 
     def stop(self, wait_s=180):
         """Ngừng NHẬN job mới. Việc đang đăng được làm cho xong (không đóng trình duyệt giữa lúc bấm/chờ xác nhận)."""
@@ -287,6 +314,15 @@ class TikTokBridge:
         now = time.strftime("%Y-%m-%d %H:%M:%S")
         marks = {k: info.get(k) for k in ("t_recv_ns", "t_detect_ns", "t_dl_start_ns", "t_done_ns")}
         marks["t_enq_ns"] = t_enq
+        old = self._too_old(info.get("published"))
+        if old and pids and not info.get("bench"):
+            stmts = [("INSERT OR IGNORE INTO upload_jobs(job_id, video_id, channel_id, profile_id, path, size, state, reason, "
+                      "created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                      (f"{vid}:{pid}", vid, ch, pid, path, info.get("size"), "HELD", old, now, now)) for pid in pids]
+            self.db.tx(stmts)
+            self.stats["held"] += 1
+            self.log(f"⏸ TikTok: {vid} — {old} → GIỮ job, KHÔNG tự đăng")
+            return []
         if not pids:
             jid = f"{vid}:NO_PROFILE"
             self.db.x("INSERT OR IGNORE INTO upload_jobs(job_id, video_id, channel_id, profile_id, path, size, state, reason, "
@@ -313,6 +349,23 @@ class TikTokBridge:
         self.stats["waiting"] = sum(len(s.queue) for s in self.slots.values())
         return out
 
+    def _too_old(self, published) -> str:
+        """Lý do chặn nếu video quá cũ để tự đăng ('' = được đăng)."""
+        if not published:
+            return ""
+        try:
+            from datetime import datetime, timezone
+            p = datetime.fromisoformat(str(published).replace("Z", "+00:00"))
+            if p.tzinfo is None:
+                p = p.replace(tzinfo=timezone.utc)
+            age_min = (datetime.now(timezone.utc) - p).total_seconds() / 60
+        except ValueError:
+            return ""
+        lim = float(self.cfg.get("tiktok_max_age_minutes", self.cfg.get("max_age_minutes", 30)) or 0)
+        if lim > 0 and age_min > lim:
+            return f"video cũ (đăng cách đây {age_min:.0f} phút > {lim:.0f} phút)"
+        return ""
+
     def recover(self):
         n = 0
         for r in self.db.all("SELECT * FROM upload_jobs WHERE state IN ('QUEUED','RETRY','UPLOADING') ORDER BY created_at"):
@@ -334,7 +387,8 @@ class TikTokBridge:
             lost = []
         for r in lost:
             if r["file"] and Path(r["file"]).is_file():
-                self.submit({"vid": r["video_id"], "ch": r["channel_id"], "path": r["file"], "size": r["size"]})
+                self.submit({"vid": r["video_id"], "ch": r["channel_id"], "path": r["file"], "size": r["size"],
+                             "published": r["published_at"]})
                 n += 1
         if n:
             self.log(f"♻️ TikTok: khôi phục {n} job đăng chưa xong")
@@ -382,6 +436,13 @@ class TikTokBridge:
         row = self.db.one("SELECT state FROM upload_jobs WHERE job_id=?", (job["job_id"],))
         if row and row["state"] in TERMINAL:
             return
+        if not job.get("bench"):
+            pr = self.db.one("SELECT published_at FROM videos WHERE video_id=?", (job["vid"],))
+            old = self._too_old(pr["published_at"] if pr is not None else None)
+            if old:                                           # vd job khôi phục sau khi tool tắt lâu: không đăng muộn
+                self._set(job, "HELD", reason=old)
+                self.log(f"⏸ TikTok {s.pid}: {job['vid']} — {old} → GIỮ job, KHÔNG tự đăng")
+                return
         bad = self._check_file(job)
         if bad:
             self._set(job, "HELD", reason=bad)
@@ -468,6 +529,11 @@ class TikTokBridge:
                         self._set(job, "FAILED", reason=str(res.reason)[:300], **timing)
                         self.stats["unknown_failed"] += 1
                 self.stats["last"] = dict(timing, vid=job["vid"], pid=s.pid, result=st)
+                f_ = lambda k: "-" if timing.get(k) is None else f"{timing[k]:.0f}"
+                self.log(f"⏱️ TIKTOK_STAGES {job['vid']} {s.pid} {st} | PROFILE_WAIT_MS {f_('profile_wait_ms')} | "
+                         f"PAGE_RELOAD_MS {f_('page_reload_ms')} (nạp lại: {'CÓ' if timing.get('page_reloaded') else 'không'}) | "
+                         f"FILE_ATTACH_MS {f_('file_attach_ms')} | POST_READY_MS {f_('post_ready_ms')} | "
+                         f"POST_CONFIRMED_MS {f_('post_confirmed_ms')} | chế độ {timing.get('wait_mode')}")
                 self.log(f"🎬 TikTok {s.pid}: {job['vid']} → {st} | DOWNLOAD_DONE_TO_TIKTOK_ATTACH={timing.get('done_to_attach_ms')} ms "
                          f"| file {Path(job['path']).name} | DONE→gắn file {timing.get('done_to_attach_ms')} ms "
                          f"(DONE→hàng đợi {timing.get('done_to_enqueue_ms')}, →worker nhận {timing.get('enqueue_to_received_ms')}, "
@@ -499,7 +565,15 @@ class TikTokBridge:
         t_attach = mark("SEND_KEYS_START")
         t_post_ready = mark("PROCESSING_READY")
         t_click, t_conf = mark("POST_CLICKED"), mark("POST_CONFIRMED")
-        return {"done_to_enqueue_ms": _ms(m.get("t_done_ns"), m.get("t_enq_ns")),
+        flags = getattr(trace, "flags", {}) or {}
+        return {"profile_wait_ms": _ms(t_recv, t_ready),                       # worker nhận job → profile READY
+                "page_reload_ms": _ms(mark("JOB_START"), mark("PAGE_READY")),  # có trang Upload sạch (nạp lại nếu bẩn)
+                "page_reloaded": flags.get("page_reloaded"),
+                "file_attach_ms": _ms(t_attach, mark("SEND_KEYS_END")),
+                "post_ready_ms": _ms(mark("SEND_KEYS_END"), t_post_ready),     # file đã gắn → nút Post sẵn sàng
+                "post_confirmed_ms": _ms(t_click, t_conf),
+                "wait_mode": getattr(getattr(self.tam, "CFG", None), "wait_mode", None),
+                "done_to_enqueue_ms": _ms(m.get("t_done_ns"), m.get("t_enq_ns")),
                 "enqueue_to_received_ms": _ms(m.get("t_enq_ns"), t_recv),
                 "received_to_attach_ms": _ms(t_recv, t_attach),
                 "done_to_attach_ms": _ms(m.get("t_done_ns"), t_attach),

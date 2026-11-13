@@ -495,7 +495,8 @@ class ApiScanner:
             st.known = [v for v, _, _ in ups]
             for vid, pub, title in ups:                     # mốc: chỉ video còn 'mới' theo CÙNG bộ lọc tuổi như WebSub
                 p = parse_iso(pub)
-                if p is not None and self.e.is_new_video(p) and vid not in self.e.seen:
+                # mốc an toàn: CHỈ video ≤ max_age_minutes (không dùng cửa sổ 'lúc tool tắt' → video cũ 19 giờ không thành mới)
+                if p is not None and self.e.is_fresh_video(p) and vid not in self.e.seen:
                     self._emit(ch, vid, p, title, t_recv, iv, baseline=True)
             return
         for vid, pub, title in ups:

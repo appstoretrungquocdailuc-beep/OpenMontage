@@ -1970,6 +1970,7 @@ def ensure_upload_page(driver, fsm: "ProfileFSM", log: Callable[[str], None], ki
         el = wait_file_input(driver, CFG.file_input_wait_s, kill)
         if el is None:
             return None, "không thấy chỗ nạp file (kể cả sau refresh)"
+        return el, "refreshed"
     if el is None:
         return None, "bị dừng"
     return el, "ok"
@@ -2493,6 +2494,8 @@ def _upload_core(driver, paths: List[str], log, kill, pid: str, trace: PerfTrace
 
     # --- 1) trang upload sẵn sàng + ô nhập file (không sleep; không nạp lại nếu đang sạch) ---
     el, why = ensure_upload_page(driver, fsm, log, kill)
+    trace.mark("PAGE_READY")                              # PAGE_RELOAD_MS = JOB_START → PAGE_READY (gồm nạp lại nếu trang bẩn)
+    trace.set("page_reloaded", 1 if why in ("reloaded", "refreshed") else 0)
     if el is None:
         if kill():
             return UploadResult(S.KILLED, "Hard Stop khi chờ trang upload", trace=trace, paths=paths)

@@ -115,6 +115,7 @@ DEFAULT_CONFIG = {
     "max_parallel_uploads": 4,         # số phiên upload TikTok đồng thời tối đa (backpressure)
     "upload_retry_failed_safe": 1,     # lỗi TRƯỚC khi bấm Post (an toàn) → thử lại tối đa N lần
     "tiktok_dry_run": False,           # True: chạy hết tới khi nút Post sáng rồi DỪNG, KHÔNG bấm Post
+    "tiktok_max_age_minutes": 30,      # video có giờ đăng cũ hơn → KHÔNG tự đăng TikTok (giữ HELD), dù đường phát hiện nào
     "tam_wait_mode": "",               # cách TAM theo dõi nút Post: "" = mặc định của TAM (event/A) | "lite" (C) | "sparse" (B)
     # ---- NGUỒN PHÁT HIỆN (RACE MODE) ----
     "detection_mode": "PARALLEL",      # WEBSUB_ONLY | API_ONLY | PARALLEL (WebSub + API chạy đồng thời, nguồn nào tới trước thắng)
@@ -1548,7 +1549,10 @@ class Engine:
             return "foreign"
         if published is not None:
             age = (now_utc() - published).total_seconds()
-            if not self.is_new_video(published):
+            # API: CHỈ theo tuổi (≤ max_age_minutes). Cửa sổ 'lúc tool tắt' dành riêng cho WebSub (hub gửi lại sau sự cố);
+            # API không có cơ chế gửi lại → dùng cửa sổ đó sẽ biến video cũ (vd 19 giờ) thành 'VIDEO MỚI' lúc khởi động.
+            fresh = self.is_fresh_video(published) if engine == "API" else self.is_new_video(published)
+            if not fresh:
                 # KHÔNG đánh dấu 'đã thấy' vĩnh viễn: chỉ ghi nhật ký để có thể xem lại
                 self.hub_event(ch, "push-old", "", None, 0, f"{vid} published {iso(published)} tuổi {int(age)}s ({engine})")
                 with self.seen_lock:
@@ -1670,6 +1674,12 @@ class Engine:
                                                  meta.get("detected_at") or iso(), meta.get("published"), state, enq_ms))
         if enq_ms is not None:
             self.db.upd(vid, enqueue_ms=enq_ms)
+
+    def is_fresh_video(self, published) -> bool:
+        """Chỉ theo tuổi: published ≤ max_age_minutes (không có cửa sổ 'lúc tool tắt')."""
+        if published is None:
+            return True
+        return (now_utc() - published).total_seconds() <= float(self.cfg.get("max_age_minutes", 30)) * 60
 
     def is_new_video(self, published) -> bool:
         """MỚI nếu: tuổi <= max_age_minutes, HOẶC được đăng ĐÚNG trong khoảng tool tắt (từ lần còn sống cuối −10 phút tới lúc
@@ -1879,6 +1889,7 @@ class Engine:
             if self.on_done is not None and want_tt:
                 try:                                       # DOWNLOAD_DONE → job TikTok ngay (không chặn tải/Excel)
                     self.on_done({"vid": vid, "ch": ch, "path": str(final), "size": size, "t_recv_ns": job.get("t_recv_ns"),
+                                  "published": (row["published_at"] if row is not None else None) or job.get("published"),
                                   "t_detect_ns": job.get("t_enq_ns"), "t_dl_start_ns": t_res, "t_done_ns": t_end})
                 except Exception as e:  # noqa: BLE001
                     self.log(f"❌ không chuyển được {vid} sang TikTok: {type(e).__name__}: {e} (video vẫn an toàn trong DOWNLOADS)")
@@ -2784,7 +2795,7 @@ def run_gui(cfg, base):
              ("download_ms", "Tải (ms)"), ("mux_ms", "Mux (ms)"), ("total_ms", "Tổng (ms)"), ("excel", "Excel"),
              ("mode", "Chế độ phát hiện"), ("wins", "Thắng: WebSub / API"), ("api_status", "API"),
              ("api_quota", "API_QUOTA_USED"), ("api_interval", "Nhịp quét API"), ("api_polls", "API gọi / lỗi / ms"),
-             ("tt_genlogin", "Genlogin/Selenium"), ("tt_opened", "Profile đã mở"), ("tt_ready", "Profile READY"),
+             ("tt_speed", "Trạng thái profile"), ("tt_genlogin", "Genlogin/Selenium"), ("tt_opened", "Profile đã mở"), ("tt_ready", "Profile READY"),
              ("tt_waiting", "Job chờ đăng"), ("tt_uploading", "Đang đăng"), ("tt_confirmed", "POST_CONFIRMED"),
              ("tt_bad", "UNKNOWN/FAILED"), ("tt_held", "Giữ lại (thiếu profile/file)"), ("tt_last", "Lần đăng gần nhất")]
     for i, (k, t) in enumerate(names):
@@ -2813,7 +2824,7 @@ def run_gui(cfg, base):
         last = s.get("last") or {}
         t = s.get("tiktok") or {}
         tl = t.get("last") or {}
-        extra = {"tt_genlogin": t.get("genlogin", "TẮT"), "tt_opened": t.get("opened"), "tt_ready": t.get("ready"),
+        extra = {"tt_speed": t.get("speed", "TẮT"), "tt_genlogin": t.get("genlogin", "TẮT"), "tt_opened": t.get("opened"), "tt_ready": t.get("ready"),
                  "tt_waiting": t.get("waiting"), "tt_uploading": t.get("uploading"), "tt_confirmed": t.get("confirmed"),
                  "tt_bad": t.get("unknown_failed"), "tt_held": t.get("held"),
                  "tt_last": (f"{tl.get('vid')} {tl.get('result')} | DONE→gắn {tl.get('done_to_attach_ms')} ms | "
