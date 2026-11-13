@@ -53,7 +53,7 @@ from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 BACKEND_NAME = "tam_INSTANT_POST"
-BACKEND_VERSION = "5.1.0"
+BACKEND_VERSION = "5.2.0"
 BACKEND_API_LEVEL = 5          # GUI bắt buộc khớp số này (chống GUI mới chạy backend cũ)
 
 
@@ -1990,6 +1990,10 @@ def prepare_upload_page(driver, log: Callable[[str], None], kill: Optional[Calla
         return False
     if fsm is not None:
         fsm.mark_page_clean()
+        if fsm.state == PState.ERROR:
+            # trang vừa nạp SẠCH (đã thấy ô nạp file): lỗi trước-khi-bấm của việc trước đã được dọn → việc kế tiếp KHÔNG nạp lại
+            # lần nữa sau DOWNLOAD_DONE. UNKNOWN thì KHÔNG đụng (cần người kiểm tra).
+            fsm.to(PState.READY, "trang upload vừa nạp sạch")
     if trace is not None:
         trace.mark("NEXT_PROFILE_READY", overwrite=True)
     return True
@@ -4778,7 +4782,8 @@ def _pct_list(xs: List[float]) -> Dict[str, Any]:
     xs = [x for x in xs if x is not None]
     if not xs:
         return {"n": 0}
-    return {"n": len(xs), "median": round(statistics.median(xs), 3), "p95": round(percentile(xs, 0.95), 3), "max": round(max(xs), 3)}
+    return {"n": len(xs), "median": round(statistics.median(xs), 3), "p90": round(percentile(xs, 0.90), 3),
+            "p95": round(percentile(xs, 0.95), 3), "max": round(max(xs), 3)}
 
 
 def cli_bench_overhead(pid: str, secs: float, keep_open: bool) -> int:
@@ -4917,12 +4922,17 @@ def cli_bench_upload(pid: str, files: List[str], repeat: int, yes: bool, keep_op
         _close_one(pid, drv, keep_open)
 
 
-def cli_bench_watch(pid: str, files: List[str], repeat: int, yes: bool, keep_open: bool, modes: str = "ABC") -> int:
+def cli_bench_watch(pid: str, files: List[str], repeat: int, yes: bool, keep_open: bool, modes: str = "ABC",
+                    states: str = "fresh", idle_s: float = 120.0) -> int:
     """A/B/C trên TikTok THẬT, cùng profile, cùng file, mỗi lượt nạp lại trang Upload sạch, thứ tự xoay vòng.
     A = event (watcher hiện tại) | B = sparse (không cài gì khi upload) | C = lite (chỉ theo dõi chính nút Post).
     LUÔN dry-run: chạy tới khi nút Post sáng rồi DỪNG — KHÔNG BAO GIỜ bấm Post, không video nào được đăng."""
     names = {"A": "event", "B": "sparse", "C": "lite"}
     modes = [m for m in modes.upper() if m in names] or ["A", "B", "C"]
+    # TRẠNG THÁI TRANG lúc gắn file: fresh = vừa nạp lại | idle = nạp lại rồi để rảnh idle_s giây (giống trang mở sẵn chờ video)
+    # | front = Page.bringToFront ngay trước khi gắn (tab hiển thị). Đo để biết trang mở sẵn lâu có làm POST_READY chậm không.
+    sts = [x.strip().lower() for x in str(states or "fresh").split(",") if x.strip().lower() in ("fresh", "idle", "front")] or ["fresh"]
+    combos = [(m, st) for st in sts for m in modes]
     files = [os.path.abspath(f) for f in files]
     miss = [f for f in files if not os.path.isfile(f)]
     if miss:
@@ -4943,12 +4953,17 @@ def cli_bench_watch(pid: str, files: List[str], repeat: int, yes: bool, keep_ope
         CFG.rec_enable = True
         n_bytes = sum((stat_file(f) or (0, 0))[0] for f in files)
         for r in range(max(1, repeat)):
-            order = modes[r % len(modes):] + modes[:r % len(modes)]
+            order = combos[r % len(combos):] + combos[:r % len(combos)]
             if r % 2:
                 order = order[::-1]
-            for m in order:
+            for m, pst in order:
                 CFG.wait_mode = names[m]
                 get_fsm(pid).dirty = True                       # mỗi lượt: trang Upload SẠCH vừa nạp
+                if pst == "idle":                               # nạp sạch TRƯỚC rồi để trang rảnh như khi chờ video thật
+                    prepare_upload_page(drv, lambda *_: None, None, get_fsm(pid))
+                    time.sleep(max(0.0, idle_s))                # chỉ trong công cụ đo, không có trong đường đăng thật
+                saved_front = CFG.bring_to_front
+                CFG.bring_to_front = (pst == "front")
                 snap = {}       # type: Dict[str, Any]
                 counter = _CountingDriver(drv)
 
@@ -4966,9 +4981,11 @@ def cli_bench_watch(pid: str, files: List[str], repeat: int, yes: bool, keep_ope
                 finally:
                     cleanup_stage_dir(tmp)
                     counter.release()
+                    CFG.bring_to_front = saved_front
                 rec = tr.record()
                 fl = rec.get("flags") or {}
-                row = {"mode": m, "wait_mode": names[m], "round": r + 1, "result": res.status.value,
+                row = {"mode": m, "page_state": pst, "cell": f"{m}/{pst}", "wait_mode": names[m], "round": r + 1,
+                       "result": res.status.value, "page_reloaded": fl.get("page_reloaded"), "vis_ready": fl.get("vis_ready"),
                        "attach_to_ready_py_ms": round((snap["t1"] - snap["t0"]) * 1000) if "t1" in snap and "t0" in snap else None,
                        "attach_to_ready_page_ms": (rec.get("ms") or {}).get("AttachToReadyPage"),
                        "webdriver_cmds": (snap["n1"] - snap["n0"]) if snap.get("n1") is not None and snap.get("n0") is not None else None}
@@ -4984,13 +5001,14 @@ def cli_bench_watch(pid: str, files: List[str], repeat: int, yes: bool, keep_ope
                 rows.append(row)
                 if CFG.perf_enable:
                     PERF_LOG.write(rec)
-                print(f"  vòng {r + 1} {m}({names[m]}): gắn→READY {row['attach_to_ready_py_ms']} ms | trang {row['attach_to_ready_page_ms']} | "
+                print(f"  vòng {r + 1} {m}({names[m]})/{pst}: gắn→READY {row['attach_to_ready_py_ms']} ms | trang {row['attach_to_ready_page_ms']} | "
                       f"CPU chrome {row['cpu_chrome_s']} s | lệnh {row['webdriver_cmds']} | long task {row.get('x_longtask_ms')} ms | "
                       f"{row['result']}" + ("" if res.status == PostStatus.DRY_RUN else f" ({res.reason})"))
         rep = {"profile": pid, "files": [os.path.basename(f) for f in files], "bytes": n_bytes, "repeat": repeat,
                "ts": datetime.datetime.now().isoformat(timespec="seconds"), "rows": rows, "summary": {}}
-        for m in modes:
-            rs = [x for x in rows if x["mode"] == m and x["result"] == PostStatus.DRY_RUN.value]
+        cells = [f"{m}/{st}" for m, st in combos]
+        for m in cells:
+            rs = [x for x in rows if x["cell"] == m and x["result"] == PostStatus.DRY_RUN.value]
             rep["summary"][m] = {k: _pct_list([x.get(k) for x in rs if isinstance(x.get(k), (int, float))])
                                  for k in ("attach_to_ready_py_ms", "attach_to_ready_page_ms", "cpu_chrome_s", "cpu_python_s",
                                            "webdriver_cmds", "x_longtask_ms", "x_task_ms", "x_layout_count", "x_recalcstyle_count",
@@ -4998,16 +5016,16 @@ def cli_bench_watch(pid: str, files: List[str], repeat: int, yes: bool, keep_ope
         out = os.path.join(BASE_DIR, f"tam_bench_watch_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
         with open(out, "w", encoding="utf-8") as f:
             json.dump(rep, f, ensure_ascii=False, indent=1)
-        print("\n=== TÓM TẮT (median | P95) — DRY-RUN, không bấm Post ===")
-        print(f"{'chế độ':8} {'gắn→READY ms':>16} {'CPU chrome s':>14} {'CPU python s':>14} {'lệnh WD':>9} {'long task ms':>13} {'layout':>8}")
-        for m in modes:
+        print("\n=== TÓM TẮT (median | P90 | P95) — DRY-RUN, không bấm Post ===")
+        print(f"{'chế độ/trang':16} {'gắn→READY ms':>22} {'CPU chrome s':>20} {'lệnh WD':>14} {'long task ms':>16}")
+        for m in cells:
             sm = rep["summary"][m]
-            f_ = lambda k: (f"{sm[k].get('median')}|{sm[k].get('p95')}" if sm[k].get("n") else "-")
-            print(f"{m}({names[m]:6}) {f_('attach_to_ready_py_ms'):>16} {f_('cpu_chrome_s'):>14} {f_('cpu_python_s'):>14} "
-                  f"{f_('webdriver_cmds'):>9} {f_('x_longtask_ms'):>13} {f_('x_layout_count'):>8}")
-        for a_, b_ in (("A", "C"), ("A", "B")):
-            xa = [x["attach_to_ready_py_ms"] for x in rows if x["mode"] == a_ and x.get("attach_to_ready_py_ms") is not None]
-            xb = [x["attach_to_ready_py_ms"] for x in rows if x["mode"] == b_ and x.get("attach_to_ready_py_ms") is not None]
+            f_ = lambda k: (f"{sm[k].get('median')}|{sm[k].get('p90')}|{sm[k].get('p95')}" if sm[k].get("n") else "-")
+            print(f"{m:16} {f_('attach_to_ready_py_ms'):>22} {f_('cpu_chrome_s'):>20} {f_('webdriver_cmds'):>14} {f_('x_longtask_ms'):>16}")
+        pairs = [(f"A/{sts[0]}", f"C/{sts[0]}"), (f"A/{sts[0]}", f"B/{sts[0]}")] + [(f"{modes[0]}/fresh", f"{modes[0]}/{st}") for st in sts if st != "fresh" and "fresh" in sts]
+        for a_, b_ in pairs:
+            xa = [x["attach_to_ready_py_ms"] for x in rows if x["cell"] == a_ and x.get("attach_to_ready_py_ms") is not None]
+            xb = [x["attach_to_ready_py_ms"] for x in rows if x["cell"] == b_ and x.get("attach_to_ready_py_ms") is not None]
             if len(xa) >= 3 and len(xb) >= 3:
                 d, lo, hi = bootstrap_median_diff(xa, xb)
                 print(f"{b_} − {a_} (gắn→READY, median): {d:+.0f} ms, KTC95% [{lo:+.0f}; {hi:+.0f}]"
@@ -5406,6 +5424,8 @@ def build_parser() -> "argparse.ArgumentParser":
     ap.add_argument("--variant", help="nhãn ghi vào PERF (TAM_VARIANT)")
     ap.add_argument("--wait-mode", choices=["event", "sparse", "lite", "poll"], help="đặt TAM_WAIT_MODE cho lần chạy này (event=A, sparse=B, lite=C)")
     ap.add_argument("--modes", default="ABC", help="--bench-watch: các chế độ so sánh (mặc định ABC)")
+    ap.add_argument("--page-states", default="fresh", help="--bench-watch: fresh,idle,front (trạng thái trang lúc gắn file)")
+    ap.add_argument("--idle-s", type=float, default=120.0, help="--bench-watch --page-states idle: số giây trang rảnh trước khi gắn")
     ap.add_argument("--stage", choices=["direct", "ram"], help="đặt TAM_STAGE cho lần chạy này")
     ap.add_argument("--force-reload", action="store_true", help="đặt TAM_FORCE_RELOAD=1 cho lần chạy này")
     ap.add_argument("--keep-open", action="store_true", help="không đóng profile sau khi đo")
@@ -5454,7 +5474,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     if a.bench_watch:
         if not a.profile or not a.files:
             ap.error("--bench-watch cần --profile và --files")
-        return cli_bench_watch(a.profile, a.files, a.repeat if a.repeat != 3 else 6, a.yes, a.keep_open, a.modes)
+        return cli_bench_watch(a.profile, a.files, a.repeat if a.repeat != 3 else 20, a.yes, a.keep_open, a.modes,
+                               a.page_states, a.idle_s)
     if a.bench_attach:
         if not a.profile or not a.files:
             ap.error("--bench-attach cần --profile (có thể a,b,c) và --files")

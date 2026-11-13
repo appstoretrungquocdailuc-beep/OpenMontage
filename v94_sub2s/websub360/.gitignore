@@ -11,3 +11,5 @@ __pycache__/
 api_keys.txt
 RACE_BENCHMARK.*
 BENCH_DL.*
+BENCH_PIPELINE.*
+PIPELINE_REPORT.md

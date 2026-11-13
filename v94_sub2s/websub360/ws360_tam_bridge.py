@@ -193,9 +193,9 @@ class TikTokBridge:
             for t in ths:
                 while t.is_alive() and not self.stop_ev.is_set():
                     t.join(0.5)
-                    ok = sum(1 for p in pre if self.slots[p].state == "READY")
+                    ok = sum(1 for p in pre if self.slots[p].state in ("READY", "BUSY"))
                     self.stats["speed"] = f"ĐANG CHUẨN BỊ {ok}/{len(pre)} profile"
-            ok = [p for p in pre if self.slots[p].state == "READY"]
+            ok = [p for p in pre if self.slots[p].state in ("READY", "BUSY")]   # BUSY = đã mở và đang đăng video chờ
             el = _ms(t0, time.perf_counter_ns())
             if len(ok) == len(pre):
                 self.stats["speed"] = f"SẴN SÀNG TỐC ĐỘ TỐI ĐA ({len(ok)}/{len(pre)})"
@@ -343,7 +343,7 @@ class TikTokBridge:
             with s.cond:
                 if not any(j["job_id"] == f"{vid}:{pid}" for j in s.queue):
                     s.queue.append({"job_id": f"{vid}:{pid}", "vid": vid, "ch": ch, "pid": pid, "path": path,
-                                    "size": info.get("size"), "marks": dict(marks)})
+                                    "size": info.get("size"), "marks": dict(marks), "bench": bool(info.get("bench"))})
                 s.cond.notify()
             out.append(f"{vid}:{pid}")
         self.stats["waiting"] = sum(len(s.queue) for s in self.slots.values())

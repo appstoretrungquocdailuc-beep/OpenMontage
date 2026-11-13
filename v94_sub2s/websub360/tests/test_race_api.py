@@ -462,3 +462,22 @@ def test_channel_level_403_does_not_disable_key(tmp_path, api):
     body = json.dumps({"error": {"code": 403, "errors": [{"reason": "forbidden"}], "message": "channel"}}).encode()
     s._handle_error(CH[0], st, pr, K[0], 403, {}, body)
     assert pr.live_keys() == [K[0]] and st.bad_until > time.time()
+
+
+def test_api_baseline_after_long_downtime_never_turns_19h_old_video_into_new(tmp_path, api):
+    """Lỗi thật: tool tắt ~20 giờ → khởi động → API thấy video đăng 19 giờ trước → báo VIDEO MỚI. Phải bỏ qua."""
+    keys(tmp_path, [f"P1|{K[0]}"])
+    api.upload(CH[0], "OLD19HOURS1", published=now() - timedelta(hours=19))
+    api.upload(CH[0], "FRESH5MIN01", published=now() - timedelta(minutes=5))
+    e = eng(tmp_path, CH[:1], api, download_enabled=False, excel_enabled=False)
+    e.db.meta_set("last_alive", time.time() - 20 * 3600)           # lần chạy trước: 20 giờ trước
+    e2 = eng(tmp_path, CH[:1], api, keep_excel=True, download_enabled=False, excel_enabled=False)
+    assert e2.last_alive_at_start and e2.is_new_video(now() - timedelta(hours=19))   # cửa sổ WebSub vẫn còn (đúng thiết kế)
+    e2.start()
+    assert wait(lambda: e2.db.one("SELECT 1 FROM videos WHERE video_id='FRESH5MIN01'"))   # video mới thật: KHÔNG bỏ sót
+    time.sleep(0.6)
+    assert not e2.db.one("SELECT 1 FROM videos WHERE video_id='OLD19HOURS1'")
+    assert "OLD19HOURS1" not in logs(e2)
+    # API phát hiện SAU mốc mà giờ đăng cũ (vd video cũ vừa công khai) cũng bị chặn theo tuổi
+    assert e2.on_event(CH[0], "OLDLATE0001", "API", now() - timedelta(hours=19), "x") == "old"
+    e2.stop()

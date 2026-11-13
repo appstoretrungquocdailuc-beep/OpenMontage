@@ -48,6 +48,7 @@
   "max_parallel_uploads": 4,
   "upload_retry_failed_safe": 1,
   "tiktok_dry_run": false,
+  "tiktok_max_age_minutes": 30,
   "tam_wait_mode": "",
   "detection_mode": "PARALLEL",
   "api_keys_file": "api_keys.txt",

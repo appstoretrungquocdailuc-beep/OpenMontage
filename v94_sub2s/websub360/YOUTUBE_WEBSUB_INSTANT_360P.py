@@ -1890,6 +1890,7 @@ class Engine:
                 try:                                       # DOWNLOAD_DONE → job TikTok ngay (không chặn tải/Excel)
                     self.on_done({"vid": vid, "ch": ch, "path": str(final), "size": size, "t_recv_ns": job.get("t_recv_ns"),
                                   "published": (row["published_at"] if row is not None else None) or job.get("published"),
+                                  "bench": bool(getattr(self, "bench_mode", False)),
                                   "t_detect_ns": job.get("t_enq_ns"), "t_dl_start_ns": t_res, "t_done_ns": t_end})
                 except Exception as e:  # noqa: BLE001
                     self.log(f"❌ không chuyển được {vid} sang TikTok: {type(e).__name__}: {e} (video vẫn an toàn trong DOWNLOADS)")
@@ -3557,7 +3558,7 @@ def bench_dl(cfg, base, ids, reps=None, variants=None):
         for r in rows:
             w.writerow(r)
     md = [f"# BENCH-DL — tải 360p thật, {len(ids)} video, {reps} vòng/phương án, thứ tự xoay vòng ({iso()})", "",
-          "Mỗi lượt: link MỚI + xoá file trước (không dùng file có sẵn). Giá trị: median / P90 (ms). TỔNG = từ lúc bắt đầu resolve "
+          "Mỗi lượt: link MỚI + xoá file trước (không dùng file có sẵn). Giá trị: median / P90 / P95 (ms). TỔNG = từ lúc bắt đầu resolve "
           "tới khi file đã tải xong + ffprobe xác minh + bàn giao (không tính TTFB 2 lần: TTFB nằm trong 'tải').", "",
           "| Phương án | lượt | lỗi | TỔNG | ≤1000 ms | resolver | setup resolver | chờ máy chủ resolver | TTFB | setup tải | "
           "chờ máy chủ tải | truyền | ffprobe |", "|" + "---|" * 13]
@@ -3565,10 +3566,10 @@ def bench_dl(cfg, base, ids, reps=None, variants=None):
     for v in names:
         rs = [r for r in rows if r["variant"] == v]
         ok = [r for r in rs if r["result"] == "DONE"]
-        q = lambda k: (pct([r[k] for r in ok if r.get(k) is not None], 50), pct([r[k] for r in ok if r.get(k) is not None], 90))
+        q = lambda k: tuple(pct([r[k] for r in ok if r.get(k) is not None], p_) for p_ in (50, 90, 95))
         summary[v] = {k: q(k) for k in BENCH_DL_COLS}
         summary[v].update(n=len(rs), fail=len(rs) - len(ok), under_1s=sum(1 for r in ok if (r["total_ms"] or 1e9) <= 1000))
-        f_ = lambda t: "-" if t[0] is None else f"{t[0]:.0f} / {t[1]:.0f}"
+        f_ = lambda t: "-" if t[0] is None else f"{t[0]:.0f} / {t[1]:.0f} / {t[2]:.0f}"
         sv = summary[v]
         md.append(f"| {v} | {sv['n']} | {sv['fail']} ({100 * sv['fail'] / max(1, sv['n']):.0f}%) | {f_(sv['total_ms'])} | "
                   f"{sv['under_1s']}/{len(ok)} | {f_(sv['resolver_ms'])} | {f_(sv['res_setup_ms'])} | {f_(sv['res_server_wait_ms'])} | "
@@ -3582,6 +3583,135 @@ def bench_dl(cfg, base, ids, reps=None, variants=None):
     (base / "BENCH_DL.md").write_text("\n".join(md) + "\n", encoding="utf-8")
     print("\n".join(md))
     return {"rows": rows, "summary": summary}
+
+
+PIPE_COLS = [("detect_to_done_ms", "PHÁT HIỆN→DOWNLOAD_DONE"), ("resolver_ms", "  resolver"), ("ttfb_ms", "  TTFB tải"),
+             ("transfer_ms", "  truyền sau byte đầu"), ("ffprobe_ms", "  ffprobe"), ("done_to_attach_ms", "DOWNLOAD_DONE→ATTACH"),
+             ("profile_wait_ms", "PROFILE_WAIT_MS"), ("page_reload_ms", "PAGE_RELOAD_MS"), ("file_attach_ms", "FILE_ATTACH_MS"),
+             ("post_ready_ms", "POST_READY_MS"), ("post_confirmed_ms", "POST_CONFIRMED_MS"),
+             ("detect_to_post_ready_ms", "PHÁT HIỆN→POST_READY"), ("detect_to_confirm_ms", "PHÁT HIỆN→POST_CONFIRMED")]
+
+
+def _pipe_row(db, job_id):
+    j = db.one("SELECT * FROM upload_jobs WHERE job_id=?", (job_id,))
+    if j is None:
+        return None
+    j = dict(j)
+    v = db.one("SELECT * FROM videos WHERE video_id=?", (j["video_id"],))
+    v = dict(v) if v is not None else {}
+    net = json.loads(v.get("net") or "{}")
+    mk = json.loads(j.get("marks") or "{}") if str(j.get("marks") or "").startswith("{") else {}
+    return {"job_id": job_id, "video_id": j["video_id"], "state": j["state"], "wait_mode": j.get("wait_mode"),
+            "detect_to_done_ms": v.get("total_ms"), "resolver_ms": v.get("resolver_ms"),
+            "ttfb_ms": (net.get("media") or {}).get("ttfb_ms"), "transfer_ms": (net.get("media") or {}).get("transfer_ms"),
+            "ffprobe_ms": v.get("ffprobe_ms"), "done_to_attach_ms": j.get("done_to_attach_ms"),
+            "profile_wait_ms": j.get("profile_wait_ms"), "page_reload_ms": j.get("page_reload_ms"), "page_reloaded": j.get("page_reloaded"),
+            "file_attach_ms": j.get("file_attach_ms"), "post_ready_ms": j.get("post_ready_ms"),
+            "post_confirmed_ms": j.get("post_confirmed_ms"), "detect_to_post_ready_ms": mk.get("post_ready_ms"),
+            "detect_to_confirm_ms": mk.get("post_confirmed_ms"), "size": v.get("size")}
+
+
+def _pipe_table(rows, title, groups_key="wait_mode"):
+    md = [f"## {title}", "", "| Giai đoạn | nhóm | n | median | P90 | P95 |", "|---|---|---|---|---|---|"]
+    groups = sorted({str(r.get(groups_key)) for r in rows}) + (["TẤT CẢ"] if len({r.get(groups_key) for r in rows}) > 1 else [])
+    for k, label in PIPE_COLS:
+        for g in groups:
+            vals = [r[k] for r in rows if r.get(k) is not None and (g == "TẤT CẢ" or str(r.get(groups_key)) == g)]
+            if vals:
+                md.append(f"| {label} | {g} | {len(vals)} | {pct(vals, 50):.0f} | {pct(vals, 90):.0f} | {pct(vals, 95):.0f} |")
+    return md
+
+
+def pipeline_report(base: Path, db_name="database.sqlite", last=200) -> dict:
+    """Số liệu THẬT từ các lần đăng đã chạy (production): median/P90/P95 từng giai đoạn → PIPELINE_REPORT.md."""
+    db = DB(base / db_name)
+    jobs = [r["job_id"] for r in db.all("SELECT job_id FROM upload_jobs WHERE state IN ('CONFIRMED','DRY_RUN_DONE') "
+                                        "ORDER BY updated_at DESC LIMIT ?", (int(last),))]
+    rows = [r for r in (_pipe_row(db, j) for j in jobs) if r]
+    md = [f"# PIPELINE REPORT — {len(rows)} job thật gần nhất ({iso()})", ""]
+    if not rows:
+        md.append("Chưa có job CONFIRMED / DRY_RUN_DONE nào trong database.sqlite.")
+    else:
+        md += _pipe_table(rows, "Theo chế độ theo dõi nút Post (wait_mode)")
+        md += ["", f"Trang Upload phải nạp lại sau DOWNLOAD_DONE: {sum(1 for r in rows if r.get('page_reloaded'))}/{len(rows)} job."]
+    (base / "PIPELINE_REPORT.md").write_text("\n".join(md) + "\n", encoding="utf-8")
+    print("\n".join(md))
+    return {"rows": rows}
+
+
+def bench_pipeline(cfg, base, ids, profile, reps=None, modes=("event", "lite", "sparse"), tam=None, ready_timeout=180):
+    """Toàn tuyến THẬT trên máy bạn, CHẠY THỬ (không bấm Post): tải 360p mới → giao TikTok (đường 13 ms) → gắn file → POST_READY.
+    Chế độ theo dõi nút Post xoay vòng mỗi lượt. Không đụng database.sqlite / check.xlsx thật. ≥ 20 lượt mỗi chế độ."""
+    log = Log(base / "logs")
+    bcfg = dict(cfg, download_dir="DOWNLOADS_BENCH", excel_enabled=False, tiktok_enabled=True, tiktok_dry_run=True)
+    eng = Engine(bcfg, base, log, db_name="database_BENCH.sqlite", lock_name="ws360_bench.lock")
+    eng.bench_mode = True
+    br = attach_tiktok(eng, bcfg, log, tam=tam)
+    ch = "UCBENCH" + "0" * 17
+    br.reload_mapping = lambda: setattr(br, "targets", {ch: [str(profile)]})
+    eng.on_excel_reload = None
+    eng.channels = {ch: [0]}
+    eng.reload_channels = lambda initial=False: (set(), set())
+    eng.start(websub=False, api=False, excel_watch=False)
+    br.start()
+    end = time.time() + ready_timeout
+    while time.time() < end and not str(br.snapshot().get("speed", "")).startswith(("SẴN SÀNG", "CHỈ")):
+        time.sleep(0.2)
+    if not str(br.snapshot().get("speed", "")).startswith("SẴN SÀNG"):
+        log(f"❌ BENCH-PIPELINE: profile {profile} chưa READY ({br.snapshot().get('speed')}) — dừng")
+        eng.stop()
+        return {"rows": []}
+    have_lite = hasattr(br.tam, "JS_LITE_INSTALL")
+    modes = [m for m in modes if m == "event" or have_lite]
+    reps = reps or max(1, -(-20 // max(1, len(ids))))
+    rows = []
+    for r in range(reps):
+        for vid in ids:
+            order = modes[r % len(modes):] + modes[:r % len(modes)]
+            for m in order:
+                br.tam.CFG.wait_mode = m
+                eng.db.x("DELETE FROM videos WHERE video_id=?", (vid,))
+                eng.db.x("DELETE FROM upload_jobs WHERE video_id=?", (vid,))
+                shutil.rmtree(eng.dl_dir / ch, ignore_errors=True)
+                t = time.perf_counter_ns()
+                eng.db.x("INSERT INTO videos(video_id, channel_id, url, engine, detected_at, state, tiktok) VALUES(?,?,?,?,?,?,1)",
+                         (vid, ch, video_url(vid), "BENCH", iso(), "QUEUED"))
+                res = eng.process({"vid": vid, "ch": ch, "t_recv_ns": t, "t_enq_ns": t, "tiktok": True})
+                jid = f"{vid}:{profile}"
+                end = time.time() + 150
+                row = None
+                while res == "DONE" and time.time() < end:
+                    j = eng.db.one("SELECT state FROM upload_jobs WHERE job_id=?", (jid,))
+                    if j and j["state"] in ("DRY_RUN_DONE", "FAILED", "HELD", "UNKNOWN", "FAILED_VISIBLE", "WAIT_USER", "DUPLICATE"):
+                        row = _pipe_row(eng.db, jid)
+                        break
+                    time.sleep(0.05)
+                row = row or {"job_id": jid, "video_id": vid, "state": res if res != "DONE" else "TIMEOUT", "wait_mode": m}
+                row["wait_mode"] = m
+                row["rep"] = r
+                rows.append(row)
+                log(f"BENCH-PIPELINE {m:6} {vid} #{r + 1}: {row['state']} | PHÁT HIỆN→DONE {row.get('detect_to_done_ms')} | "
+                    f"DONE→ATTACH {row.get('done_to_attach_ms')} | PAGE_RELOAD {row.get('page_reload_ms')} | "
+                    f"POST_READY {row.get('post_ready_ms')} | PHÁT HIỆN→POST_READY {row.get('detect_to_post_ready_ms')}")
+                # sau chạy thử bridge tự nạp lại trang Upload (như sau POST_CONFIRMED thật) → chờ profile READY lại
+                end = time.time() + 60
+                while time.time() < end and br.slots[str(profile)].state not in ("READY", "ERROR", "UNKNOWN"):
+                    time.sleep(0.05)
+    eng.stop()
+    shutil.rmtree(eng.dl_dir, ignore_errors=True)
+    ok = [x for x in rows if x["state"] == "DRY_RUN_DONE"]
+    md = [f"# BENCH PIPELINE (CHẠY THỬ, không bấm Post) — profile {profile}, {len(ids)} video, {len(rows)} lượt ({iso()})", "",
+          f"Lượt đạt: {len(ok)}/{len(rows)}. POST_CONFIRMED không đo được ở chạy thử — xem PIPELINE_REPORT.md (job đăng thật).", ""]
+    md += _pipe_table(ok, "Theo chế độ theo dõi nút Post")
+    (base / "BENCH_PIPELINE.md").write_text("\n".join(md) + "\n", encoding="utf-8")
+    with open(base / "BENCH_PIPELINE.csv", "w", newline="", encoding="utf-8") as f:
+        keys = list(dict.fromkeys(k for x in rows for k in x))
+        w = csv.DictWriter(f, fieldnames=keys)
+        w.writeheader()
+        for x in rows:
+            w.writerow(x)
+    print("\n".join(md))
+    return {"rows": rows}
 
 
 def bench(cfg, base, ids, reps=3):
@@ -3735,6 +3865,9 @@ def main(argv=None):
     ap.add_argument("--bench360", nargs="*", help="đo đường tải thật N lượt/video → BENCH360.csv (median/p90 từng bước)")
     ap.add_argument("--bench-dl", nargs="*", help="so sánh các phương án mạng/tải trên video thật → BENCH_DL.md/.csv (≥20 lượt mỗi phương án)")
     ap.add_argument("--variants", default="", help="--bench-dl: danh sách phương án, cách nhau dấu phẩy")
+    ap.add_argument("--bench-pipeline", nargs="*", help="toàn tuyến thật CHẠY THỬ (không bấm Post): tải → TikTok → POST_READY; cần --profile")
+    ap.add_argument("--profile", default="", help="--bench-pipeline: Profile ID Genlogin dùng để đo")
+    ap.add_argument("--pipeline-report", action="store_true", help="median/P90/P95 từng giai đoạn từ các job đăng thật → PIPELINE_REPORT.md")
     ap.add_argument("--integrated", action="store_true", help="bật sẵn tự đăng TikTok (TAM) khi mở giao diện / headless")
     ap.add_argument("--dry-run-post", action="store_true", help="tích hợp: chạy tới khi nút Post sáng rồi DỪNG, không bấm")
     ap.add_argument("--mode", default="", help="WEBSUB_ONLY | API_ONLY | PARALLEL (ghi đè detection_mode trong config.json)")
@@ -3761,6 +3894,16 @@ def main(argv=None):
         return 0 if all(s != "FAIL" for _, s, _ in r) else 1
     if a.bench360 is not None:
         bench360(cfg, base, [v for v in (extract_vid(x) for x in a.bench360) if v], max(1, a.reps if a.reps != 3 else 10))
+        return 0
+    if a.pipeline_report:
+        pipeline_report(base)
+        return 0
+    if a.bench_pipeline is not None:
+        ids = [v for v in (extract_vid(x) for x in a.bench_pipeline) if v]
+        if not ids or not a.profile:
+            print("Cần ID video và --profile. Ví dụ: --bench-pipeline ID1 ID2 --profile 12345")
+            return 2
+        bench_pipeline(cfg, base, ids, a.profile, a.reps if a.reps != 3 else None)
         return 0
     if a.bench_dl is not None:
         ids = [v for v in (extract_vid(x) for x in a.bench_dl) if v]

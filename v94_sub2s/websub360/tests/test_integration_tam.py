@@ -497,3 +497,104 @@ def test_title_named_file_reaches_uploader_exactly_and_attach_is_logged(tmp_path
     assert any("DOWNLOAD_DONE_TO_TIKTOK_ATTACH=" in l and name in l for l in e._logs)
     assert any("DETECTION_TO_DOWNLOAD_DONE TITLEVID001" in l for l in e._logs)
     e.stop()
+
+
+@need_ff
+def test_old_video_from_websub_downtime_catchup_is_downloaded_but_never_auto_posted(tmp_path, tam, monkeypatch, gvs, media):
+    from datetime import timedelta
+    fk = FakeTikTok(tam, monkeypatch)
+    e, br = engine(tmp_path, [(P1, CH[0])], tam)
+    e.last_alive_at_start = time.time() - 20 * 3600                     # tool tắt 20 giờ: hub gửi lại push muộn
+    monkeypatch.setattr(e.resolver, "resolve", lambda v, deadline_s=2.5: T.plan_prog(gvs, media, v))
+    e.start(websub=False)
+    br.start()
+    assert e.on_event(CH[0], "CATCHUP19H1", "WEBSUB", datetime.now(timezone.utc) - timedelta(hours=19), "cũ") == "queued"
+    assert T.wait_state(e, "CATCHUP19H1")["state"] == "DONE"            # vẫn tải + ghi Excel như thiết kế WebSub
+    j = wait_job(br, "CATCHUP19H1:" + P1)
+    assert j["state"] == "HELD" and "video cũ" in j["reason"] and not fk.uploads
+    e.stop()
+
+
+def test_recovered_job_for_old_video_is_held_not_posted_late(tmp_path, tam, monkeypatch):
+    from datetime import timedelta
+    fk = FakeTikTok(tam, monkeypatch)
+    e, br = engine(tmp_path, [(P1, CH[0])], tam)
+    f = tmp_path / "LATEJOB0001_360p.mp4"
+    f.write_bytes(b"x" * 100)
+    pub = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat()
+    e.db.x("INSERT INTO videos(video_id, channel_id, url, engine, detected_at, published_at, state, file, size, tiktok) "
+           "VALUES(?,?,?,?,?,?,?,?,?,?)", ("LATEJOB0001", CH[0], "u", "WEBSUB", pub, pub, "DONE", str(f), 100, 1))
+    e.db.x("INSERT INTO upload_jobs(job_id, video_id, channel_id, profile_id, path, size, state, created_at, updated_at) "
+           "VALUES(?,?,?,?,?,?,?,?,?)", ("LATEJOB0001:" + P1, "LATEJOB0001", CH[0], P1, str(f), 100, "QUEUED", "x", "x"))
+    br.start()                                                            # khởi động lại sau 5 giờ → khôi phục job
+    j = wait_job(br, "LATEJOB0001:" + P1)
+    assert j["state"] == "HELD" and "video cũ" in j["reason"] and not fk.uploads
+
+
+@need_ff
+def test_video_during_profile_startup_is_durable_and_posted_right_after_ready(tmp_path, tam, monkeypatch, gvs, media):
+    fk = FakeTikTok(tam, monkeypatch)
+    real_open = fk.open
+
+    def slow_open(pid, token, chromedriver, url):
+        time.sleep(1.0)                                                   # Genlogin mở chậm
+        return real_open(pid, token, chromedriver, url)
+    monkeypatch.setattr(tam, "setup_and_navigate_profile", slow_open)
+    e, br = engine(tmp_path, [(P1, CH[0])], tam)
+    monkeypatch.setattr(e.resolver, "resolve", lambda v, deadline_s=2.5: T.plan_prog(gvs, media, v))
+    e.start(websub=False)
+    br.start()
+    assert br.snapshot()["speed"].startswith("ĐANG CHUẨN BỊ")
+    e.on_event(CH[0], "DURINGOPEN1", "WEBSUB", T.TS, "t")              # video tới khi profile còn đang mở
+    assert br.db.one("SELECT 1 FROM upload_jobs WHERE video_id='DURINGOPEN1'") or T.wait_state(e, "DURINGOPEN1")
+    j = wait_job(br, "DURINGOPEN1:" + P1)
+    assert j["state"] == "CONFIRMED" and fk.opens == [P1]                # đăng ngay khi READY, không mở profile 2 lần
+    assert j["profile_wait_ms"] is not None and j["profile_wait_ms"] > 200
+    end = time.time() + 3
+    while time.time() < end and not br.snapshot()["speed"].startswith("SẴN SÀNG"):
+        time.sleep(0.05)
+    assert br.snapshot()["speed"].startswith("SẴN SÀNG TỐC ĐỘ TỐI ĐA")
+    L = "\n".join(e._logs)
+    assert "🚀 TikTok: SẴN SÀNG TỐC ĐỘ TỐI ĐA" in L
+    line = [l for l in e._logs if "TIKTOK_STAGES DURINGOPEN1" in l][0]
+    for k in ("PROFILE_WAIT_MS", "PAGE_RELOAD_MS", "FILE_ATTACH_MS", "POST_READY_MS", "POST_CONFIRMED_MS"):
+        assert k in line
+    for k in ("file_attach_ms", "post_ready_ms", "post_confirmed_ms"):
+        assert j[k] is not None
+    e.stop()
+
+
+@need_ff
+def test_bench_pipeline_dry_run_rotates_modes_and_reports_percentiles(tmp_path, tam, monkeypatch, gvs, media):
+    fk = FakeTikTok(tam, monkeypatch)
+    make_excel(tmp_path / "check.xlsx", [(P1, CH[0])])
+    monkeypatch.setattr(ws.Resolver, "resolve", lambda self, v, deadline_s=2.5: dict(T.plan_prog(gvs, media, v), title="t"))
+    cfg = dict(ws.DEFAULT_CONFIG, retry_schedule_sec=[0.1], net_warm=False, tam_path=str(FIX_TAM))
+    out = ws.bench_pipeline(cfg, tmp_path, ["PIPEBENCH01"], P1, reps=2, tam=tam)
+    rows = out["rows"]
+    assert len(rows) == 6 and all(r["state"] == "DRY_RUN_DONE" for r in rows), [r["state"] for r in rows]
+    assert sorted({r["wait_mode"] for r in rows}) == ["event", "lite", "sparse"]
+    assert len(fk.uploads) == 6 and all(not r.get("post_confirmed_ms") for r in rows)
+    jp = tmp_path / "tam_post_journal.jsonl"
+    assert not jp.exists() or "POSTING" not in jp.read_text(encoding="utf-8")   # KHÔNG bấm Post lần nào
+    md = (tmp_path / "BENCH_PIPELINE.md").read_text(encoding="utf-8")
+    assert "P95" in md and "POST_READY_MS" in md and "DOWNLOAD_DONE→ATTACH" in md
+    assert not (tmp_path / "database.sqlite").exists()                       # không đụng DB thật
+    assert len(gvs.requests_for("/vp/PIPEBENCH01")) == 6                     # tải lại thật mỗi lượt
+
+
+@need_ff
+def test_pipeline_report_from_real_confirmed_jobs(tmp_path, tam, monkeypatch, gvs, media):
+    FakeTikTok(tam, monkeypatch)
+    e, br = engine(tmp_path, [(P1, CH[0])], tam)
+    monkeypatch.setattr(e.resolver, "resolve", lambda v, deadline_s=2.5: T.plan_prog(gvs, media, v))
+    e.start(websub=False)
+    br.start()
+    for v in ("REPORTVID01", "REPORTVID02"):
+        e.on_event(CH[0], v, "WEBSUB", T.TS, "t")
+        assert wait_job(br, f"{v}:{P1}")["state"] == "CONFIRMED"
+    e.stop()
+    rep = ws.pipeline_report(tmp_path)
+    assert len(rep["rows"]) == 2 and all(r["post_confirmed_ms"] is not None for r in rep["rows"])
+    md = (tmp_path / "PIPELINE_REPORT.md").read_text(encoding="utf-8")
+    assert "POST_CONFIRMED_MS" in md and "PHÁT HIỆN→POST_CONFIRMED" in md and "P95" in md

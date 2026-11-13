@@ -92,3 +92,27 @@ def test_never_clicks_while_post_button_is_covered_and_still_confirms(lab, mode)
     res, _, marks = run(lab, mode, "nodes=60&coverhold=1200", dry=False, pid="TC" + mode)
     assert res.status.value == "CONFIRMED", res.reason
     assert marks["postClick"] >= marks["coverOff"] > marks["enabled"]
+
+
+def test_bench_watch_cli_modes_x_page_states_reports_p90_p95(lab, monkeypatch, capsys):
+    tam = lab["tam"]
+    tam.TARGET_UPLOAD_URL = f"{lab['base']}/tiktokstudio/upload?nodes=60"
+    monkeypatch.setattr(tam, "_open_one", lambda pid: lab["drv"])
+    monkeypatch.setattr(tam, "_close_one", lambda pid, drv, keep: None)
+    before = set(Path(tam.BASE_DIR).glob("tam_bench_watch_*.json"))
+    try:
+        assert tam.cli_bench_watch("BW", [lab["file"]], 2, True, True, "AC", "fresh,idle", 0.3) == 0
+        new = set(Path(tam.BASE_DIR).glob("tam_bench_watch_*.json")) - before
+        import json
+        rep = json.loads(next(iter(new)).read_text(encoding="utf-8"))
+        assert set(rep["summary"]) == {"A/fresh", "C/fresh", "A/idle", "C/idle"}
+        assert len(rep["rows"]) == 8 and all(r["result"] == "DRY_RUN" for r in rep["rows"])
+        s = rep["summary"]["A/fresh"]["attach_to_ready_py_ms"]
+        assert {"median", "p90", "p95"} <= set(s)
+        idle_rows = [r for r in rep["rows"] if r["page_state"] == "idle"]
+        assert all(r["page_reloaded"] == 0 for r in idle_rows)            # trang 'idle' = trang mở sẵn, không nạp lại khi gắn
+        out = capsys.readouterr().out
+        assert "median | P90 | P95" in out
+    finally:
+        for f in set(Path(tam.BASE_DIR).glob("tam_bench_watch_*.json")) - before:
+            f.unlink()
