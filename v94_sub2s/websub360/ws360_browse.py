@@ -17,7 +17,9 @@ Không dùng yt-dlp/Deno để quét. Không vượt CAPTCHA / giới hạn IP /
 from __future__ import annotations
 
 import collections
+import email.utils
 import json
+import os
 import re
 import threading
 import time
@@ -45,6 +47,78 @@ CH_FAIL_THRESHOLD = 3
 CH_COOLDOWN_BASE = 5.0
 CH_COOLDOWN_MAX = 60.0
 JOB_STUCK_SEC = 6.0
+
+
+RX_RAW_IDS = re.compile(rb'"(?:videoId|contentId)"\s*:\s*"([0-9A-Za-z_-]{11})"')
+
+
+def raw_ids(raw: bytes) -> set:
+    """MỌI Video ID có trong JSON thô (≈1–2 ms / 1,3 MB; đã kiểm: = đúng danh sách video, không lẫn video đề xuất)."""
+    return {m.decode() for m in RX_RAW_IDS.findall(raw)}
+
+
+class ServerClock:
+    """Đồng hồ máy chủ Google từ header Date (độ phân giải 1 s): giữ CẬN chặt nhất của độ lệch (server − máy)."""
+
+    def __init__(self, window=120):
+        self.lock = threading.Lock()
+        self.samples = collections.deque(maxlen=window)
+
+    def note(self, date_hdr, wall_send, wall_recv):
+        try:
+            d = email.utils.parsedate_to_datetime(date_hdr).timestamp()
+        except Exception:
+            return
+        with self.lock:
+            self.samples.append((d - wall_recv, d + 1.0 - wall_send))   # server∈[Date, Date+1) tại một thời điểm trong [send, recv]
+
+    def server_time(self, wall):
+        """(ước lượng, ± nửa khoảng) hoặc (None, None)."""
+        with self.lock:
+            if not self.samples:
+                return None, None
+            lo = max(a for a, _ in self.samples)
+            hi = min(b for _, b in self.samples)
+        if hi < lo:                                         # mẫu mâu thuẫn (đồng hồ máy nhảy) → dùng mẫu mới nhất
+            lo, hi = self.samples[-1]
+        return wall + (lo + hi) / 2, (hi - lo) / 2
+
+
+class TraceLog:
+    """logs/browse_trace.jsonl — 1 dòng / lượt Browse (giờ monotonic + giờ thật + ID trả về). Tự cắt khi > max_mb (giữ 3 file)."""
+
+    def __init__(self, path, max_mb=50):
+        self.path = path
+        self.max = max_mb * 1024 * 1024
+        self.lock = threading.Lock()
+        self.fh = None
+
+    def write(self, rec):
+        line = json.dumps(rec, ensure_ascii=False, separators=(",", ":"))
+        with self.lock:
+            try:
+                if self.fh is None:
+                    os.makedirs(os.path.dirname(self.path), exist_ok=True)
+                    self.fh = open(self.path, "a", encoding="utf-8", buffering=1)
+                self.fh.write(line + "\n")
+                if self.fh.tell() > self.max:
+                    self.fh.close()
+                    self.fh = None
+                    for i in (2, 1):
+                        if os.path.exists(f"{self.path}.{i}"):
+                            os.replace(f"{self.path}.{i}", f"{self.path}.{i + 1}")
+                    os.replace(self.path, f"{self.path}.1")
+            except OSError:
+                self.fh = None
+
+    def close(self):
+        with self.lock:
+            try:
+                if self.fh:
+                    self.fh.close()
+            except OSError:
+                pass
+            self.fh = None
 
 
 def scrub(text) -> str:
@@ -331,14 +405,26 @@ class BrowseGuard:
 
 
 class _Surf:
-    __slots__ = ("known", "order", "first_ok", "polls", "empty", "last_attempt", "cooldown_until", "cool_n", "fails", "had_rows")
+    __slots__ = ("known", "order", "first_ok", "polls", "empty", "last_attempt", "cooldown_until", "cool_n", "fails", "had_rows",
+                 "raw_known", "raw_order")
 
     def __init__(self):
         self.known, self.order = set(), collections.deque()
+        self.raw_known, self.raw_order = None, collections.deque()
         self.first_ok = False
         self.polls = self.empty = self.cool_n = self.fails = 0
         self.last_attempt = self.cooldown_until = 0.0
         self.had_rows = False
+
+    def add_raw(self, ids):
+        if self.raw_known is None:
+            self.raw_known = set()
+        for i in ids:
+            if i not in self.raw_known:
+                self.raw_known.add(i)
+                self.raw_order.append(i)
+        while len(self.raw_order) > 1500:
+            self.raw_known.discard(self.raw_order.popleft())
 
     def add(self, ids):
         for i in ids:
@@ -362,6 +448,7 @@ class BrowseScanner:
         self.url = str(cfg.get("browse_url") or "https://www.youtube.com/youtubei/v1/browse")
         self.player_url = str(cfg.get("browse_player_url") or "https://www.youtube.com/youtubei/v1/player")
         self.key = str(cfg.get("browse_api_key") or "") or DEFAULT_WEB_KEY
+        self.cfg_lock = threading.Lock()
         self.client_version = str(cfg.get("browse_client_version") or "") or _yt_web_client_version()
         self.periods = {"uploads": max(0.2, float(cfg.get("browse_uploads_period_sec", 0.75))),
                         "videos": max(0.5, float(cfg.get("browse_videos_period_sec", 3.0)))}
@@ -380,6 +467,17 @@ class BrowseScanner:
         self.threads = []
         self.beat = {}
         self.token = 0
+        self.clock = ServerClock()
+        self.trace = TraceLog(os.path.join(str(getattr(engine, "base", ".")), "logs", "browse_trace.jsonl"),
+                              int(cfg.get("browse_trace_max_mb", 50))) if cfg.get("browse_trace", True) else None
+        self.pending = {}                                    # vid → chưa xác minh được, sẽ xét lại
+        self.audit_sem = threading.Semaphore(2)
+        self.first_json = {}                                 # vid → lượt ĐẦU TIÊN có ID trong JSON HTTP 200
+        self.first_parsed = {}                               # vid → lượt đầu tiên bộ đọc trả ra ID
+        self.seq = 0
+        self.track_lock = threading.Lock()                   # seq/first_json dùng chung giữa các luồng quét
+        self.default_endpoint = not cfg.get("browse_url")
+        self.cfg_fixed = bool(cfg.get("browse_api_key")) or bool(cfg.get("browse_client_version"))
         self.resp_ms = collections.deque(maxlen=4000)
         self.parse_ms = collections.deque(maxlen=4000)
         self.fast_raw = bool(cfg.get("browse_fast_parse", True))
@@ -396,6 +494,7 @@ class BrowseScanner:
         db.x("CREATE TABLE IF NOT EXISTS browse_seen(channel_id TEXT, video_id TEXT, at REAL, PRIMARY KEY(channel_id, video_id))")
         db.x("CREATE TABLE IF NOT EXISTS browse_verify(video_id TEXT PRIMARY KEY, channel_id TEXT, source TEXT, verdict TEXT, "
              "method TEXT, age_lo REAL, age_hi REAL, reason TEXT, at TEXT, response_ms REAL)")
+        db.x("CREATE TABLE IF NOT EXISTS browse_timeline(video_id TEXT PRIMARY KEY, channel_id TEXT, data TEXT)")
         db.x("CREATE TABLE IF NOT EXISTS browse_stats(ts REAL, polls INTEGER, p50 REAL, p90 REAL, p95 REAL, n403 INTEGER, "
              "n429 INTEGER, nerr INTEGER, nparse INTEGER, fresh INTEGER, old INTEGER, unverified INTEGER)")
         for r in db.all("SELECT channel_id, video_id FROM browse_seen"):
@@ -430,9 +529,44 @@ class BrowseScanner:
         return self._pool
 
     def _headers(self):
-        return {"User-Agent": UA, "Accept": "application/json", "Accept-Language": "en-US,en;q=0.8", "Accept-Encoding": "gzip",
+        return {"User-Agent": UA, "Accept": "application/json", "Accept-Language": "en-US,en;q=0.8", "Accept-Encoding": "gzip, deflate",
                 "Content-Type": "application/json", "Origin": "https://www.youtube.com", "Cache-Control": "no-cache",
-                "X-YouTube-Client-Name": "1", "X-YouTube-Client-Version": self.client_version}
+                "Pragma": "no-cache", "X-YouTube-Client-Name": "1", "X-YouTube-Client-Version": self.client_version}
+
+    def refresh_config(self):
+        """Như V39 _refresh_browse_config: đọc INNERTUBE_API_KEY + INNERTUBE_CLIENT_VERSION mới nhất từ trang chủ YouTube
+        (luồng nền, 10 phút/lần; lỗi thì giữ giá trị cũ). Không chạy khi bạn tự đặt key/version hoặc dùng máy chủ khác."""
+        if not self.default_endpoint or self.cfg_fixed:
+            return
+        try:
+            r = self.pool().request("GET", "https://www.youtube.com/", headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.8"},
+                                    retries=False, preload_content=True, timeout=urllib3.Timeout(connect=1.0, read=3.0))
+            if r.status != 200:
+                return
+            t = r.data.decode("utf-8", "replace")
+            mk = re.search(r'"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"', t)
+            mv = re.search(r'"INNERTUBE_CLIENT_VERSION"\s*:\s*"([^"]+)"', t)
+            with self.cfg_lock:
+                if mk:
+                    self.key = mk.group(1)
+                if mv:
+                    self.client_version = mv.group(1)
+            self.stats["cfg_refresh"] += 1
+        except Exception:
+            pass
+
+    def _refresh_soon(self):
+        now = time.monotonic()
+        with self.cfg_lock:
+            if now - getattr(self, "_last_forced_refresh", -1e9) < 30:
+                return
+            self._last_forced_refresh = now
+        threading.Thread(target=self.refresh_config, daemon=True, name="BROWSE-CFG-NOW").start()
+
+    def _cfg_loop(self):
+        self.refresh_config()
+        while not self.stop_ev.wait(600):
+            self.refresh_config()
 
     def browse(self, cid, surface):
         """1 POST InnerTube browse (payload V39). Trả dict(status, rows, ms, t_recv_ns, err, how, parse_ms)."""
@@ -443,18 +577,29 @@ class BrowseScanner:
             payload["params"] = VIDEOS_TAB_PARAMS
         else:
             payload["browseId"] = "VLUU" + cid[2:]
+        w0 = time.time()
         t0 = time.perf_counter_ns()
+        with self.cfg_lock:
+            key = self.key
         try:
-            r = self.pool().request("POST", f"{self.url}?key={self.key}&prettyPrint=false", body=json.dumps(payload).encode(),
+            r = self.pool().request("POST", f"{self.url}?key={key}&prettyPrint=false", body=json.dumps(payload).encode(),
                                     headers=self._headers(), retries=False, preload_content=True,
                                     timeout=urllib3.Timeout(connect=self.timeouts[0], read=self.timeouts[1]))
         except Exception as e:  # noqa: BLE001 — chỉ TÊN lỗi (URL có key)
             t1 = time.perf_counter_ns()
             kind = "timeout" if "Timeout" in type(e).__name__ else "net"
-            return {"status": -1, "rows": [], "ms": (t1 - t0) / 1e6, "t_recv_ns": t1, "err": f"{kind}:{type(e).__name__}"}
+            return {"status": -1, "rows": [], "ms": (t1 - t0) / 1e6, "t_send_ns": t0, "t_recv_ns": t1, "wall_send": w0,
+                    "wall_recv": time.time(), "err": f"{kind}:{type(e).__name__}"}
         t1 = time.perf_counter_ns()
-        out = {"status": r.status, "rows": [], "ms": (t1 - t0) / 1e6, "t_recv_ns": t1, "err": ""}
+        w1 = time.time()
+        date = r.headers.get("Date")
+        if date:
+            self.clock.note(date, w0, w1)
+        out = {"status": r.status, "rows": [], "ms": (t1 - t0) / 1e6, "t_send_ns": t0, "t_recv_ns": t1, "wall_send": w0,
+               "wall_recv": w1, "date": date, "bytes": len(r.data or b""), "err": ""}
         if r.status == 200:
+            out["raw"] = r.data
+            out["raw_ids"] = raw_ids(r.data)
             tp = time.perf_counter_ns()
             try:
                 rows, how = None, ""
@@ -510,7 +655,7 @@ class BrowseScanner:
         return p, precise, f"publishDate {raw[:25]}"
 
     # ---------------------------------------------------------------- xác minh độ mới
-    def verify(self, cid, vid, row, source, ms_):
+    def verify(self, cid, vid, row, source, ms_, allow_remote=True):
         """→ (verdict FRESH|OLD|UNVERIFIED, published|None, age_lo, age_hi, method, reason). Không bao giờ đoán 'mới'."""
         lim = float(self.cfg.get("max_age_minutes", 30)) * 60
         now = datetime.now(timezone.utc)
@@ -523,6 +668,8 @@ class BrowseScanner:
                 return "FRESH", now - timedelta(seconds=lo), lo, hi, "ROW_TEXT", f"'{row.get('age_text')[:40]}'"
             if lo > lim:
                 return "OLD", now - timedelta(seconds=lo), lo, hi, "ROW_TEXT", f"'{row.get('age_text')[:40]}'"
+        if not allow_remote:
+            return "UNVERIFIED", None, None, None, "ROW_TEXT", "chưa có chữ tuổi (chờ lịch thử player)"
         p, precise, why = self.player_publish(vid)
         if p is not None:
             age = (now - p).total_seconds()
@@ -552,12 +699,58 @@ class BrowseScanner:
             d[cid] = _Surf()
         return d[cid]
 
+    def _track(self, cid, surface, res, st):
+        """Ghi lượt quét + tìm lượt ĐẦU TIÊN mỗi ID mới có trong JSON + kiểm bộ đọc nhanh có bỏ sót ID mới không."""
+        with self.track_lock:
+            self.seq += 1
+            seq = self.seq
+        rid = res.get("raw_ids") or set()
+        new_raw = set()
+        if st.raw_known is None:
+            st.add_raw(rid)                                  # lượt đầu của bề mặt này: chỉ làm mốc
+        else:
+            new_raw = rid - st.raw_known
+            st.add_raw(rid)
+        for vid in new_raw:
+            with self.track_lock:
+                if vid not in self.first_json:
+                    self.first_json[vid] = {"t_ns": res["t_recv_ns"], "wall": res["wall_recv"], "surface": SURFACES[surface],
+                                            "skey": surface, "cid": cid, "poll": st.polls, "seq": seq, "http_ms": round(res["ms"], 1)}
+        parsed = {r["video_id"] for r in res["rows"]}
+        miss = new_raw - parsed
+        if miss and res.get("how") == "raw" and res.get("raw"):
+            # ID mới có trong JSON mà bộ đọc nhanh không trả → giải mã ĐẦY ĐỦ ngay lượt này để chắc chắn không bỏ sót
+            full, _h = parse_browse_uploads_json(json.loads(res["raw"]), anchor_ids=self.baseline.get(cid))
+            lost = miss & {x["video_id"] for x in full}
+            if lost:
+                self.stats["fast_miss"] += 1
+                self.fast_raw = False
+                self.log(f"❗ BROWSE_FAST_MISS {cid} [{SURFACES[surface]}]: bộ đọc nhanh BỎ SÓT {sorted(lost)} (có trong giải mã đầy đủ) "
+                         f"→ dùng kết quả đầy đủ cho lượt này và TẮT bộ đọc nhanh")
+                res["rows"], res["how"] = full, "json(fast-miss)"
+                parsed = {r["video_id"] for r in full}
+        for vid in parsed:
+            if vid in self.first_json and vid not in self.first_parsed:
+                self.first_parsed[vid] = {"t_ns": res["t_recv_ns"], "wall": res["wall_recv"], "surface": SURFACES[surface],
+                                          "poll": st.polls, "seq": seq, "how": res.get("how")}
+        for d in (self.first_json, self.first_parsed):
+            if len(d) > 5000:
+                for k in list(d)[:1000]:
+                    d.pop(k, None)
+        if self.trace is not None:
+            self.trace.write({"seq": seq, "wall_send": round(res["wall_send"], 3), "wall_recv": round(res["wall_recv"], 3),
+                              "mono_send_ns": res["t_send_ns"], "mono_recv_ns": res["t_recv_ns"], "ch": cid, "surf": SURFACES[surface],
+                              "st": res["status"], "ms": round(res["ms"], 1), "bytes": res.get("bytes"), "date": res.get("date"),
+                              "how": res.get("how"), "parse_ms": round(res.get("parse_ms") or 0, 2),
+                              "top": [r["video_id"] for r in res["rows"]], "new_in_json": sorted(new_raw), "n_json_ids": len(rid)})
+
     def _process(self, cid, surface, res):
         st = self._s(surface, cid)
         source = SURFACES[surface]
+        st.polls += 1
+        self._track(cid, surface, res, st)
         rows = res["rows"]
         ids = [r["video_id"] for r in rows]
-        st.polls += 1
         if not ids:
             st.empty += 1
             if st.had_rows and st.empty in (3, 30, 300):
@@ -567,6 +760,9 @@ class BrowseScanner:
             return
         st.empty = 0
         st.had_rows = True
+        by = {r["video_id"]: r for r in rows}
+        for vid in [i for i in ids if i in self.pending]:      # chưa xác minh được lúc trước → xét lại (chữ tuổi có thể vừa hiện)
+            self._candidate(cid, vid, by[vid], source, res, recheck=True)
         base = self.baseline.get(cid, set())
         unseen = [i for i in ids if i not in st.known and i not in base]
         cand = [i for i in unseen if i not in self.e.seen]
@@ -586,7 +782,6 @@ class BrowseScanner:
                          and parse_relative_age(r.get("age_text"))[1] <= lim and r["video_id"] not in self.e.seen]
                 st.add(ids)
                 self._remember(cid, ids)
-                by = {r["video_id"]: r for r in rows}
                 for vid in reversed(fresh) if surface == "uploads" else []:
                     self._candidate(cid, vid, by[vid], SURFACES[surface], res)
                 return
@@ -597,30 +792,114 @@ class BrowseScanner:
             self.log(f"🧹 BROWSE SHAPE_CHANGE {cid} [{source}]: {len(cand)} ID lạ cùng lúc → xác minh từng ID (không ghi bừa)")
         st.add(ids)
         self._remember(cid, ids)
-        by = {r["video_id"]: r for r in rows}
         for vid in reversed(cand):                             # cũ → mới
             self._candidate(cid, vid, by.get(vid) or {}, source, res)
 
-    def _candidate(self, cid, vid, row, source, res):
+    PLAYER_RETRY = (2, 5, 10, 30, 60)
+
+    def _candidate(self, cid, vid, row, source, res, recheck=False):
+        t_cand = time.perf_counter_ns()
         if vid in self.e.seen:                                 # vừa được nguồn khác nhận trong lúc ta xác minh
+            self.pending.pop(vid, None)
             return
-        verdict, pub, lo, hi, method, why = self.verify(cid, vid, row, source, res["ms"])
-        self.stats[f"verdict_{verdict}"] += 1
+        pend = self.pending.get(vid)
+        now_m = time.monotonic()
+        allow_remote = pend is None or now_m >= pend["next"]   # xét lại: chữ tuổi mỗi lượt (0 request); player theo lịch giãn dần
+        verdict, pub, lo, hi, method, why = self.verify(cid, vid, row, source, res["ms"], allow_remote=allow_remote)
+        t_ver = time.perf_counter_ns()
+        if verdict == "UNVERIFIED":
+            if pend is None:
+                pend = self.pending[vid] = {"t0": now_m, "n": 0, "next": now_m + self.PLAYER_RETRY[0], "cid": cid}
+            elif allow_remote:
+                pend["n"] += 1
+                pend["next"] = now_m + self.PLAYER_RETRY[min(pend["n"], len(self.PLAYER_RETRY) - 1)]
+            final = now_m - pend["t0"] > float(self.cfg.get("browse_unverified_window_sec", 900))
+            if recheck and not final:
+                return                                         # vẫn chưa chắc: im lặng chờ lượt sau
+            if final:
+                self.pending.pop(vid, None)
+                verdict = "UNVERIFIED_FINAL"
+        else:
+            self.pending.pop(vid, None)
+        self.stats[f"verdict_{'UNVERIFIED' if verdict.startswith('UNVERIFIED') else verdict}"] += 1
         self.e.db.x("INSERT OR REPLACE INTO browse_verify(video_id, channel_id, source, verdict, method, age_lo, age_hi, reason, at, "
                     "response_ms) VALUES(?,?,?,?,?,?,?,?,?,?)",
                     (vid, cid, source, verdict, method, lo, hi, scrub(why)[:200], datetime.now(timezone.utc).isoformat(), round(res["ms"], 1)))
         if verdict == "FRESH":
-            age_s = f"{lo:.1f}s" if lo is not None else "?"
-            self.log(f"🌐 BROWSE_DETECTED {vid} | source={source} | age={age_s} (≤{hi:.0f}s, {method}: {scrub(why)}) | "
-                     f"BROWSE_RESPONSE_MS={res['ms']:.0f} | kênh {cid}")
+            txt = (row or {}).get("age_text") or ""
+            self.log(f"🌐 BROWSE_DETECTED {vid} | source={source} | row_text='{txt[-40:]}' (chữ của YouTube, KHÔNG phải tuổi đo được) | "
+                     f"xác minh {method} | BROWSE_RESPONSE_MS={res['ms']:.0f} | kênh {cid}" + (" | sau khi xét lại" if recheck else ""))
             r = self.e.on_event(cid, vid, "BROWSE", pub, row.get("title") or "", res["t_recv_ns"],
                                 extra={"browse_source": source, "age_s": lo, "browse_ms": round(res["ms"], 1)})
+            t_q = time.perf_counter_ns()
             self.stats[f"event_{r}"] += 1
+            self._timeline(cid, vid, source, res, t_cand, t_ver, t_q, method, r)
         elif verdict == "OLD":
             self.log(f"↩️ BROWSE {vid} [{source}] kênh {cid}: video CŨ ({method}: {scrub(why)}) — không tải, không đăng")
+        elif verdict == "UNVERIFIED_FINAL":
+            self.log(f"❔ BROWSE_UNVERIFIED_FINAL {vid} [{source}] kênh {cid}: sau {self.cfg.get('browse_unverified_window_sec', 900)} s "
+                     f"vẫn KHÔNG xác minh được độ mới ({method}: {scrub(why)}) — không tải, không đăng")
         else:
-            self.log(f"❔ BROWSE_UNVERIFIED {vid} [{source}] kênh {cid}: KHÔNG xác minh được độ mới ({method}: {scrub(why)}) — "
-                     f"không tải, không đăng (an toàn)")
+            self.log(f"❔ BROWSE_UNVERIFIED {vid} [{source}] kênh {cid}: chưa xác minh được độ mới ({method}: {scrub(why)}) — "
+                     f"chưa tải; sẽ XÉT LẠI ở các lượt sau (chữ tuổi mỗi lượt, player sau {self.PLAYER_RETRY[0]} s…)")
+
+    def _timeline(self, cid, vid, source, res, t_cand, t_ver, t_q, method, result):
+        fj = self.first_json.get(vid)
+        fp = self.first_parsed.get(vid)
+        base_ns = fj["t_ns"] if fj else res["t_recv_ns"]
+        ms_ = lambda a, b: None if a is None or b is None else round((b - a) / 1e6, 1)
+        tl = {"video_id": vid, "channel_id": cid, "source": source, "verify": method, "result": result,
+              "HTTP_RECEIVED_MS": round(res["ms"], 1),
+              "FIRST_JSON_VISIBLE": ({"wall": round(fj["wall"], 3), "surface": fj["surface"], "poll": fj["poll"], "seq": fj["seq"],
+                                      "http_ms": fj["http_ms"]} if fj else None),
+              "FIRST_JSON_TO_THIS_POLL_MS": ms_(base_ns, res["t_recv_ns"]),
+              "FIRST_PARSED_MS": ms_(base_ns, fp["t_ns"]) if fp else None, "FIRST_PARSED_HOW": fp.get("how") if fp else None,
+              "FIRST_CANDIDATE_MS": ms_(base_ns, t_cand), "AGE_VERIFY_MS": ms_(t_cand, t_ver), "DETECTED_TO_QUEUE_MS": ms_(t_ver, t_q),
+              # số lượt quét CÙNG kênh + CÙNG bề mặt đã trôi qua kể từ lượt đầu có ID trong JSON (0 = bắt ngay lượt đầu)
+              "polls_between": (self._s(fj["skey"], fj["cid"]).polls - fj["poll"]) if fj else None, "wall_detect": round(time.time(), 3)}
+        f_ = lambda v: "-" if v is None else v
+        fjw = datetime.fromtimestamp(fj["wall"]).strftime("%H:%M:%S.%f")[:-3] if fj else "?"
+        self.log(f"⏱️ BROWSE_TIMELINE {vid} | HTTP_RECEIVED_MS {tl['HTTP_RECEIVED_MS']} | FIRST_JSON_VISIBLE {fjw} "
+                 f"[{fj['surface'] if fj else '?'} lượt #{fj['poll'] if fj else '?'}] | FIRST_PARSED +{f_(tl['FIRST_PARSED_MS'])} ms "
+                 f"({f_(tl['FIRST_PARSED_HOW'])}) | FIRST_CANDIDATE +{f_(tl['FIRST_CANDIDATE_MS'])} ms | AGE_VERIFY_MS {f_(tl['AGE_VERIFY_MS'])} | "
+                 f"DETECTED_TO_QUEUE_MS {f_(tl['DETECTED_TO_QUEUE_MS'])} | số lượt từ lúc có trong JSON: {f_(tl['polls_between'])}")
+        try:
+            self.e.db.x("INSERT OR REPLACE INTO browse_timeline(video_id, channel_id, data) VALUES(?,?,?)", (vid, cid, json.dumps(tl)))
+        except Exception:
+            pass
+        if self.cfg.get("browse_age_audit", True):
+            threading.Thread(target=self._age_audit, args=(vid, tl), daemon=True, name="BROWSE-AUDIT").start()
+
+    def _age_audit(self, vid, tl):
+        """Chạy NỀN sau khi đã vào hàng đợi tải (không làm chậm gì): giờ đăng CHÍNH XÁC + đồng hồ Google → tuổi thật lúc ID xuất hiện
+        trong JSON và lúc phát hiện. API + BROWSE: Data API (1 đơn vị). BROWSE ONLY: InnerTube player (không Data API)."""
+        with self.audit_sem:
+            pub, how = None, ""
+            if self.verify_with_api and getattr(self.e, "api", None) is not None and hasattr(self.e.api, "video_published"):
+                pub, how = self.e.api.video_published(vid)
+                how = "Data API: " + how
+            if pub is None:
+                p, precise, why = self.player_publish(vid)
+                pub, how = (p, "player: " + why) if precise else (None, how + ("; " if how else "") + "player: " + why)
+        if pub is None:
+            self.log(f"🕒 BROWSE_AGE_AUDIT {vid}: không có giờ đăng chính xác ({scrub(how)[:120]}) — chỉ có dòng thời gian quét")
+            return
+        fj = tl.get("FIRST_JSON_VISIBLE") or {}
+        res = {"published": pub.isoformat(), "published_src": how[:120]}
+        for key, wall in (("age_at_first_json_s", fj.get("wall")), ("age_at_detect_s", tl.get("wall_detect"))):
+            if wall:
+                srv, half = self.clock.server_time(wall)
+                if srv is not None:
+                    res[key] = round(srv - pub.timestamp(), 2)
+                    res["clock_half_s"] = round(half, 2)
+        tl["audit"] = res
+        try:
+            self.e.db.x("UPDATE browse_timeline SET data=? WHERE video_id=?", (json.dumps(tl), vid))
+        except Exception:
+            pass
+        self.log(f"🕒 BROWSE_AGE_AUDIT {vid} | published {pub.isoformat()} ({scrub(how)[:60]}) | tuổi lúc ID có trong JSON lần đầu ≈ "
+                 f"{res.get('age_at_first_json_s', '?')} s | lúc vào hàng đợi tải ≈ {res.get('age_at_detect_s', '?')} s "
+                 f"(đồng hồ Google từ header Date ±{res.get('clock_half_s', '?')} s; giờ đăng làm tròn tới giây)")
 
     # ---------------------------------------------------------------- 1 job
     def _job(self, surface, cid, token):
@@ -630,6 +909,13 @@ class BrowseScanner:
             self.resp_ms.append(res["ms"])
             self.stats["polls"] += 1
             stt = res["status"]
+            if (stt != 200 or res["err"]) and self.trace is not None:
+                with self.track_lock:
+                    self.seq += 1
+                    seq = self.seq
+                self.trace.write({"seq": seq, "wall_send": round(res.get("wall_send", 0), 3), "wall_recv": round(res.get("wall_recv", 0), 3),
+                                  "mono_send_ns": res.get("t_send_ns"), "mono_recv_ns": res["t_recv_ns"], "ch": cid,
+                                  "surf": SURFACES[surface], "st": stt, "ms": round(res["ms"], 1), "err": res["err"]})
             if stt == 200 and not res["err"]:
                 st.fails = 0
                 self.guard.success(self._target(surface))
@@ -648,6 +934,8 @@ class BrowseScanner:
                         self.log(f"🧊 BROWSE {cid} [{SURFACES[surface]}] HTTP {stt} chỉ ở kênh này → nghỉ riêng {sec:.0f}s")
             else:
                 self.stats["net_err" if stt < 0 else f"http_{stt}"] += 1
+                if stt in (400, 401):                          # như V39: key/clientVersion có thể đã cũ → đọc lại ngay (nền, ≤ 1 lần/30 s)
+                    self._refresh_soon()
                 st.fails += 1
                 if st.fails >= CH_FAIL_THRESHOLD:
                     st.cool_n += 1
@@ -777,6 +1065,7 @@ class BrowseScanner:
             self.beat[s] = time.monotonic()
             self._spawn(lambda s=s: self._scheduler(s), f"BROWSE-{s.upper()}")
         self._spawn(self._watchdog, "BROWSE-WATCHDOG")
+        self._spawn(self._cfg_loop, "BROWSE-CFG")                # như V39: khoá + phiên bản client mới nhất, 10 phút/lần
         self.status = "CHẠY"
         n = len(self._channels())
         self.log(f"🌐 BROWSE: {n} kênh | Uploads mục tiêu {self.periods['uploads']:g} s/kênh (RPS ≤ {self.max_rps['uploads']:g} → thực tế "
@@ -794,6 +1083,8 @@ class BrowseScanner:
             ex.shutdown(wait=True, cancel_futures=True)
         if self.stats["polls"]:
             self._stats_tick()
+        if self.trace is not None:
+            self.trace.close()
         self.status = "TẮT"
 
     def snapshot(self):
@@ -802,7 +1093,8 @@ class BrowseScanner:
         return {"status": self.status + (" (nghỉ chung)" if cool > time.monotonic() else ""), "polls": s["polls"],
                 "p50": self.pct(50), "p90": self.pct(90), "p95": self.pct(95), "rps": round(rps, 1),
                 "e403": s["http_403"], "e429": s["http_429"], "net": s["net_err"], "parse": s["parse_err"],
-                "fresh": s["verdict_FRESH"], "old": s["verdict_OLD"], "unverified": s["verdict_UNVERIFIED"]}
+                "fresh": s["verdict_FRESH"], "old": s["verdict_OLD"], "unverified": s["verdict_UNVERIFIED"],
+                "fast_miss": s["fast_miss"], "pending": len(self.pending)}
 
 
 def _yt_web_client_version():

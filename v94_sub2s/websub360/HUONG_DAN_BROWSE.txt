@@ -36,7 +36,15 @@ AN TOÀN — KHÔNG ĐĂNG VIDEO CŨ
   - JSON của YouTube đổi cấu trúc → BROWSE_SHAPE_EMPTY / BROWSE_PARSE_ERROR (báo lỗi, KHÔNG coi là "không có video").
 
 LOG
-  🌐 BROWSE_DETECTED <ID> | source=BROWSE_UPLOADS | age=3.0s (≤4s, ROW_TEXT: '…') | BROWSE_RESPONSE_MS=145 | kênh …
+  🌐 BROWSE_DETECTED <ID> | source=BROWSE_UPLOADS | row_text='0 views • 3 seconds ago' (chữ của YouTube, KHÔNG phải tuổi đo được)
+        | xác minh ROW_TEXT | BROWSE_RESPONSE_MS=145 | kênh …
+  ⏱️ BROWSE_TIMELINE <ID> | HTTP_RECEIVED_MS | FIRST_JSON_VISIBLE <giờ> [bề mặt, lượt #] | FIRST_PARSED +ms | FIRST_CANDIDATE +ms
+        | AGE_VERIFY_MS | DETECTED_TO_QUEUE_MS | số lượt từ lúc có trong JSON (0 = bắt NGAY lượt đầu có ID)
+  🕒 BROWSE_AGE_AUDIT <ID> | published … | tuổi lúc ID có trong JSON lần đầu ≈ … s | lúc vào hàng đợi tải ≈ … s
+        (chạy NỀN sau khi đã vào hàng đợi tải; giờ đăng chính xác từ Data API (API + BROWSE) hoặc player; đồng hồ Google)
+  ❗ BROWSE_FAST_MISS — bộ đọc nhanh bỏ sót ID mới mà giải mã đầy đủ thấy → dùng kết quả đầy đủ NGAY lượt đó + tắt đọc nhanh
+  ❔ BROWSE_UNVERIFIED <ID> — chưa xác minh được: KHÔNG tải, nhưng XÉT LẠI mỗi lượt (chữ tuổi) + player sau 2/5/10/30/60 s,
+        tối đa 15 phút ("browse_unverified_window_sec") rồi mới BROWSE_UNVERIFIED_FINAL
   🔥 BROWSE_DETECTED <ID> | WINNER=BROWSE | source=BROWSE_UPLOADS | [BROWSE] VIDEO MỚI …
   📡 API_DETECTED <ID> | WINNER=BROWSE | duplicate_ignored=API | API chậm hơn 2350 ms
   🏁 DETECTION_TO_DOWNLOAD_DONE <ID> = … ms (WINNER=BROWSE)
@@ -51,5 +59,25 @@ KIỂM TRA & BÁO CÁO
                          DETECTION_TO_DOWNLOAD_DONE / DONE→ATTACH / POST_READY / POST_CONFIRMED theo nguồn thắng.
   So với WS360 cũ: chạy song song bản cũ (WebSub/API, thư mục production) và bản thử (API + BROWSE, thư mục mới) trên CÙNG
   danh sách kênh vài ngày, rồi so 2 báo cáo. Cần ≥ 10 video thật mới kết luận.
+
+ĐO "PHÁT HIỆN MUỘN" (mỗi lượt Browse đều được ghi lại)
+  logs\browse_trace.jsonl — 1 dòng / lượt: seq, giờ monotonic gửi/nhận (ns), giờ thật, header Date của Google, HTTP status, ms,
+  kích thước, cách đọc (raw/json), 12 ID đầu đã đọc ("top"), ID MỚI xuất hiện trong JSON lượt này ("new_in_json").
+  → Tìm lượt ĐẦU TIÊN có ID: mở file, tìm Video ID; dòng đầu tiên có ID trong "new_in_json" chính là lượt HTTP 200 đầu tiên
+    YouTube trả ID đó. Các dòng trước (cùng kênh) KHÔNG có ID = YouTube chưa đưa video vào danh sách (không phải lỗi tool).
+  Bảng browse_timeline (database.sqlite) lưu BROWSE_TIMELINE + BROWSE_AGE_AUDIT cho từng video.
+  Tắt: "browse_trace": false. File tự cắt ở 50 MB, giữ 3 file.
+
+SO SÁNH V39 GỐC ↔ WS360 + BROWSE TRÊN CÙNG VIDEO (CÙNG VPS, CÙNG KÊNH, CÙNG LÚC)
+  1) Chép V39 vào THƯ MỤC RIÊNG (vd C:\V39_SO_SANH) với check.xlsx RIÊNG (bản sao) — KHÔNG để tool upload/TikTok nào theo dõi
+     file Excel / trigger / outbox của thư mục này. Như vậy V39 ghi Excel riêng, KHÔNG đăng TikTok.
+     ⚠️ KHÔNG chép websub_callback.txt / websub_secret.txt vào thư mục V39 so sánh (và không đặt biến YT_WEBSUB_CALLBACK):
+     nếu có, V39 sẽ đăng ký LẠI cùng URL ngrok với secret KHÁC → WebSub của bản production bị lỗi chữ ký HMAC.
+     V39 luôn mở cổng 8765 (trùng WS360 production) — nếu báo bận cổng thì phần WebSub của V39 không chạy; phần Browse
+     vẫn chạy bình thường (chỉ cần Browse để so sánh).
+  2) WS360 + BROWSE ở C:\WS360_BROWSE_TEST, tick "Chạy thử (KHÔNG bấm Post)" (hoặc tắt TikTok). Cùng danh sách kênh với V39.
+  3) Chạy cả hai cùng lúc vài giờ/ngày. Khi có video mới: SO_SANH_V39_BROWSE.bat → nhập C:\V39_SO_SANH → BROWSE_COMPARE.md
+     (Δ = giờ V39 DISCOVERED − giờ WS360; >0 WS360 sớm hơn). Cần ≥ 10 video cả hai cùng thấy mới kết luận.
+  Hai tool cùng gửi Browse từ 1 IP → tổng RPS gấp đôi; nếu thấy 429 thì giảm "browse_max_rps" của WS360 trong lúc so sánh.
 
 QUAY LẠI BẢN CŨ: dùng thư mục production như trước (không bị đụng). Mã nguồn trước khi thêm Browse: backup\*_truoc_browse.py.

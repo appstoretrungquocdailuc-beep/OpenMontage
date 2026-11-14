@@ -20,3 +20,6 @@ database_DLBENCH.sqlite*
 DOWNLOADS_DLBENCH/
 database_PROBE.sqlite*
 BROWSE_REPORT.md
+BROWSE_COMPARE.md
+logs/*.jsonl*
+!DOWNLOAD_ONLY_BENCHMARK.bat

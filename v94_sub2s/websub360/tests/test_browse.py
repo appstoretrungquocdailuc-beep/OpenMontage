@@ -36,6 +36,7 @@ class FakeInnerTube:
         self.global_status = None
         self.raw = {}                # channel → bytes trả nguyên (giả JSON đổi cấu trúc)
         self.delay = 0.0
+        self.uploads_lockup = False          # True: Uploads trả hình dạng 2026 (itemSectionRenderer → lockupViewModel) như YouTube thật
         self.reqs, self.player_reqs = [], []
         self.inflight, self.max_inflight = {}, {}
         self.lock = threading.Lock()
@@ -80,6 +81,9 @@ class FakeInnerTube:
                     if ch in api.raw:
                         return self._send(200, api.raw[ch])
                     items = api.uploads.get(ch, [])
+                    if surf == "uploads" and api.uploads_lockup:
+                        data = _lockup_json(items)
+                        return self._send(200, json.dumps(data, separators=(",", ":")).encode())
                     if surf == "uploads":
                         lst = [{"playlistVideoRenderer": {"videoId": v, "title": {"runs": [{"text": t}]},
                                                           "videoInfo": {"runs": [{"text": "0 views"}, {"text": " • "}, {"text": a}]} if a else {}}}
@@ -202,9 +206,11 @@ def test_browse_only_detects_new_video_without_data_api_or_websub(tmp_path, it, 
     assert T.wait_excel(e, "BRWSNEW0001")["state"] == "DONE"
     assert load_workbook(tmp_path / "check.xlsx").active["D3"].value == ws.video_url("BRWSNEW0001")
     log = L(e)
-    assert "BROWSE_DETECTED BRWSNEW0001 | source=BROWSE_UPLOADS | age=3.0s" in log and "BROWSE_RESPONSE_MS=" in log
+    assert "BROWSE_DETECTED BRWSNEW0001 | source=BROWSE_UPLOADS | row_text='0 views • 3 seconds ago'" in log and "BROWSE_RESPONSE_MS=" in log
     assert "DETECTION_TO_DOWNLOAD_DONE BRWSNEW0001" in log and "AIzaSy" not in log
-    assert all("googleapis.com" not in p for _, _, _, p in it.reqs) and not it.player_reqs   # chữ tuổi đủ → 0 request xác minh
+    assert all("googleapis.com" not in p for _, _, _, p in it.reqs) and "xác minh ROW_TEXT" in log   # chữ tuổi đủ → 0 request xác minh
+    # request player duy nhất (nếu có) là KIỂM TRA TUỔI CHẠY NỀN SAU khi đã vào hàng đợi tải — không nằm trên đường phát hiện
+    assert it.player_reqs in ([], ["BRWSNEW0001"]) and log.index("BROWSE_DETECTED BRWSNEW0001") < log.index("DETECTION_TO_DOWNLOAD_DONE BRWSNEW0001")
     assert e.db.one("SELECT verdict, method FROM browse_verify WHERE video_id='BRWSNEW0001'")["method"] == "ROW_TEXT"
     time.sleep(0.6)
     assert len(gvs.requests_for("/vp/BRWSNEW0001")) == 1                       # 2 bề mặt cùng thấy → tải 1 lần
@@ -394,3 +400,119 @@ def test_fast_reader_mismatch_disables_itself(tmp_path, it, monkeypatch):
     assert wait(lambda: "bộ đọc nhanh lệch" in L(e))
     assert e.browse.fast_raw is False and not e.db.one("SELECT 1 FROM browse_verify WHERE video_id='WRONGWRONG1'")
     e.stop()
+
+
+
+# ------------------------------------------------------------------ dòng thời gian từng lượt (điều tra 'phát hiện muộn')
+def _trace(tmp):
+    p = tmp / "logs" / "browse_trace.jsonl"
+    return [json.loads(x) for x in p.read_text(encoding="utf-8").splitlines()] if p.exists() else []
+
+
+def test_detected_on_the_first_poll_whose_json_contains_the_id_with_full_timeline(tmp_path, it):
+    it.uploads_lockup = True                                                  # hình dạng THẬT 2026 → đi qua bộ đọc nhanh
+    seed_old(it, CH[0])
+    e = eng(tmp_path, CH[:1], it, download_enabled=False, excel_enabled=False, browse_videos_tab=False)
+    e.start()
+    assert wait(lambda: e.browse._s("uploads", CH[0]).polls >= 3)
+    it.add(CH[0], "TIMELINE001", "1 second ago")
+    assert wait(lambda: e.db.one("SELECT 1 FROM browse_timeline WHERE video_id='TIMELINE001'"))
+    tl = json.loads(e.db.one("SELECT data FROM browse_timeline WHERE video_id='TIMELINE001'")["data"])
+    assert tl["FIRST_JSON_TO_THIS_POLL_MS"] == 0.0 and tl["polls_between"] == 0          # phát hiện NGAY lượt đầu có ID
+    assert tl["FIRST_PARSED_MS"] == 0.0 and tl["FIRST_PARSED_HOW"] == "raw"
+    for k in ("HTTP_RECEIVED_MS", "FIRST_CANDIDATE_MS", "AGE_VERIFY_MS", "DETECTED_TO_QUEUE_MS"):
+        assert tl[k] is not None and tl[k] < 1000, k
+    tr = _trace(tmp_path)
+    first = [r for r in tr if "TIMELINE001" in (r.get("new_in_json") or [])]
+    assert len(first) == 1 and first[0]["seq"] == tl["FIRST_JSON_VISIBLE"]["seq"] and first[0]["st"] == 200
+    assert all(k in first[0] for k in ("mono_send_ns", "mono_recv_ns", "wall_recv", "top", "date", "ms"))
+    before = [r for r in tr if r["seq"] < first[0]["seq"] and r.get("st") == 200]
+    assert before and all("TIMELINE001" not in r["top"] for r in before)              # các lượt trước KHÔNG có ID này
+    assert "⏱️ BROWSE_TIMELINE TIMELINE001" in L(e) and "age=" not in L(e).split("BROWSE_DETECTED TIMELINE001")[1].split("\n")[0]
+    e.stop()
+
+
+def test_fast_reader_miss_is_caught_on_the_same_poll_and_disabled(tmp_path, it, monkeypatch):
+    it.uploads_lockup = True
+    seed_old(it, CH[0])
+    real = B.fast_rows_from_raw
+
+    def lossy(raw, limit=12):                                                 # giả lỗi: bộ đọc nhanh làm rơi video mới
+        rows = real(raw, limit)
+        return [r for r in (rows or []) if r["video_id"] != "MISSEDBYRAW"] or None
+    monkeypatch.setattr(B, "fast_rows_from_raw", lossy)
+    e = eng(tmp_path, CH[:1], it, download_enabled=False, excel_enabled=False, browse_videos_tab=False)
+    e.start()
+    assert wait(lambda: e.browse._s("uploads", CH[0]).polls >= 3)
+    it.add(CH[0], "MISSEDBYRAW", "2 seconds ago")
+    assert wait(lambda: e.db.one("SELECT 1 FROM videos WHERE video_id='MISSEDBYRAW'"))
+    tl = json.loads(e.db.one("SELECT data FROM browse_timeline WHERE video_id='MISSEDBYRAW'")["data"])
+    assert tl["polls_between"] == 0 and tl["FIRST_PARSED_HOW"] == "json(fast-miss)"        # vẫn bắt NGAY lượt đầu
+    assert e.browse.fast_raw is False and "BROWSE_FAST_MISS" in L(e)
+    e.stop()
+
+
+def test_candidate_without_age_text_is_rechecked_not_lost(tmp_path, it):
+    seed_old(it, CH[0])
+    e = eng(tmp_path, CH[:1], it, download_enabled=False, excel_enabled=False, browse_videos_tab=False)
+    e.start()
+    assert wait(lambda: e.browse._s("uploads", CH[0]).first_ok)
+    it.add(CH[0], "LATETEXT001", "")                                          # lượt đầu: chưa có chữ tuổi, player không có ngày
+    assert wait(lambda: "BROWSE_UNVERIFIED LATETEXT001" in L(e))
+    assert not e.db.one("SELECT 1 FROM videos WHERE video_id='LATETEXT001'")
+    with it.lock:                                                             # vài lượt sau YouTube hiện chữ tuổi
+        it.uploads[CH[0]][0] = ("LATETEXT001", "4 seconds ago", "t")
+    assert wait(lambda: e.db.one("SELECT 1 FROM videos WHERE video_id='LATETEXT001'"))
+    tl = json.loads(e.db.one("SELECT data FROM browse_timeline WHERE video_id='LATETEXT001'")["data"])
+    assert tl["polls_between"] >= 1 and "sau khi xét lại" in L(e)            # thấy được trong log: bị trì hoãn vì xác minh
+    e.stop()
+
+
+def test_age_audit_uses_precise_publish_time_and_google_date_clock(tmp_path, it):
+    seed_old(it, CH[0])
+    e = eng(tmp_path, CH[:1], it, download_enabled=False, excel_enabled=False, browse_videos_tab=False)
+    e.start()
+    assert wait(lambda: e.browse._s("uploads", CH[0]).first_ok)
+    it.publish["AUDITVID001"] = (now() - timedelta(seconds=3)).replace(microsecond=0).isoformat()
+    it.add(CH[0], "AUDITVID001", "3 seconds ago")
+    assert wait(lambda: "BROWSE_AGE_AUDIT AUDITVID001 | published" in L(e))
+    tl = json.loads(e.db.one("SELECT data FROM browse_timeline WHERE video_id='AUDITVID001'")["data"])
+    a = tl["audit"]
+    assert 0 <= a["age_at_first_json_s"] <= 6 and a["age_at_detect_s"] >= a["age_at_first_json_s"] - 0.01 and a["clock_half_s"] <= 1.0
+    e.stop()
+
+
+def test_compare_with_v39_ledger_on_same_video(tmp_path, it):
+    seed_old(it, CH[0])
+    e = eng(tmp_path, CH[:1], it, download_enabled=False, excel_enabled=False, browse_videos_tab=False)
+    e.start()
+    assert wait(lambda: e.browse._s("uploads", CH[0]).first_ok)
+    it.add(CH[0], "COMPARE0001", "2 seconds ago")
+    assert wait(lambda: e.db.one("SELECT 1 FROM browse_timeline WHERE video_id='COMPARE0001'"))
+    e.stop()
+    tl = json.loads(e.db.one("SELECT data FROM browse_timeline WHERE video_id='COMPARE0001'")["data"])
+    v39 = tmp_path / "V39"
+    v39.mkdir()
+    t39 = datetime.fromtimestamp(tl["FIRST_JSON_VISIBLE"]["wall"] + 0.35, timezone.utc)   # V39 thấy muộn hơn 350 ms
+    (v39 / "scanner_ledger.jsonl").write_text("\n".join(json.dumps(x) for x in [
+        {"ts": t39.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z", "ev": "DISCOVERED", "vid": "COMPARE0001", "ch": CH[0], "src": "BROWSE_UPLOADS"},
+        {"ts": (t39 - timedelta(seconds=60)).strftime("%Y-%m-%dT%H:%M:%S.000Z"), "ev": "DISCOVERED", "vid": "ONLYINV3901", "ch": CH[0], "src": "BROWSE_UPLOADS"}]) + "\n")
+    out = ws.browse_compare(tmp_path, v39)
+    row = [r for r in out["rows"] if r["video_id"] == "COMPARE0001"][0]
+    assert 300 <= row["v39_minus_ws360_first_json_ms"] <= 400
+    md = (tmp_path / "BROWSE_COMPARE.md").read_text(encoding="utf-8")
+    assert "COMPARE0001" in md and "ONLYINV3901" in md and out["only_v39"] == ["ONLYINV3901"] and "CHƯA ĐỦ DỮ LIỆU" in md
+
+
+def test_http_400_refreshes_key_and_client_version_like_v39(tmp_path, it, monkeypatch):
+    seed_old(it, CH[0])
+    e = eng(tmp_path, CH[:1], it, download_enabled=False, excel_enabled=False, browse_videos_tab=False)
+    calls = []
+    monkeypatch.setattr(B.BrowseScanner, "refresh_config", lambda self: calls.append(threading.current_thread().name))
+    it.global_status = 400
+    e.start()
+    assert wait(lambda: it.count(CH[0]) >= 3)            # 3 lỗi liên tiếp → kênh nghỉ 5 s (như V39)
+    assert wait(lambda: "BROWSE-CFG-NOW" in calls, 3)      # đọc lại NGAY do 400 (không chờ chu kỳ 10 phút)
+    time.sleep(0.3)
+    e.stop()
+    assert calls.count("BROWSE-CFG-NOW") == 1             # nhiều lỗi 400 liên tiếp vẫn chỉ đọc lại 1 lần / 30 s                       # gọi lại ngay khi 400 (khởi động 1 + 400 1), giới hạn ≤ 1 lần/30 s

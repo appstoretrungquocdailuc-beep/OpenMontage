@@ -148,6 +148,10 @@ DEFAULT_CONFIG = {
     "browse_client_version": "",       # trống = phiên bản client WEB của yt-dlp đã cài (chỉ đọc hằng số)
     "browse_api_key": "",              # trống = khoá WEB CÔNG KHAI của InnerTube (như V39)
     "browse_fast_parse": True,         # đọc nhanh 12 video đầu từ JSON thô (≈1 ms thay vì 13–18 ms), đối chiếu định kỳ
+    "browse_trace": True,              # logs/browse_trace.jsonl: mỗi lượt Browse 1 dòng (giờ monotonic, ID trả về, ID mới trong JSON)
+    "browse_trace_max_mb": 50,         # tự cắt file trace khi lớn hơn (giữ 3 file)
+    "browse_age_audit": True,          # sau khi đã vào hàng đợi tải: lấy giờ đăng chính xác (nền) để đo tuổi thật lúc phát hiện
+    "browse_unverified_window_sec": 900,   # video chưa xác minh được độ mới: tiếp tục xét lại trong N giây rồi mới bỏ
     "browse_fast_verify_every": 50,    # cứ N lượt giải mã đầy đủ 1 lần để đối chiếu; lệch → tự tắt đọc nhanh                   # file .wav phát khi có video mới (Windows); trống = tắt
     # ---- LỚP MẠNG TẢI 360P ----
     "net_mode": "fast",                # fast: đo DNS/TCP/TLS/chờ máy chủ + DNS cache | legacy: đúng bản trước (rollback)
@@ -4105,6 +4109,108 @@ def browse_report(base: Path, db_name="database.sqlite", hours=168.0) -> dict:
     print("\n".join(md))
     return res
 
+def _v39_ts(x):
+    try:
+        return datetime.fromisoformat(str(x).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def browse_compare(base: Path, v39_dir, db_name="database.sqlite", hours=168.0) -> dict:
+    """So sánh V39 gốc ↔ WS360 + BROWSE trên CÙNG video (chạy song song trên CÙNG máy → cùng đồng hồ máy).
+    V39: scanner_ledger.jsonl (DISCOVERED = lúc V39 đưa video vào hàng xác minh, giờ UTC của máy; srv_first = đồng hồ Google; pub = Data API).
+    WS360: bảng browse_timeline (lượt ĐẦU TIÊN có ID trong JSON HTTP 200 + lúc phát hiện) + detections. CHỈ ĐỌC, không ghi gì vào 2 tool."""
+    v39_dir = Path(v39_dir)
+    since = time.time() - hours * 3600
+    v39 = {}
+    files = sorted(v39_dir.glob("scanner_ledger.jsonl*")) if v39_dir.is_dir() else ([v39_dir] if v39_dir.is_file() else [])
+    for f in files:
+        try:
+            lines = f.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for ln in lines:
+            try:
+                r = json.loads(ln)
+            except ValueError:
+                continue
+            vid, ev = r.get("vid"), r.get("ev")
+            if not vid or ev not in ("DISCOVERED", "SOURCE_SEEN_LATER", "EXCEL_COMMITTED", "REASSERT", "LATE", "OLD_KNOWN", "REJECTED",
+                                     "UNVERIFIED_FINAL"):
+                continue
+            t = _v39_ts(r.get("ts"))
+            d = v39.setdefault(vid, {})
+            if ev == "DISCOVERED" and "t" not in d:
+                d.update(t=t, src=r.get("src"), ch=r.get("ch"), pub=r.get("pub"), srv_first=r.get("srv_first"), req_ms=r.get("req_ms"))
+            elif ev == "SOURCE_SEEN_LATER":
+                d.setdefault("later", []).append(f"{r.get('src')} +{r.get('lag_ms')} ms")
+            elif "final" not in d:
+                d["final"] = ev
+    db = DB(base / db_name)
+    db.x("CREATE TABLE IF NOT EXISTS browse_timeline(video_id TEXT PRIMARY KEY, channel_id TEXT, data TEXT)")
+    ws_tl = {}
+    for r in db.all("SELECT video_id, data FROM browse_timeline"):
+        try:
+            ws_tl[r["video_id"]] = json.loads(r["data"])
+        except ValueError:
+            pass
+    det = {}
+    for r in db.all("SELECT video_id, source, t_wall, winner FROM detections WHERE baseline=0 AND t_wall>=?", (since,)):
+        det.setdefault(r["video_id"], {})[r["source"]] = dict(r)
+    v39 = {k: v for k, v in v39.items() if v.get("t") and v["t"] >= since}
+    vids = sorted(set(v39) | set(ws_tl) | set(det), key=lambda v: (v39.get(v, {}).get("t") or (ws_tl.get(v) or {}).get("wall_detect") or 0))
+    f3 = lambda t: datetime.fromtimestamp(t).strftime("%H:%M:%S.%f")[:-3] if t else "-"
+    rows = []
+    for vid in vids:
+        a, tl, dd = v39.get(vid, {}), ws_tl.get(vid) or {}, det.get(vid, {})
+        fj = (tl.get("FIRST_JSON_VISIBLE") or {}).get("wall")
+        wdet = tl.get("wall_detect") or (dd.get("BROWSE") or {}).get("t_wall")
+        wfirst = min([x["t_wall"] for x in dd.values() if x.get("t_wall")] or [0]) or None   # nguồn nhanh nhất của WS360
+        t39 = a.get("t")
+        r = {"video_id": vid, "v39_discovered": t39, "v39_src": a.get("src"), "v39_final": a.get("final"), "v39_pub": a.get("pub"),
+             "ws360_first_json": fj, "ws360_browse_detect": wdet, "ws360_first_any": wfirst,
+             "ws360_winner": next((k for k, x in dd.items() if x.get("winner")), None), "ws360_polls_between": tl.get("polls_between"),
+             "ws360_verify": tl.get("verify"), "ws360_age_first_json_s": (tl.get("audit") or {}).get("age_at_first_json_s"),
+             "v39_minus_ws360_first_json_ms": round((t39 - fj) * 1000, 1) if t39 and fj else None,
+             "v39_minus_ws360_detect_ms": round((t39 - wdet) * 1000, 1) if t39 and wdet else None}
+        try:
+            if a.get("pub") and a.get("srv_first"):
+                r["v39_age_s"] = round(float(a["srv_first"]) - datetime.fromisoformat(str(a["pub"]).replace("Z", "+00:00")).timestamp(), 2)
+        except (TypeError, ValueError):
+            pass
+        rows.append(r)
+    both = [r for r in rows if r["v39_minus_ws360_detect_ms"] is not None]
+    d_det = [r["v39_minus_ws360_detect_ms"] for r in both]
+    d_fj = [r["v39_minus_ws360_first_json_ms"] for r in both if r["v39_minus_ws360_first_json_ms"] is not None]
+    only39 = [r["video_id"] for r in rows if r["v39_discovered"] and not (r["ws360_browse_detect"] or r["ws360_first_any"])]
+    only_ws = [r["video_id"] for r in rows if not r["v39_discovered"] and (r["ws360_browse_detect"] or r["ws360_first_any"])]
+    f_ = lambda v: "-" if v is None else f"{v:+.0f}"
+    md = [f"# BROWSE COMPARE — V39 gốc ↔ WS360 + BROWSE — {iso()}", "",
+          f"V39: `{v39_dir}` ({len(files)} file ledger) | WS360: `{base / db_name}` | cửa sổ {hours:.0f} giờ.",
+          "Δ = giờ V39 DISCOVERED − giờ WS360. **Δ > 0: WS360 sớm hơn; Δ < 0: V39 sớm hơn.** Chỉ có ý nghĩa khi 2 tool chạy CÙNG máy, "
+          "cùng lúc, cùng kênh (cùng đồng hồ máy).", ""]
+    md += [f"Video cả hai cùng thấy: **{len(both)}** | chỉ V39 thấy: **{len(only39)}** | chỉ WS360 thấy: **{len(only_ws)}**", ""]
+    if both:
+        md += [f"Δ (V39 − WS360 phát hiện Browse) ms: P50 {f_(pct(d_det, 50))} | P90 {f_(pct(d_det, 90))} | nhỏ nhất {f_(min(d_det))} | "
+               f"lớn nhất {f_(max(d_det))} | WS360 sớm hơn {sum(1 for x in d_det if x > 0)}/{len(d_det)} lần",
+               f"Δ (V39 − WS360 lượt đầu ID có trong JSON) ms: P50 {f_(pct(d_fj, 50))} | P90 {f_(pct(d_fj, 90))}" if d_fj else "", ""]
+    md += ["Kết luận: " + ("CHƯA ĐỦ DỮ LIỆU (cần ≥ 10 video cả hai cùng thấy) — KHÔNG kết luận bên nào nhanh hơn." if len(both) < 10 else
+                         ("WS360 nhanh hơn" if pct(d_det, 50) > 0 else "V39 nhanh hơn" if pct(d_det, 50) < 0 else "ngang nhau") +
+                         f" theo trung vị {abs(pct(d_det, 50)):.0f} ms trên {len(both)} video."), ""]
+    md += ["| Video | V39 DISCOVERED (nguồn) | V39 tuổi đo (s) | WS360 lượt đầu có ID | WS360 phát hiện Browse | lượt trễ | Δ JSON ms | Δ phát hiện ms | "
+           "WS360 thắng | WS360 tuổi lúc có trong JSON (s) | V39 kết thúc |", "|---|---|---|---|---|---|---|---|---|---|---|"]
+    for r in rows:
+        md.append(f"| {r['video_id']} | {f3(r['v39_discovered'])} ({r['v39_src'] or '-'}) | {r.get('v39_age_s', '-')} | {f3(r['ws360_first_json'])} | "
+                  f"{f3(r['ws360_browse_detect'])} | {f_(r['ws360_polls_between']) if r['ws360_polls_between'] is not None else '-'} | "
+                  f"{f_(r['v39_minus_ws360_first_json_ms'])} | {f_(r['v39_minus_ws360_detect_ms'])} | {r['ws360_winner'] or '-'} | "
+                  f"{r['ws360_age_first_json_s'] if r['ws360_age_first_json_s'] is not None else '-'} | {r['v39_final'] or '-'} |")
+    md += ["", "Ghi chú: 'lượt trễ' = số lượt quét cùng kênh/bề mặt giữa lượt đầu ID có trong JSON và lượt WS360 phát hiện (0 = bắt ngay). "
+           "Tuổi V39 = đồng hồ Google lúc nhận − publishedAt (Data API). Tuổi WS360 = kiểm tra nền sau khi đã vào hàng đợi "
+           "(giờ đăng làm tròn tới giây). Chữ 'N seconds ago' của YouTube KHÔNG dùng làm tuổi."]
+    (base / "BROWSE_COMPARE.md").write_text("\n".join(md) + "\n", encoding="utf-8")
+    print("\n".join(md))
+    return {"rows": rows, "both": len(both), "only_v39": only39, "only_ws360": only_ws, "delta_detect_p50": pct(d_det, 50) if d_det else None}
+
 
 def browse_probe(cfg, base, channels):
     """Chẩn đoán: 1 lượt Browse (Uploads + tab Videos) cho từng kênh → in mỗi dòng: Video ID, chữ tuổi, kết luận (KHÔNG tải, KHÔNG
@@ -4221,6 +4327,7 @@ def main(argv=None):
     ap.add_argument("--profile", default="", help="--bench-pipeline: Profile ID Genlogin dùng để đo")
     ap.add_argument("--browse-report", action="store_true", help="thống kê Browse/API/WebSub + tải/đăng theo nguồn thắng → BROWSE_REPORT.md")
     ap.add_argument("--browse-probe", nargs="*", help="gọi Browse 1 lần cho các Channel ID (hoặc cột K) và in dòng + chữ tuổi + kết luận")
+    ap.add_argument("--browse-compare", default="", help="thư mục V39 (chứa scanner_ledger.jsonl): so sánh cùng video V39 ↔ WS360 → BROWSE_COMPARE.md")
     ap.add_argument("--pipeline-report", action="store_true", help="median/P90/P95 từng giai đoạn từ các job đăng thật → PIPELINE_REPORT.md")
     ap.add_argument("--integrated", action="store_true", help="bật sẵn tự đăng TikTok (TAM) khi mở giao diện / headless")
     ap.add_argument("--dry-run-post", action="store_true", help="tích hợp: chạy tới khi nút Post sáng rồi DỪNG, không bấm")
@@ -4261,6 +4368,9 @@ def main(argv=None):
         return 0
     if a.browse_report:
         browse_report(base)
+        return 0
+    if a.browse_compare:
+        browse_compare(base, Path(a.browse_compare))
         return 0
     if a.browse_probe is not None:
         return browse_probe(cfg, base, a.browse_probe)
