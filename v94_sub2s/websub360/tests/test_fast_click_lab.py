@@ -70,7 +70,7 @@ class Spy:
         return [m for m in self.sent if m.startswith("Input.")]
 
 
-def run(lab, query="nodes=60", dry=False, pid="F", hooks=None, kill=None):
+def run(lab, query="nodes=60", dry=False, pid="F", hooks=None, kill=None, kill_after_attach=False):
     tam, drv = lab["tam"], lab["drv"]
     tam.CFG.wait_mode = "event"
     tam.TARGET_UPLOAD_URL = f"{lab['base']}/tiktokstudio/upload?{query}"
@@ -78,6 +78,8 @@ def run(lab, query="nodes=60", dry=False, pid="F", hooks=None, kill=None):
     fsm.reset_unknown("test")
     fsm.dirty = True
     logs = []
+    if kill_after_attach:                            # Hard Stop NGAY SAU khi gắn file (đang chờ nút Post)
+        kill = lambda: any("[Timing] T1" in x for x in logs)
     tr = tam.PerfTrace(label="t", profile=pid, mode="TEST")
     res = tam.upload_video_to_tiktok_ex(drv, [lab["file"]], logger_func=logs.append, pid=pid, mode="TEST", dry_run=dry, trace=tr,
                                         hooks=hooks, check_force_kill=kill)
@@ -123,13 +125,8 @@ def test_hook_refusal_and_hard_stop_never_click(lab, monkeypatch):
     spy = Spy(tam, monkeypatch)
     res, marks, posts, _, _ = run(lab, pid="FH", hooks=tam.JobHooks(before_click=lambda: False))
     assert res.status.value == "FAILED_SAFE" and not marks.get("postClick") and posts == 0
-    state = {"n": 0}
-
-    def kill():                                     # Hard Stop trong lúc chờ nút Post
-        state["n"] += 1
-        return state["n"] > 25
-    res, marks, posts, _, _ = run(lab, pid="FK", kill=kill)
-    assert res.status.value == "KILLED" and not marks.get("postClick") and posts == 0
+    res, marks, posts, _, logs = run(lab, pid="FK", kill_after_attach=True)
+    assert res.status.value == "KILLED" and "nút Post" in res.reason and not marks.get("postClick") and posts == 0
     assert spy.mouse() == []
 
 
@@ -192,7 +189,7 @@ def test_snapshot_is_only_requested_after_chrome_acked_the_release(lab, monkeypa
 
     def send(this, method, params=None):
         i = real_send(this, method, params)
-        seq.append(("send", method, (params or {}).get("type") or (params or {}).get("expression", "")[:40], i))
+        seq.append(("send", method, (params or {}).get("type") or (params or {}).get("expression", ""), i))
         return i
 
     def recv(this, ids, deadline, kill=None, tick=0.05, arrive=None):
@@ -204,7 +201,7 @@ def test_snapshot_is_only_requested_after_chrome_acked_the_release(lab, monkeypa
     res, marks, posts, fl, _ = run(lab, pid="FS")
     assert res.status.value == "CONFIRMED" and posts == 1
     rel = next(x for x in seq if x[0] == "send" and x[2] == "mouseReleased")
-    snap = next(k for k, x in enumerate(seq) if x[0] == "send" and "snapshot" in str(x[2]))
+    snap = next(k for k, x in enumerate(seq) if x[0] == "send" and "S.snapshot()" in str(x[2]))
     acked = next(k for k, x in enumerate(seq) if x[0] == "recv" and rel[3] in x[1])
     assert acked < snap                                              # đã nhận xác nhận THẢ chuột rồi mới hỏi trang
 
