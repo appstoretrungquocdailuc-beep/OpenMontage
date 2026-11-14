@@ -169,6 +169,15 @@ class TikTokBridge:
                 self.log(f"⚠️ TikTok: tam_wait_mode '{wm}' không dùng được với file TAM này — giữ '{self.tam.CFG.wait_mode}'")
         self.log(f"👁️ TikTok: cách theo dõi nút Post = {getattr(getattr(self.tam, 'CFG', None), 'wait_mode', '?')} "
                  f"(event=A watcher đầy đủ | lite=C chỉ theo dõi nút | sparse=B không cài gì khi upload)")
+        cp = str(self.cfg.get("tam_click_path") or "").strip().lower()
+        if cp and hasattr(self.tam, "CFG") and hasattr(self.tam.CFG, "click_path"):
+            if cp in ("ws", "driver"):
+                self.tam.CFG.click_path = cp
+            else:
+                self.log(f"⚠️ TikTok: tam_click_path '{cp}' không hợp lệ (ws | driver) — giữ '{self.tam.CFG.click_path}'")
+        if hasattr(getattr(self.tam, "CFG", None), "click_path"):
+            self.log(f"🖱️ TikTok: đường bấm Post = {self.tam.CFG.click_path} (ws = WebSocket CDP riêng, bấm ngay khi nút sáng | "
+                     f"driver = qua chromedriver như 5.3.0)")
         self.reload_mapping()
         self.accepting = True
         self.recover()

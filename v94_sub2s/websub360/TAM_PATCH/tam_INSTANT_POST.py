@@ -54,7 +54,7 @@ from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 BACKEND_NAME = "tam_INSTANT_POST"
-BACKEND_VERSION = "5.3.0"
+BACKEND_VERSION = "5.4.0-TEST-FASTCLICK"
 BACKEND_API_LEVEL = 5          # GUI bắt buộc khớp số này (chống GUI mới chạy backend cũ)
 
 
@@ -212,6 +212,9 @@ class _Cfg:
         self.ready_stable_ms = max(0, _env_int("TAM_READY_STABLE_MS", 0))     # nút Post phải sáng liên tục chừng này ms mới bấm (0 = như bản cũ)
         self.click_attempts = max(1, _env_int("TAM_CLICK_ATTEMPTS", 3))
         self.click_move = _env_flag("TAM_CLICK_MOVE", True)                  # gửi mouseMoved trước khi nhấn (như bản cũ)
+        # ĐƯỜNG BẤM POST: ws (mặc định bản TEST) = chờ nút Post bằng 1 promise CDP KHÔNG đứt quãng qua WebSocket CDP riêng tới ĐÚNG tab
+        # của driver, nút sáng là bấm ngay (nhấn/thả gửi liền, không qua chromedriver) | driver = như 5.3.0 (rollback)
+        self.click_path = _env_str("TAM_CLICK_PATH", "ws").lower()
         self.upload_url_path = _env_str("TAM_UPLOAD_URL_PATH", "")           # rỗng => lấy path của TARGET_UPLOAD_URL
         self.bring_to_front = _env_flag("TAM_BRING_TO_FRONT", False)         # CDP Page.bringToFront trước khi upload (A/B tab nền); mặc định TẮT
         self.perf_enable = _env_flag("TAM_PERF", True)
@@ -1309,7 +1312,7 @@ try { if (!window.__tamDoc) window.__tamDoc = Math.random().toString(36).slice(2
 
 const S = {
   v: 5, doc: window.__tamDoc || null,
-  btn: null, candAt: null, readyAt: null, readyInfo: null,
+  btn: null, candAt: null, readyAt: null, readyInfo: null, litAt: null, coverWatch: false,
   attachedAt: null, attachFlag: false,
   waiters: [], cwaiters: [],
   armed: false, frozen: false, watchText: false, clickAt: null,
@@ -1364,18 +1367,28 @@ function compute() {
   return {x: x, y: y};
 }
 function markUpDone() { if (S.upDoneAt === null) S.upDoneAt = performance.now(); }
-function readyPayload() {
+function readyPayload(via) {
   if (S.upDoneAt === null && cfg.upDoneSel) { try { if (document.querySelector(cfg.upDoneSel)) markUpDone(); } catch (e) {} }
-  return {ready: true, x: S.readyInfo.x, y: S.readyInfo.y, readyAt: S.readyAt, now: performance.now(), doc: S.doc,
+  return {ready: true, via: via || 'immediate', x: S.readyInfo.x, y: S.readyInfo.y, readyAt: S.readyAt, litAt: S.litAt,
+          now: performance.now(), doc: S.doc,
           vis: document.visibilityState, upDoneAt: S.upDoneAt, attachedAt: S.attachedAt, stats: S.stats, reErr: S.reErr};
 }
 function flush() {
   if (!S.waiters.length) return;
   const w = S.waiters.splice(0);
-  for (let i = 0; i < w.length; i++) { clearTimeout(w[i].timer); w[i].resolve(readyPayload()); }
+  for (let i = 0; i < w.length; i++) { clearTimeout(w[i].timer); w[i].resolve(readyPayload('flush')); }
 }
 let coverT = null;
 function coverStart() {
+  // Nút đã SÁNG nhưng bị che: kiểm tra lại theo THAY ĐỔI DOM (không bị Chrome bóp như setTimeout ở cửa sổ ẩn/thu nhỏ: ≥1 s/lần)
+  // + hẹn giờ 8 ms dự phòng. Lớp che biến mất (đổi style/class/xoá node) → evaluate ngay trong cùng microtask.
+  if (!S.coverWatch && !S.disposed) {
+    S.coverWatch = true;
+    try {
+      rootObs.observe(document.documentElement, {childList: true, subtree: true, characterData: true, attributes: true,
+                                                 attributeFilter: ['style', 'class', 'hidden', 'aria-hidden', 'open']});
+    } catch (e) {}
+  }
   if (coverT === null && !S.disposed) coverT = setTimeout(function () { coverT = null; S.stats.cover++; evaluate(); }, 8);
 }
 function coverStop() { if (coverT !== null) { clearTimeout(coverT); coverT = null; } }
@@ -1388,6 +1401,7 @@ function evaluate() {
   if (S.disposed || S.frozen) return;
   const attached = S.attachedAt !== null || S.attachFlag;
   const c = compute();
+  if (c) { if (S.litAt === null) S.litAt = performance.now(); } else { S.litAt = null; }   // SÁNG = bật + hiển thị (kể cả đang bị che)
   if (c && !c.covered) {
     if (S.candAt === null) S.candAt = performance.now();
     if (!attached) return;                                   // nút sáng sẵn từ trước khi gắn file: bỏ qua
@@ -1488,7 +1502,7 @@ function textScan(m) {
 const rootObs = new MutationObserver(function (m) {
   S.stats.root += m.length;
   if (S.disposed) return;
-  if (!S.frozen && (!S.btn || !S.btn.isConnected)) evaluate();
+  if (!S.frozen && (!S.btn || !S.btn.isConnected || (S.coverWatch && S.readyInfo === null))) { if (S.coverWatch) S.stats.coverMut = (S.stats.coverMut || 0) + 1; evaluate(); }
   if (S.upDoneAt === null && (cfg.upDoneSel || reUpDone)) {
     if (cfg.upDoneSel) { try { if (document.querySelector(cfg.upDoneSel)) markUpDone(); } catch (e) {} }
     if (reUpDone && S.upDoneAt === null) {
@@ -2244,12 +2258,281 @@ def _wait_post_ready_event(driver, kill: Callable[[], bool], timeout_s: float, s
             last = r
 
 
-def cdp_click(driver, x: float, y: float):
-    """Click chuột TIN CẬY qua CDP (giống bản gốc nhưng bỏ sleep 8 ms: các lệnh CDP được Chrome xử lý theo thứ tự)."""
-    if CFG.click_move:
-        driver.execute_cdp_cmd('Input.dispatchMouseEvent', {'type': 'mouseMoved', 'x': x, 'y': y, 'button': 'none'})
-    driver.execute_cdp_cmd('Input.dispatchMouseEvent', {'type': 'mousePressed', 'x': x, 'y': y, 'button': 'left', 'clickCount': 1})
-    driver.execute_cdp_cmd('Input.dispatchMouseEvent', {'type': 'mouseReleased', 'x': x, 'y': y, 'button': 'left', 'clickCount': 1})
+def cdp_click(driver, x: float, y: float, times: Optional[List[float]] = None):
+    """Click chuột TIN CẬY qua CDP (giống bản gốc nhưng bỏ sleep 8 ms: các lệnh CDP được Chrome xử lý theo thứ tự).
+    `times` (tuỳ chọn): ghi ms của từng lệnh qua chromedriver (chỉ đo, không đổi hành vi)."""
+    steps = ([{'type': 'mouseMoved', 'x': x, 'y': y, 'button': 'none'}] if CFG.click_move else []) + [
+        {'type': 'mousePressed', 'x': x, 'y': y, 'button': 'left', 'clickCount': 1},
+        {'type': 'mouseReleased', 'x': x, 'y': y, 'button': 'left', 'clickCount': 1}]
+    for p in steps:
+        t0 = time.perf_counter_ns()
+        driver.execute_cdp_cmd('Input.dispatchMouseEvent', p)
+        if times is not None:
+            times.append(round((time.perf_counter_ns() - t0) / 1e6, 1))
+
+
+class CdpWsError(Exception):
+    pass
+
+
+class CdpWs(object):
+    """Kết nối CDP RIÊNG (WebSocket) tới ĐÚNG tab mà driver đang điều khiển (targetId lấy qua chính driver).
+    Không qua chromedriver → không có bước HTTP + kiểm tra điều hướng của chromedriver trên đường bấm.
+    Chỉ gửi lệnh có id; KHÔNG bật domain sự kiện nào (Runtime/Page.enable) → không có luồng sự kiện thừa."""
+
+    def __init__(self, url: str, tid: str, timeout: float = 2.0):
+        import socket as _sock
+        import websocket  # websocket-client: đã có sẵn vì Selenium 4 phụ thuộc gói này
+        self._wsmod = websocket
+        self.ws = websocket.create_connection(url, timeout=timeout, suppress_origin=True,
+                                              http_no_proxy=["127.0.0.1", "localhost", "::1"])
+        try:
+            self.ws.sock.setsockopt(_sock.IPPROTO_TCP, _sock.TCP_NODELAY, 1)
+        except Exception:
+            pass
+        self.tid = tid
+        self.url = url
+        self.n = 0
+        self.alive = True
+        self.rtt_ms = None
+
+    def send(self, method: str, params: Optional[Dict[str, Any]] = None) -> int:
+        self.n += 1
+        try:
+            self.ws.send(json.dumps({"id": self.n, "method": method, "params": params or {}}))
+        except Exception as e:
+            self.alive = False
+            raise CdpWsError(f"gửi {method} lỗi: {e}")
+        return self.n
+
+    def recv_until(self, ids, deadline: float, kill: Optional[Callable[[], bool]] = None, tick: float = 0.05,
+                   arrive: Optional[Dict[int, int]] = None) -> Optional[Dict[int, Dict[str, Any]]]:
+        """Đọc tới khi có đủ phản hồi cho `ids`. Trả None nếu bị Hard Stop/hết giờ (phản hồi muộn sẽ bị bỏ qua vì sai id).
+        `arrive[id]` = perf_counter_ns lúc nhận (đo từng lệnh)."""
+        want = set(ids)
+        got = {}
+        while want:
+            if kill is not None and kill():
+                return None
+            left = deadline - time.perf_counter()
+            if left <= 0:
+                return None
+            try:
+                self.ws.settimeout(min(tick, left) if kill is not None else left)
+                raw = self.ws.recv()
+            except self._wsmod.WebSocketTimeoutException:
+                continue
+            except Exception as e:
+                self.alive = False
+                raise CdpWsError(f"mất kết nối CDP: {e}")
+            t = time.perf_counter_ns()
+            try:
+                m = json.loads(raw)
+            except Exception:
+                continue
+            i = m.get("id")
+            if i in want:
+                want.discard(i)
+                got[i] = m
+                if arrive is not None:
+                    arrive[i] = t
+        return got
+
+    def call(self, method: str, params: Optional[Dict[str, Any]] = None, timeout: float = 2.0) -> Dict[str, Any]:
+        i = self.send(method, params)
+        got = self.recv_until([i], time.perf_counter() + timeout)
+        if not got:
+            raise CdpWsError(f"{method}: hết giờ")
+        m = got[i]
+        if "error" in m:
+            raise CdpWsError(f"{method}: {m['error'].get('message')}")
+        return m.get("result") or {}
+
+    def close(self):
+        self.alive = False
+        try:
+            self.ws.close()
+        except Exception:
+            pass
+
+
+def _driver_debugger_address(driver) -> str:
+    try:
+        caps = getattr(driver, "capabilities", None) or {}
+        return str((caps.get("goog:chromeOptions") or {}).get("debuggerAddress") or "")
+    except Exception:
+        return ""
+
+
+def fast_click_conn(driver, log: Optional[Callable[[str], None]] = None):
+    """Trả (CdpWs|None, lý do). Mở/dùng lại kết nối CDP riêng tới tab hiện tại của driver. Lỗi → None (dùng đường driver như 5.3.0)."""
+    if CFG.click_path != "ws":
+        return None, "TAM_CLICK_PATH=driver"
+    addr = _driver_debugger_address(driver)
+    if not addr:
+        return None, "driver không có debuggerAddress"
+    try:
+        info = (driver.execute_cdp_cmd("Target.getTargetInfo", {}) or {}).get("targetInfo") or {}
+        tid = str(info.get("targetId") or "")
+        if not tid or info.get("type") not in (None, "page"):
+            return None, f"không xác định được tab của driver ({info.get('type')})"
+    except Exception as e:
+        return None, f"Target.getTargetInfo lỗi: {_exc_text(e)[:80]}"
+    old = getattr(driver, "_tam_fc", None)
+    if old is not None and old.alive and old.tid == tid:
+        return old, "dùng lại"
+    fail_until = getattr(driver, "_tam_fc_fail_until", 0.0)
+    if time.monotonic() < fail_until:                              # vừa thử mở thất bại: không thử lại mỗi việc (tránh tốn 2 s/việc)
+        return None, getattr(driver, "_tam_fc_fail_why", "WebSocket CDP lỗi gần đây")
+    if old is not None:
+        old.close()
+    try:
+        c = CdpWs(f"ws://{addr}/devtools/page/{tid}", tid)
+        t0 = time.perf_counter_ns()
+        c.call("Runtime.evaluate", {"expression": "1", "returnByValue": True})
+        c.rtt_ms = round((time.perf_counter_ns() - t0) / 1e6, 2)
+    except ImportError:
+        why = "thiếu gói websocket-client"
+    except Exception as e:
+        why = f"không mở được WebSocket CDP: {_exc_text(e)[:100]}"
+    else:
+        why = None
+    if why is not None:
+        try:
+            driver._tam_fc_fail_until = time.monotonic() + 300.0
+            driver._tam_fc_fail_why = why + " (thử lại sau 5 phút)"
+        except Exception:
+            pass
+        return None, why
+    try:
+        driver._tam_fc = c
+    except Exception:
+        pass
+    return c, "mới"
+
+
+JS_WS_WAIT = r"""(function () {
+  const S = window.__tam5;
+  if (!S) return {ready: false, err: 'not-installed'};
+  if (S.doc !== %s) return {ready: false, err: 'wrong-doc', doc: S.doc};
+  return S.waitReady(%d, true);
+})()"""
+JS_WS_SNAPSHOT = r"""(function () { const S = window.__tam5; return S ? S.snapshot() : null; })()"""
+
+
+def _ws_value(m: Dict[str, Any]):
+    """Giá trị từ phản hồi Runtime.evaluate; lỗi điều hướng → JobError (trước khi bấm)."""
+    if "error" in m:
+        msg = str((m.get("error") or {}).get("message") or "")
+        if _is_nav_exc(Exception(msg)) or "not found" in msg.lower():
+            raise JobError(f"trang điều hướng/nạp lại khi đang chờ nút Post ({msg[:80]})")
+        raise CdpWsError(msg)
+    r = m.get("result") or {}
+    if r.get("exceptionDetails"):
+        txt = str((r["exceptionDetails"].get("exception") or {}).get("description") or r["exceptionDetails"].get("text"))[:160]
+        if _is_nav_exc(Exception(txt)):
+            raise JobError(f"trang điều hướng/nạp lại khi đang chờ nút Post ({txt[:80]})")
+        raise CdpWsError(txt)
+    return (r.get("result") or {}).get("value")
+
+
+def ws_wait_and_fire(fc: "CdpWs", kill: Callable[[], bool], timeout_s: float, doc: str,
+                     prefire: Callable[[Dict[str, Any]], bool], click_move: bool) -> Dict[str, Any]:
+    """Chờ nút Post bằng MỘT promise trong trang (không cắt lát → không có khe hở nào giữa các lần hỏi), nút sáng là:
+    prefire() (Hard Stop / DRY-RUN / nhật ký chống trùng) → gửi LIỀN mouseMoved+mousePressed+mouseReleased+snapshot (không chờ từng lệnh).
+    Bảo vệ trong trang (watcher 5.x) vẫn chặn nhấn khi nút tắt lại / bị che / sai đích; S.frozen chặn nhấn lần 2.
+    Trả dict: state ready|timeout|killed|nofire, ready, fired, conf, err, t (mốc perf_counter_ns)."""
+    out = {"state": "timeout", "ready": None, "fired": False, "conf": None, "err": None, "t": {}}
+    end = time.perf_counter() + timeout_s
+    first = True
+    while True:
+        left = end - time.perf_counter()
+        if left <= 0:
+            return out
+        ms = int(max(50, left * 1000))
+        i = fc.send("Runtime.evaluate", {"expression": JS_WS_WAIT % (json.dumps(doc), ms), "awaitPromise": True,
+                                         "returnByValue": True})
+        got = fc.recv_until([i], end + 2.0, kill)
+        if got is None:
+            out["state"] = "killed" if kill() else "timeout"
+            return out
+        t_ready = time.perf_counter_ns()
+        v = _ws_value(got[i])
+        if not isinstance(v, dict):
+            raise JobError("watcher trả dữ liệu lạ khi chờ nút Post")
+        if v.get("err") == "not-installed" and first:
+            out["state"], out["err"] = "nofire", "not-installed@ws"   # lần hỏi ĐẦU không thấy watcher: có thể kết nối sai tab → KHÔNG bấm qua ws
+            return out
+        first = False
+        if v.get("err") == "not-installed":
+            raise JobError("watcher không còn trong trang (trang đã nạp lại?)")
+        if v.get("err") == "wrong-doc":
+            out["state"], out["err"] = "nofire", "wrong-doc"       # kết nối CDP không trỏ vào đúng tài liệu đã cài watcher → KHÔNG bấm
+            return out
+        if not v.get("ready"):
+            continue                                                 # promise hết hạn mà chưa sáng → chờ tiếp (chỉ xảy ra sát hết giờ)
+        out["ready"] = v
+        out["t"]["ready_py"] = t_ready
+        if v.get("doc") != doc:
+            out["state"], out["err"] = "nofire", "wrong-doc"
+            return out
+        ok = prefire(v)
+        out["t"]["gate_done"] = time.perf_counter_ns()
+        if not ok:
+            out["state"] = "nofire"
+            return out
+        x, y = float(v["x"]), float(v["y"])
+        arrive = {}     # type: Dict[int, int]
+        ids = []
+        out["state"] = "ready"
+        try:
+            if click_move:
+                ids.append(fc.send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y, "button": "none"}))
+            out["fired"] = True                                    # từ đây coi như CÓ THỂ đã nhấn (bảo thủ)
+            # move/press/release gửi LIỀN (Chrome xử lý theo thứ tự; nhấn không phải chờ 'mouseMoved' được vẽ xong — ở tab ẩn
+            # việc chờ đó tốn 100–600 ms). KHÔNG gửi snapshot chung lô: Runtime.evaluate có thể chạy TRƯỚC khi sự kiện chuột
+            # tới DOM → tưởng 'chưa trúng' → bấm lại → ĐĂNG TRÙNG (đã gặp ở lab). Snapshot chỉ gửi SAU khi Chrome xác nhận thả chuột.
+            ip = fc.send("Input.dispatchMouseEvent", {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1})
+            ir = fc.send("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1})
+            out["t"]["sent"] = time.perf_counter_ns()
+            ids += [ip, ir]
+            got = fc.recv_until(ids, time.perf_counter() + 5.0, None, arrive=arrive)
+            if not got or ir not in got:
+                out["err"] = "Chrome không xác nhận lệnh thả chuột"
+                return out                                         # conf=None → bảo thủ: coi là ĐÃ bấm, không bấm lại
+            out["t"]["press_ack"] = arrive.get(ip)
+            out["t"]["release_ack"] = arrive.get(ir)
+            errs = [str((got[k].get("error") or {}).get("message")) for k in (ip, ir) if k in got and "error" in got[k]]
+            if errs:
+                out["err"] = "; ".join(errs)
+            conf = None
+            t_end = time.perf_counter() + 0.5
+            out["snap_tries"] = 0
+            while True:
+                out["snap_tries"] += 1
+                isn = fc.send("Runtime.evaluate", {"expression": JS_WS_SNAPSHOT, "returnByValue": True})
+                g2 = fc.recv_until([isn], time.perf_counter() + 3.0, None, arrive=arrive)
+                if not g2:
+                    out["err"] = (out["err"] or "") + " snapshot: hết giờ"
+                    return out
+                conf = _ws_value(g2[isn])
+                out["t"]["snapshot"] = arrive.get(isn)
+                # đã có dấu vết (sự kiện tới nút / bị chặn / kết luận) → đủ để quyết định; trang trống trơn → hỏi lại tới 500 ms
+                if conf is None or conf.get("ev") or conf.get("blocked") or conf.get("verdict") or time.perf_counter() >= t_end:
+                    break
+                time.sleep(0.03)
+            out["conf"] = conf
+            if conf is not None and not (conf.get("ev") or conf.get("blocked") or conf.get("verdict")):
+                out["no_trace"] = True                             # 500 ms sau khi thả vẫn không có dấu vết nào: KHÔNG chắc → không bấm lại
+        except CdpWsError as e:
+            out["err"] = str(e)
+            out["conf"] = None
+            return out
+        except JobError as e:                                      # tài liệu vừa điều hướng NGAY sau nhấn → coi là đã bấm
+            out["err"] = (out["err"] or "") + f" snapshot: {_exc_text(e)[:80]}"
+            out["conf"] = None
+            out["nav"] = True
+        return out
 
 
 def payload_landed(p: Optional[Dict[str, Any]]) -> bool:
@@ -2524,6 +2807,7 @@ def _upload_core(driver, paths: List[str], log, kill, pid: str, trace: PerfTrace
     # --- 2) cài watcher TRƯỚC khi gắn file (để không bỏ lỡ video xử lý rất nhanh) ---
     #     B (sparse) / C (lite): KHÔNG cài watcher đầy đủ trong lúc upload — chỉ cài sau khi nút Post đã bật.
     light = CFG.wait_mode in ("sparse", "lite")
+    fast = None     # type: Optional[Dict[str, Any]]
     if light:
         t0i = time.perf_counter_ns()
         try:
@@ -2542,6 +2826,16 @@ def _upload_core(driver, paths: List[str], log, kill, pid: str, trace: PerfTrace
         return UploadResult(S.FAILED_SAFE, "không cài được watcher vào trang", trace=trace, paths=paths)
     pre_url = str(info.get("url") or "")
     trace.set("vis_install", info.get("vis"))
+    fc = None
+    if CFG.wait_mode == "event" and CFG.ready_stable_ms == 0:
+        fc, fc_why = fast_click_conn(driver, log)
+        trace.set("click_path", "ws" if fc is not None else "driver")
+        if fc is None and CFG.click_path == "ws":
+            log(f"ℹ️ [CLICK] Dùng đường bấm qua chromedriver (như 5.3.0): {fc_why}")
+        elif fc is not None:
+            trace.set("cdp_ws_rtt_ms", fc.rtt_ms)
+    else:
+        trace.set("click_path", "driver")
     if info.get("reErr"):
         log(f"⚠️ [Confirm] Regex xác nhận không hợp lệ cho JavaScript: {info['reErr']}")
 
@@ -2573,6 +2867,7 @@ def _upload_core(driver, paths: List[str], log, kill, pid: str, trace: PerfTrace
     # --- 4) chờ nút Post sẵn sàng (theo lát; Hard Stop kiểm tra giữa các lát) ---
     wstats = {}     # type: Dict[str, Any]
     if light:
+        fc = None
         state, lready = wait_post_enabled_light(driver, kill, CFG.ready_timeout_s, wstats, CFG.wait_mode)
         t_enabled_py = time.perf_counter_ns()
         ready = None
@@ -2594,7 +2889,49 @@ def _upload_core(driver, paths: List[str], log, kill, pid: str, trace: PerfTrace
                              attachedAt=lready.get("attachedAt"), handoffAt=ready.get("readyAt"))
                 wstats["handoff_ms"] = round((time.perf_counter_ns() - t_enabled_py) / 1e6, 1)
     else:
-        state, ready = wait_post_ready(driver, kill, CFG.ready_timeout_s, wstats)
+        fast = None
+        if fc is not None:
+            fstate = {}     # type: Dict[str, Any]
+
+            def prefire(v):
+                # đường găng: CHỈ những kiểm tra an toàn bắt buộc; log/đo đạc để SAU khi bấm
+                if kill():
+                    fstate["why"] = "killed"
+                    return False
+                if ctx.dry_run:
+                    fstate["why"] = "dry"                       # DRY-RUN: tuyệt đối không gửi lệnh chuột nào
+                    return False
+                if hooks is not None and hooks.before_click is not None and hooks.before_click() is False:
+                    fstate["why"] = "hook"
+                    return False
+                if v.get("upDoneAt") is not None:
+                    fsm.to(PState.PROCESSING, "upload xong")
+                fsm.to(PState.POST_READY, "nút Post sẵn sàng")
+                fsm.to(PState.POSTING, "phát lệnh click (ws)")
+                ctx.maybe_clicked = True
+                return True
+            try:
+                fast = ws_wait_and_fire(fc, kill, CFG.ready_timeout_s, str(info.get("doc") or ""), prefire, CFG.click_move)
+            except CdpWsError as e:                              # lỗi kết nối TRƯỚC khi bấm → quay về đường chromedriver
+                log(f"⚠️ [CLICK] WebSocket CDP lỗi trước khi bấm ({e}) → dùng đường chromedriver cho việc này")
+                fc.close()
+                fast = None
+            if fast is not None and fast["state"] == "nofire" and fstate.get("why") is None:
+                log(f"⚠️ [CLICK] Kết nối CDP không khớp tài liệu đã cài watcher ({fast.get('err')}) → KHÔNG bấm qua ws; dùng chromedriver")
+                fc.close()
+                fast = None
+            if fast is not None and fast["state"] == "nofire":
+                why = fstate.get("why")
+                if why == "killed":
+                    fsm.to(PState.ERROR, "Hard Stop trước khi bấm")
+                    return UploadResult(S.KILLED, "Hard Stop trước khi bấm (chưa bấm)", trace=trace, paths=paths)
+                if why == "hook":
+                    fsm.to(PState.ERROR, "huỷ trước khi bấm")
+                    return UploadResult(S.FAILED_SAFE, "huỷ trước khi bấm (nhật ký chặn)", trace=trace, paths=paths)
+        if fast is not None:
+            state, ready = ("ready" if fast["state"] == "nofire" else fast["state"]), fast["ready"]
+        else:
+            state, ready = wait_post_ready(driver, kill, CFG.ready_timeout_s, wstats)
     t_resp = time.perf_counter_ns()
     if state == "killed":
         fsm.to(PState.ERROR, "Hard Stop khi chờ nút Post")
@@ -2608,12 +2945,15 @@ def _upload_core(driver, paths: List[str], log, kill, pid: str, trace: PerfTrace
     trace.mark_chrome("PROCESSING_READY", ready.get("readyAt"), ready.get("doc"), sync)
     if trace.marks.get("PROCESSING_READY") is None or trace.marks["PROCESSING_READY"].py_ns is None and trace.marks["PROCESSING_READY"].chrome_ms is None:
         trace.mark("PROCESSING_READY", t_resp, "py(resp)", overwrite=True)
+    fired = bool(fast is not None and fast.get("fired"))
     if ready.get("upDoneAt") is not None:
         trace.mark_chrome("UPLOAD_COMPLETED", ready["upDoneAt"], ready.get("doc"), sync)
-        fsm.to(PState.PROCESSING, "upload xong")
+        if not fired:
+            fsm.to(PState.PROCESSING, "upload xong")
     else:
         trace.mark_unknown("UPLOAD_COMPLETED", "không có tín hiệu: đặt TAM_UPLOAD_DONE_SEL / TAM_UPLOAD_DONE_TEXT_RE để đo")
-    fsm.to(PState.POST_READY, "nút Post sẵn sàng")
+    if not fired:
+        fsm.to(PState.POST_READY, "nút Post sẵn sàng")
     trace.set("vis_ready", ready.get("vis"))
     trace.set("watch_stats", ready.get("stats"))
     trace.set("slices", wstats.get("slices"))
@@ -2629,7 +2969,8 @@ def _upload_core(driver, paths: List[str], log, kill, pid: str, trace: PerfTrace
         lag_s = f" | watcher→Python≈{lag:.0f}ms"
     except Exception:
         lag_s = ""
-    log(f"💡 [READY] Nút Post vừa sáng sau {time.perf_counter() - ctx.t_attached:.3f}s{lag_s} | tab={ready.get('vis')}")
+    log(f"💡 [READY] Nút Post vừa sáng sau {time.perf_counter() - ctx.t_attached:.3f}s{lag_s} | tab={ready.get('vis')}"
+        + (" | (dòng này ghi SAU khi đã bấm qua ws — log không nằm trên đường bấm)" if fired else ""))
     if ready.get("vis") == "hidden":
         log("⚠️ [PERF] Tab đang ở nền (visibilityState=hidden): Chrome có thể giãn timer/animation của trang nên chậm hơn thao tác tay. "
             "Giữ cửa sổ profile hiển thị hoặc thử TAM_BRING_TO_FRONT=1 rồi so sánh PERF.")
@@ -2658,7 +2999,31 @@ def _upload_core(driver, paths: List[str], log, kill, pid: str, trace: PerfTrace
     # --- 6) bấm Post (CDP, tin cậy). Chỉ thử lại khi CHẮC CHẮN chuột chưa trúng nút. ---
     conf = None
     t_c0 = time.perf_counter_ns()
-    for attempt in range(CFG.click_attempts):
+    t_pre_click = t_resp
+    cdp_times = []      # type: List[float]
+    start_attempt = 0
+    if fired:
+        t_c0 = fast["t"].get("sent") or t_c0
+        conf = fast.get("conf")
+        start_attempt = 1
+        if conf is None:                                       # không đọc được trang ngay sau nhấn (điều hướng/mất kết nối) => bảo thủ: ĐÃ bấm
+            ctx.clicked = True
+            ctx.nav = bool(fast.get("nav"))
+            conf = {"err": "not-installed" if ctx.nav else "query-failed"}
+        elif payload_landed(conf) or conf.get("verdict"):
+            ctx.clicked = True
+        elif fast.get("no_trace"):
+            # không thấy sự kiện chuột nào tới trang (kể cả bị chặn) sau 500 ms: KHÔNG được coi là 'chắc chắn chưa bấm' → không bấm lại
+            ctx.clicked = True
+            log("⚠️ [Instant Click] (ws) 500 ms sau khi thả chuột trang vẫn chưa ghi nhận sự kiện nào → coi như ĐÃ bấm "
+                "(không bấm lại để tránh đăng trùng); chờ bằng chứng đăng.")
+        else:
+            ctx.maybe_clicked = False
+            log(f"⚠️ [Instant Click] Lần 1 (ws): chuột không trúng nút Post ({describe_blocked(conf)})"
+                f"{'; CDP: ' + str(fast.get('err')) if fast.get('err') else ''}. Thử lại an toàn qua chromedriver.")
+    for attempt in range(start_attempt, CFG.click_attempts):
+        if ctx.clicked:
+            break
         if kill():
             fsm.to(PState.ERROR, "Hard Stop trước khi bấm")
             return UploadResult(S.KILLED, "Hard Stop trước khi bấm (chưa bấm)", trace=trace, paths=paths)
@@ -2680,10 +3045,12 @@ def _upload_core(driver, paths: List[str], log, kill, pid: str, trace: PerfTrace
             fsm.to(PState.POSTING, "phát lệnh click")
         x, y = float(ready["x"]), float(ready["y"])
         ctx.maybe_clicked = True
+        t_pre_click = t_resp if attempt == 0 else t_pre_click
         t_c0 = time.perf_counter_ns()
         cdp_err = None
+        cdp_times = []
         try:
-            cdp_click(driver, x, y)
+            cdp_click(driver, x, y, cdp_times)
         except Exception as e:
             cdp_err = e
         try:
@@ -2718,6 +3085,7 @@ def _upload_core(driver, paths: List[str], log, kill, pid: str, trace: PerfTrace
     d = trace.durations().get("ReadyToClick", {})
     rtc = "UNKNOWN" if d.get("ns") is None else f"{d['ns'] / 1e6:.0f}ms"
     log(f"🚀 [INSTANT CLICK] READY→CLICK = {rtc} | Attach→Click = {time.perf_counter() - ctx.t_attached:.3f}s  (đã bấm; CHƯA phải đã đăng)")
+    _log_click_path(log, trace, fast, ready, conf, t_resp, t_pre_click, t_c0, cdp_times, fc)
 
     # --- 8) XÁC NHẬN bằng trạng thái giao diện. Không có bằng chứng => UNKNOWN, không bao giờ coi là thành công. ---
     out = await_confirm(driver, kill, pre_url, conf, t_c0, log)
@@ -2749,6 +3117,48 @@ def _upload_core(driver, paths: List[str], log, kill, pid: str, trace: PerfTrace
         "Đã bấm Post nhưng KHÔNG xác minh được: không MOVE, không tự đăng lại. Kiểm tra tay trên TikTok Studio, "
         "rồi chỉnh TAM_CONFIRM_*_RE bằng --calibrate-confirm nếu đây là đăng thành công.")
     return UploadResult(S.UNKNOWN, reason, True, "; ".join(snap), trace, paths)
+
+
+def _log_click_path(log, trace: PerfTrace, fast, ready, conf, t_resp, t_pre_click, t_c0, cdp_times, fc):
+    """⏱️ CLICK_PATH: tách READY→CLICK thành từng chặng (đồng hồ TRANG cho 2 đầu, perf_counter Python cho phần giữa). Chỉ ghi, không đổi gì."""
+    try:
+        f1 = lambda v: None if v is None else round(v, 1)
+        d = {"path": "ws" if fast is not None and fast.get("fired") else "driver"}
+        ra, now = ready.get("readyAt"), ready.get("now")
+        d["watcher_flush_ms"] = f1(float(now) - float(ra)) if ra is not None and now is not None else None
+        d["ready_via"] = ready.get("via")
+        ca = (conf or {}).get("clickAt")
+        same = (conf or {}).get("doc") == ready.get("doc")
+        d["rtc_page_ms"] = f1(float(ca) - float(ra)) if ca is not None and ra is not None and same else None
+        la = ready.get("litAt")
+        # SÁNG→SẴN SÀNG = nút đã bật + hiện nhưng còn bị che (chờ lớp che biến mất) | SÁNG→CLICK = cái mắt người thấy
+        d["lit_to_ready_ms"] = f1(max(0.0, float(ra) - float(la))) if la is not None and ra is not None else None
+        d["lit_to_click_ms"] = f1(float(ca) - float(la)) if la is not None and ca is not None and same else None
+        st_ = ready.get("stats") or {}
+        d["cover_checks"] = st_.get("cover")
+        d["cover_mut"] = st_.get("coverMut")
+        ms = lambda a, b: None if a is None or b is None else round((b - a) / 1e6, 2)
+        if d["path"] == "ws":
+            t = fast.get("t") or {}
+            d.update(py_gate_ms=ms(t.get("ready_py"), t.get("gate_done")), send_ms=ms(t.get("gate_done"), t.get("sent")),
+                     press_ack_ms=ms(t.get("sent"), t.get("press_ack")), snapshot_ms=ms(t.get("sent"), t.get("snapshot")),
+                     snap_tries=fast.get("snap_tries"),
+                     cdp_rtt_ms=getattr(fc, "rtt_ms", None))
+        else:
+            d.update(py_preclick_ms=ms(t_resp, t_c0), cdp_cmd_ms=list(cdp_times or []))
+        for k, v in d.items():
+            trace.set("cp_" + k, v)
+        if d["path"] == "ws":
+            log(f"⏱️ [CLICK_PATH] ws | SÁNG→CLICK {d['lit_to_click_ms']} ms (trong đó chờ hết bị che {d['lit_to_ready_ms']} ms) | "
+                f"READY→CLICK (đồng hồ trang) {d['rtc_page_ms']} ms | watcher→trả kết quả {d['watcher_flush_ms']} ms "
+                f"({d['ready_via']}) | kiểm tra an toàn {d['py_gate_ms']} ms | gửi nhấn/thả {d['send_ms']} ms | Chrome xác nhận nhấn "
+                f"{d['press_ack_ms']} ms | RTT CDP {d['cdp_rtt_ms']} ms")
+        else:
+            log(f"⏱️ [CLICK_PATH] driver | SÁNG→CLICK {d['lit_to_click_ms']} ms (trong đó chờ hết bị che {d['lit_to_ready_ms']} ms) | "
+                f"READY→CLICK (đồng hồ trang) {d['rtc_page_ms']} ms | watcher→trả kết quả {d['watcher_flush_ms']} ms "
+                f"({d['ready_via']}) | Python trước khi bấm {d['py_preclick_ms']} ms | lệnh CDP qua chromedriver {d['cdp_cmd_ms']} ms")
+    except Exception as e:
+        trace.set("cp_error", _exc_text(e)[:120])
 
 
 def upload_video_to_tiktok_ex(driver, video_paths, logger_func=None, check_force_kill=None, pid: str = "", mode: str = "",
@@ -5039,6 +5449,212 @@ def cli_bench_watch(pid: str, files: List[str], repeat: int, yes: bool, keep_ope
 
 
 # ======================================================================================
+# CLICK BENCHMARK (TEST ONLY) — độ trễ NÚT POST SÁNG → CLICK trên CHÍNH profile Genlogin / chromedriver / VPS của bạn,
+# nhưng bấm vào TRANG GIẢ chạy ở 127.0.0.1 trong một TAB MỚI. KHÔNG mở TikTok, KHÔNG đăng gì, KHÔNG đụng nhật ký đăng thật.
+#  * Đường cũ (driver: chờ theo lát + 3 lệnh CDP qua chromedriver) và đường mới (ws) xen kẽ A-B-B-A, cùng trang, cùng file.
+#  * Thước đo do TRANG tự ghi (đồng hồ trang): enabled→click = nút bật → hàm onclick của trang chạy.
+#  * Bảo vệ: hook before_click chỉ cho bấm khi tab đang ở trang giả 127.0.0.1 (kiểm tra TRƯỚC khi chờ nút, không nằm trên đường găng).
+# ======================================================================================
+CLICK_BENCH_PAGE = r"""<!doctype html><html><head><meta charset="utf-8"><title>TAM click bench (local)</title>
+<style>body{font-family:sans-serif;margin:0}#panel div{padding:2px;border-bottom:1px solid #eee}.footer{position:fixed;bottom:0;left:0;right:0;
+height:80px;background:#fff;border-top:1px solid #ccc}.btn{position:absolute;right:40px;top:20px;width:120px;height:40px}
+#cover{position:fixed;bottom:0;right:0;width:300px;height:90px;background:rgba(0,0,0,.6);color:#fff;display:none;z-index:9}</style></head>
+<body><h3>TAM CLICK BENCH — trang GIẢ trên máy này (không phải TikTok)</h3><input type="file" id="f">
+<div id="pct">0%</div><div id="panel"></div>
+<div class="footer"><div id="wrap"><button data-e2e="post_video_button" class="btn btn-disabled" disabled>Post</button></div></div>
+<div id="cover">Đang xử lý…</div>
+<script>
+const Q = new URLSearchParams(location.search), UP = +(Q.get('up') || 1500), HOLD = +(Q.get('coverhold') || 0);
+const M = window.__mock = {marks: {}, id: null};
+const E = () => performance.timeOrigin + performance.now();
+let t = null, k = 0;
+function churn() { k++; document.getElementById('pct').textContent = 'Uploading ' + Math.min(99, Math.round(k * 16 / UP * 100)) + '%';
+  let h = ''; for (let i = 0; i < 200; i++) h += '<div>' + i + ' ' + ((k * 31 + i) % 997) + '</div>'; document.getElementById('panel').innerHTML = h; }
+function onPost() { M.marks.postClick = E(); fetch('/post?id=' + M.id, {method: 'POST'}).then(() => { history.pushState({}, '', '/tiktokstudio/content');
+  const d = document.createElement('div'); d.textContent = 'Video published'; document.body.appendChild(d); }); }
+function enable() { clearInterval(t); document.getElementById('wrap').innerHTML = '<button data-e2e="post_video_button" class="btn btn-primary">Post</button>';
+  document.querySelector('#wrap button').addEventListener('click', onPost); M.marks.enabled = E();
+  if (HOLD > 0) { document.getElementById('cover').style.display = 'block';
+    setTimeout(() => { document.getElementById('cover').style.display = 'none'; M.marks.coverOff = E(); }, HOLD); } }
+document.getElementById('f').addEventListener('change', e => { if (!e.target.files.length) return; M.id = Math.random().toString(36).slice(2);
+  M.marks.attach = E(); t = setInterval(churn, 16); setTimeout(enable, UP); });
+</script></body></html>"""
+
+
+def _click_bench_server():
+    """Máy chủ trang giả (luồng nền, 127.0.0.1, cổng ngẫu nhiên). Trả (server, base_url, posts{id: count})."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    posts = {}      # type: Dict[str, int]
+
+    class H(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            return
+
+        def _send(self, code, body=b"", ctype="text/html; charset=utf-8"):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            path = urllib.parse.urlparse(self.path).path
+            if path.startswith("/tiktokstudio/"):
+                return self._send(200, CLICK_BENCH_PAGE.encode("utf-8"))
+            return self._send(404)
+
+        def do_POST(self):
+            u = urllib.parse.urlparse(self.path)
+            n = int(self.headers.get("Content-Length") or 0)
+            if n:
+                self.rfile.read(n)
+            if u.path == "/post":
+                i = (urllib.parse.parse_qs(u.query).get("id") or [""])[0]
+                posts[i] = posts.get(i, 0) + 1
+            return self._send(200, b"{}", "application/json")
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True, name="CLICK-BENCH-HTTP").start()
+    return srv, f"http://127.0.0.1:{srv.server_address[1]}", posts
+
+
+def cli_bench_click(pid: str, repeat: int, yes: bool, keep_open: bool, paths: str = "driver,ws", coverhold_ms: int = 0,
+                    page_state: str = "asis") -> int:
+    paths_l = [x for x in (p.strip().lower() for p in str(paths or "").split(",")) if x in ("driver", "ws")] or ["driver", "ws"]
+    repeat = max(1, int(repeat))
+    print(f"BENCH CLICK: profile {pid} | {repeat} vòng × {'/'.join(paths_l)} (A-B-B-A) | trang GIẢ 127.0.0.1 trong TAB MỚI — "
+          f"KHÔNG mở TikTok, KHÔNG đăng gì. Lớp che sau khi nút sáng: {coverhold_ms} ms. Trạng thái cửa sổ: {page_state}.")
+    if not yes and input("Tiếp tục? [y/N] ").strip().lower() not in ("y", "yes"):
+        print("Đã huỷ.")
+        return 1
+    srv, base, posts = _click_bench_server()
+    tmpd = tempfile.mkdtemp(prefix="tam_clickbench_")
+    fpath = os.path.join(tmpd, "click_bench_dummy.mp4")
+    with open(fpath, "wb") as f:
+        f.write(os.urandom(300_000))
+    drv = _open_one(pid)
+    if drv is None:
+        srv.shutdown()
+        return 3
+    saved = (globals()["TARGET_UPLOAD_URL"], CFG.upload_url_path, CFG.click_path, CFG.wait_mode, CFG.bring_to_front)
+    orig_handle = None
+    rows = []       # type: List[Dict[str, Any]]
+    try:
+        orig_handle = drv.current_window_handle
+        drv.switch_to.new_window("tab")                            # TAB MỚI: tab TikTok của profile giữ nguyên
+        globals()["TARGET_UPLOAD_URL"] = f"{base}/tiktokstudio/upload?up=1500&coverhold={int(coverhold_ms)}"
+        CFG.upload_url_path = "/tiktokstudio/upload"
+        CFG.wait_mode = "event"
+        CFG.bring_to_front = (page_state == "front")
+        bpid = f"{pid}#clickbench"
+        for r in range(repeat):
+            order = paths_l if r % 2 == 0 else paths_l[::-1]
+            for path in order:
+                CFG.click_path = path
+                fsm = get_fsm(bpid)
+                fsm.reset_unknown("bench")
+                fsm.dirty = True
+                guard = {"ok": False}
+
+                def log(msg, guard=guard):
+                    if "[Timing] T1" in msg:                             # đã gắn file, CHƯA chờ nút: xác minh đúng trang giả
+                        try:
+                            guard["ok"] = str(drv.current_url).startswith(base + "/tiktokstudio/upload")
+                        except Exception:
+                            guard["ok"] = False
+                hooks = JobHooks(before_click=lambda guard=guard: bool(guard["ok"]))
+                tr = PerfTrace(label=f"click-{path}#{r + 1}", profile=pid, mode="BENCH-CLICK", n_files=1, n_bytes=300_000)
+                res = upload_video_to_tiktok_ex(drv, [fpath], logger_func=log, check_force_kill=None, pid=bpid, mode="BENCH-CLICK",
+                                                trace=tr, hooks=hooks)
+                time.sleep(0.2)
+                try:
+                    mk = drv.execute_script("return window.__mock ? Object.assign({vis: document.visibilityState, id: window.__mock.id},"
+                                            " window.__mock.marks) : null;") or {}
+                except Exception:
+                    mk = {}
+                fl = tr.flags
+                d_ = lambda x, y: None if x is None or y is None else round(float(x) - float(y), 1)
+                row = {"path": path, "round": r + 1, "result": res.status.value, "reason": (res.reason or "")[:100],
+                       "cp_path": fl.get("cp_path"), "vis": mk.get("vis"),
+                       "enabled_to_click_ms": d_(mk.get("postClick"), mk.get("enabled")),
+                       "uncover_to_click_ms": d_(mk.get("postClick"), mk.get("coverOff")),
+                       "clicked_while_covered": bool(mk.get("coverOff") is not None and mk.get("postClick") is not None
+                                                     and mk["postClick"] < mk["coverOff"]) or bool(coverhold_ms and mk.get("postClick")
+                                                                                                   and mk.get("coverOff") is None),
+                       "server_posts": posts.get(mk.get("id") or "", 0),
+                       "rtc_page_ms": fl.get("cp_rtc_page_ms"), "lit_to_click_ms": fl.get("cp_lit_to_click_ms"),
+                       "watcher_flush_ms": fl.get("cp_watcher_flush_ms"), "ready_via": fl.get("cp_ready_via"),
+                       "py_preclick_ms": fl.get("cp_py_preclick_ms"), "cdp_cmd_ms": fl.get("cp_cdp_cmd_ms"),
+                       "press_ack_ms": fl.get("cp_press_ack_ms"), "cdp_rtt_ms": fl.get("cp_cdp_rtt_ms")}
+                rows.append(row)
+                print(f"  vòng {r + 1} {path:6}: {row['result']:9} | nút bật→click {row['enabled_to_click_ms']} ms | READY→CLICK "
+                      f"{row['rtc_page_ms']} ms | đường thật {row['cp_path']} | /post nhận {row['server_posts']} lần"
+                      + (f" | lệnh CDP {row['cdp_cmd_ms']}" if row["cdp_cmd_ms"] else "") + (f" | {row['reason']}" if row["reason"] else ""))
+                if CFG.perf_enable:
+                    PERF_LOG.write(tr.record())
+        summ = {}
+        for path in paths_l:
+            rs = [x for x in rows if x["path"] == path]
+            ok = [x for x in rs if x["result"] == PostStatus.CONFIRMED.value]
+            summ[path] = {"n": len(rs), "confirmed": len(ok), "double_posts": sum(1 for x in rs if x["server_posts"] > 1),
+                          "clicked_while_covered": sum(1 for x in rs if x["clicked_while_covered"]),
+                          "enabled_to_click_ms": _pct_list([x["enabled_to_click_ms"] for x in ok if x["enabled_to_click_ms"] is not None]),
+                          "rtc_page_ms": _pct_list([x["rtc_page_ms"] for x in ok if x["rtc_page_ms"] is not None])}
+        rep = {"profile": pid, "repeat": repeat, "coverhold_ms": coverhold_ms, "page_state": page_state, "backend": BACKEND_VERSION,
+               "ts": datetime.datetime.now().isoformat(timespec="seconds"), "rows": rows, "summary": summ}
+        verdict = ""
+        if len(paths_l) == 2:
+            xa = [x["enabled_to_click_ms"] for x in rows if x["path"] == "driver" and x["result"] == "CONFIRMED" and x["enabled_to_click_ms"] is not None]
+            xb = [x["enabled_to_click_ms"] for x in rows if x["path"] == "ws" and x["result"] == "CONFIRMED" and x["enabled_to_click_ms"] is not None]
+            if len(xa) >= 5 and len(xb) >= 5:
+                dd, lo, hi = bootstrap_median_diff(xa, xb)
+                pv = mann_whitney_p(xa, xb)
+                rep["diff_ws_minus_driver_ms"] = {"median": dd, "ci95": [lo, hi], "p": pv}
+                verdict = (f"ws − driver (nút bật→click, median) = {dd:+.0f} ms, KTC95% [{lo:+.0f}; {hi:+.0f}], p = {pv:.4f} → "
+                           + ("KHÁC BIỆT CÓ Ý NGHĨA" if (hi < 0 or lo > 0) and pv < 0.05 else "CHƯA khác biệt rõ"))
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        out = os.path.join(BASE_DIR, f"tam_bench_click_{stamp}.json")
+        with open(out, "w", encoding="utf-8") as f:
+            json.dump(rep, f, ensure_ascii=False, indent=1)
+        md = [f"# TAM BENCH CLICK — {rep['ts']} — profile {pid} — {BACKEND_VERSION}", "",
+              "Trang GIẢ 127.0.0.1 trong tab mới (không TikTok, không đăng). Đồng hồ trang: nút bật → onclick chạy.", "",
+              "| Đường | lượt | CONFIRMED | đăng trùng | bấm lúc bị che | nút bật→click P50 | P90 | P95 | READY→CLICK P50 | P90 |",
+              "|---|---|---|---|---|---|---|---|---|---|"]
+        for path, sm in summ.items():
+            e, rr = sm["enabled_to_click_ms"], sm["rtc_page_ms"]
+            md.append(f"| {path} | {sm['n']} | {sm['confirmed']} | {sm['double_posts']} | {sm['clicked_while_covered']} | {e.get('median')} | "
+                      f"{e.get('p90')} | {e.get('p95')} | {rr.get('median')} | {rr.get('p90')} |")
+        if verdict:
+            md += ["", verdict]
+        with open(out[:-5] + ".md", "w", encoding="utf-8") as f:
+            f.write("\n".join(md) + "\n")
+        print("\n" + "\n".join(md))
+        print(f"\nĐã lưu: {out} và .md — gửi 2 file này để phân tích.")
+        return 0
+    finally:
+        globals()["TARGET_UPLOAD_URL"], CFG.upload_url_path, CFG.click_path, CFG.wait_mode, CFG.bring_to_front = saved
+        try:
+            if orig_handle is not None and drv.current_window_handle != orig_handle:
+                drv.close()                                         # đóng TAB đo, quay về tab TikTok cũ
+                drv.switch_to.window(orig_handle)
+        except Exception:
+            pass
+        try:
+            fc = getattr(drv, "_tam_fc", None)
+            if fc is not None:
+                fc.close()
+                drv._tam_fc = None
+        except Exception:
+            pass
+        shutil.rmtree(tmpd, ignore_errors=True)
+        srv.shutdown()
+        _close_one(pid, drv, keep_open)
+
+
+# ======================================================================================
 # PROXY UPLOAD BENCHMARK (TEST ONLY) — so sánh 2 proxy A/B trên CÙNG profile, CÙNG file, CÙNG tài khoản.
 #  * LUÔN dry-run (gắn file → chờ nút Post sáng → DỪNG). Thêm lớp bảo vệ thứ 2: hook before_click trả False (huỷ mọi lần bấm).
 #  * Đổi proxy: đóng phiên Genlogin → NGƯỜI DÙNG đổi proxy của profile trong Genlogin → mở lại → kiểm tra IP công khai ĐÃ ĐỔI.
@@ -5864,6 +6480,8 @@ def build_parser() -> "argparse.ArgumentParser":
     g.add_argument("--bench-upload", action="store_true", help="chạy thử tới lúc nút Post sáng rồi DỪNG (không đăng); cần --profile --files")
     g.add_argument("--proxy-bench", action="store_true", help="cửa sổ PROXY UPLOAD BENCHMARK (TEST ONLY, không bấm Post)")
     g.add_argument("--proxy-bench-cli", action="store_true", help="như --proxy-bench nhưng dòng lệnh; cần --profile --file")
+    g.add_argument("--bench-click", action="store_true", help="độ trễ nút Post sáng→click: đường driver vs ws trên TRANG GIẢ 127.0.0.1 "
+                   "trong tab mới của profile (không TikTok, không đăng); cần --profile")
     g.add_argument("--bench-watch", action="store_true", help="A/B/C cơ chế theo dõi nút Post trên TikTok thật (DRY-RUN, không bấm Post); cần --profile --files")
     g.add_argument("--bench-attach", action="store_true", help="đo AttachToReady (file được chọn -> nút Post sáng): đăng tay vs tool, không đăng; cần --profile --files")
     ap.add_argument("--attach-mode", choices=["tool", "manual", "both"], default="both", help="--bench-attach: tool | manual (bạn tự chọn file) | both (xen kẽ ABBA)")
@@ -5893,6 +6511,9 @@ def build_parser() -> "argparse.ArgumentParser":
     ap.add_argument("--stage", choices=["direct", "ram"], help="đặt TAM_STAGE cho lần chạy này")
     ap.add_argument("--force-reload", action="store_true", help="đặt TAM_FORCE_RELOAD=1 cho lần chạy này")
     ap.add_argument("--keep-open", action="store_true", help="không đóng profile sau khi đo")
+    ap.add_argument("--click-paths", default="driver,ws", help="--bench-click: các đường bấm so sánh (driver,ws)")
+    ap.add_argument("--coverhold-ms", type=int, default=0, help="--bench-click: nút sáng nhưng bị lớp phủ che thêm N ms")
+    ap.add_argument("--window", default="asis", help="--bench-click: asis (giữ nguyên cửa sổ như lúc đăng thật) | front (đưa tab lên trước)")
     return ap
 
 
@@ -5941,6 +6562,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not a.profile or not a.file:
             ap.error("--proxy-bench-cli cần --profile và --file")
         return cli_proxy_bench(a.profile, a.file, a.proxy_a, a.proxy_b, a.per_block, a.secs)
+    if a.bench_click:
+        if not a.profile:
+            ap.error("--bench-click cần --profile")
+        return cli_bench_click(a.profile, a.repeat if a.repeat != 3 else 10, a.yes, a.keep_open, a.click_paths, a.coverhold_ms, a.window)
     if a.bench_watch:
         if not a.profile or not a.files:
             ap.error("--bench-watch cần --profile và --files")

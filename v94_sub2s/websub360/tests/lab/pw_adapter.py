@@ -21,9 +21,22 @@ class NoAlert(Exception):
 
 
 class _Alert:
+    def __init__(self, drv=None):
+        self.drv = drv
+
     @property
     def alert(self):
         raise NoAlert("no such alert")
+
+    def new_window(self, kind="tab"):                 # như Selenium 4: mở tab mới và chuyển sang
+        d = self.drv
+        pg = d.page.context.new_page()
+        d._pages[id(pg)] = pg
+        d._use(pg)
+
+    def window(self, handle):
+        d = self.drv
+        d._use(d._pages[handle])
 
 
 class PWElement:
@@ -37,13 +50,28 @@ class PWElement:
 
 
 class PWDriver:
-    def __init__(self, page, cdp):
+    def __init__(self, page, cdp, debugger_address=None):
         self.page = page
         self.cdp = cdp
+        # như Selenium attach qua debuggerAddress (Genlogin): chromedriver trả goog:chromeOptions.debuggerAddress
+        self.capabilities = {"goog:chromeOptions": {"debuggerAddress": debugger_address}} if debugger_address else {}
         self.command_count = 0
         self.cdp_count = 0
         self.script_to_s = 30.0
-        self.switch_to = _Alert()
+        self.switch_to = _Alert(self)
+        self._pages = {id(page): page}
+
+    def _use(self, pg):
+        self.page = pg
+        self.cdp = pg.context.new_cdp_session(pg)
+
+    @property
+    def current_window_handle(self):
+        return id(self.page)
+
+    def close(self):
+        self._pages.pop(id(self.page), None)
+        self.page.close()
 
     @property
     def current_url(self):

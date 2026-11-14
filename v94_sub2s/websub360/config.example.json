@@ -50,6 +50,7 @@
   "tiktok_dry_run": false,
   "tiktok_max_age_minutes": 30,
   "tam_wait_mode": "",
+  "tam_click_path": "",
   "detection_mode": "PARALLEL",
   "api_keys_file": "api_keys.txt",
   "api_quota_per_project": 10000,

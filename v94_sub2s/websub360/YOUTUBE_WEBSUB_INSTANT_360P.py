@@ -117,6 +117,7 @@ DEFAULT_CONFIG = {
     "tiktok_dry_run": False,           # True: chạy hết tới khi nút Post sáng rồi DỪNG, KHÔNG bấm Post
     "tiktok_max_age_minutes": 30,      # video có giờ đăng cũ hơn → KHÔNG tự đăng TikTok (giữ HELD), dù đường phát hiện nào
     "tam_wait_mode": "",               # cách TAM theo dõi nút Post: "" = mặc định của TAM (event/A) | "lite" (C) | "sparse" (B)
+    "tam_click_path": "",              # đường bấm Post: "" = mặc định của file TAM (5.4 TEST: ws) | "ws" | "driver" (như 5.3.0, rollback)
     # ---- NGUỒN PHÁT HIỆN (RACE MODE) ----
     "detection_mode": "PARALLEL",      # WEBSUB_ONLY | API_ONLY | PARALLEL (WebSub + API chạy đồng thời, nguồn nào tới trước thắng)
     "api_keys_file": "api_keys.txt",   # mỗi dòng: TEN_PROJECT|KEY  (hoặc chỉ KEY = 1 project riêng)

@@ -1,0 +1,41 @@
+TAM 5.4.0-TEST-FASTCLICK — BẤM POST NGAY KHI NÚT SÁNG (BẢN THỬ, KHÔNG DÙNG CHO PRODUCTION KHI CHƯA ĐO TRÊN VPS)
+=======================================================================================================
+
+CHỈ ĐỔI đường "nút Post sáng → bấm". Browse, downloader, Excel, SQLite, PREWARM_ALL, cách gắn file, xác nhận POST_CONFIRMED
+và nhật ký chống đăng trùng: giữ nguyên. Bản cũ: WS360\backup\tam_INSTANT_POST_5.3.0_truoc_fast_click.py
+
+VÌ SAO BẢN CŨ CHẬM 1–2 NHỊP (đo trên Chromium thật, xem BAO_CAO_FAST_CLICK.md)
+ 1. Bấm chuột qua chromedriver = 3 lệnh nối tiếp: mouseMoved → chờ xong → mousePressed → chờ xong → mouseReleased.
+    Ở tab KHÔNG hiển thị (cửa sổ thu nhỏ / bị che / RDP ngắt), Chrome chỉ xác nhận "mouseMoved" khi vẽ khung hình kế tiếp:
+    đo được 140–565 ms CHỈ cho lệnh đầu tiên. Nhấn chuột thật sự chỉ được gửi SAU khoảng chờ đó.
+ 2. Chờ nút theo "lát" 0,4 s qua chromedriver: giữa 2 lát có khe hở (lệnh WebDriver mới), nút sáng đúng lúc đó → trả muộn
+    (log cũ "watcher→Python≈247ms" là khe hở này).
+ 3. Nút sáng nhưng bị lớp phủ che: bản cũ kiểm tra lại bằng hẹn giờ 8 ms — ở tab ẩn Chrome giãn hẹn giờ.
+
+BẢN 5.4 LÀM GÌ (TAM_CLICK_PATH=ws, mặc định của bản thử)
+ - Mở 1 kết nối CDP RIÊNG (WebSocket) tới ĐÚNG tab driver đang điều khiển (lấy targetId qua chính driver), trước khi gắn file.
+ - Chờ nút Post bằng 1 promise trong trang, KHÔNG cắt lát → không có khe hở.
+ - Nút sáng → kiểm tra an toàn (Hard Stop, DRY-RUN, ghi nhật ký POSTING) → gửi LIỀN move+nhấn+thả (không chờ từng lệnh).
+ - Log READY / đo đạc ghi SAU khi đã bấm (không nằm trên đường bấm).
+ - Bị che: kiểm tra lại theo THAY ĐỔI DOM (lớp che biến mất là bấm), không phụ thuộc hẹn giờ.
+ - Không mở được WebSocket (thiếu gói websocket-client, Chrome từ chối, sai tab…) → tự dùng đường cũ (chromedriver).
+
+AN TOÀN (đều có test trên Chromium thật)
+ - Không bấm khi nút tắt / bị che / sai đích: bảo vệ trong trang (từ 5.x) chặn nhấn, và chỉ bấm khi watcher báo SẴN SÀNG.
+ - Sai tab / sai tài liệu: kết nối ws không thấy đúng watcher → KHÔNG bấm qua ws, quay về chromedriver (bấm đúng tab).
+ - Chống đăng trùng: 1 lượt nhấn duy nhất; kết quả chỉ được đọc SAU khi Chrome xác nhận thả chuột; trang không ghi nhận gì sau
+   500 ms → coi như ĐÃ bấm (không bấm lại). Nhật ký POSTING ghi TRƯỚC khi nhấn như cũ.
+ - DRY-RUN: không gửi bất kỳ lệnh chuột nào (test đếm lệnh = 0).
+
+ĐO TRÊN VPS (BẮT BUỘC trước khi tin con số) — KHÔNG đăng gì, KHÔNG mở TikTok
+ 1. Chép tam_INSTANT_POST.py + BENCH_CLICK_TIKTOK.bat (thư mục này) vào thư mục TAM của BẢN THỬ (không phải production).
+ 2. Tắt WS360/TAM đang dùng profile thử. Giữ cửa sổ profile giống lúc đăng thật (thu nhỏ/bị che nếu bình thường vẫn vậy).
+ 3. Nhấp đúp BENCH_CLICK_TIKTOK.bat → nhập Profile ID. Tool mở TAB MỚI, nạp trang GIẢ http://127.0.0.1:…, bấm thật vào trang
+    giả 40 lượt (driver/ws xen kẽ), đóng tab, tab TikTok cũ giữ nguyên.
+ 4. Gửi file tam_bench_click_<ngày giờ>.json + .md.
+
+DÙNG TRONG WS360 BẢN THỬ
+ - Mặc định đã là ws. Mỗi lần đăng có dòng:
+   ⏱️ [CLICK_PATH] ws | SÁNG→CLICK … ms (trong đó chờ hết bị che … ms) | READY→CLICK … | kiểm tra an toàn … | Chrome xác nhận nhấn …
+ - QUAY LẠI CÁCH CŨ ngay: config.json → "tam_click_path": "driver"   (hoặc biến môi trường TAM_CLICK_PATH=driver)
+ - Giữ "Chạy thử (KHÔNG bấm Post)" khi thử. Chỉ đăng thật khi bạn cho phép; chỉ tính thành công khi có POST_CONFIRMED.

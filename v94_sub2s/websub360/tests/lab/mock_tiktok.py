@@ -153,7 +153,9 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, b"{}")
         if u.path == "/post":
             with LOCK:
-                STATE.setdefault(q.get("id"), {})["posted"] = time.time() * 1000
+                st = STATE.setdefault(q.get("id"), {})
+                st["posted"] = time.time() * 1000
+                st["post_count"] = st.get("post_count", 0) + 1          # >1 = ĐĂNG TRÙNG
             return self._send(200, b"{}")
         self._send(404)
 
