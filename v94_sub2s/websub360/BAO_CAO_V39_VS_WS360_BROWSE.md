@@ -89,7 +89,7 @@ production, Excel, TAM/TikTok: **không sửa**. Chưa có video mới THẬT n�
 - Video thiếu chữ tuổi ở lượt đầu: không bị mất, được bắt ở lượt có chữ tuổi (log ghi "sau khi xét lại").
 - Kiểm tra tuổi bằng giờ đăng chính xác cộng header Date: sai số đồng hồ ≤ 1 s.
 - `--browse-compare` tính đúng Δ = +350 ms trên ledger V39 dựng sẵn.
-- Bộ test Browse: **20/20 PASS**. Toàn bộ test: xem mục 7.
+- Bộ test Browse: **20/20 PASS**. Toàn bộ: **158/158 PASS**.
 
 ## 6. Cách so sánh thật trên VPS (cùng video, cùng kênh, cùng lúc)
 1. **V39**, ở thư mục riêng (ví dụ `C:\V39_SO_SANH`):
@@ -110,4 +110,4 @@ production, Excel, TAM/TikTok: **không sửa**. Chưa có video mới THẬT n�
 
 ## 7. Bộ test
 - Browse: 20/20 PASS.
-- Toàn bộ: xem kết quả trong commit kèm theo.
+- Toàn bộ: **158/158 PASS** (181 s), gồm test tải / Excel / TAM / TikTok cũ. Các phần đó không đổi.
