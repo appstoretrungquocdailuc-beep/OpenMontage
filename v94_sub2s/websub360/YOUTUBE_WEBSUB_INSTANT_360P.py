@@ -4405,6 +4405,10 @@ def main(argv=None):
         e = Engine(cfg, base, log)
         if cfg.get("tiktok_enabled"):
             attach_tiktok(e, cfg, log)
+            log("🎬 Không giao diện: TỰ ĐĂNG TIKTOK BẬT" + (" — CHẠY THỬ (không bấm Post)" if cfg.get("tiktok_dry_run") else " — ĐĂNG THẬT"))
+        else:
+            log("ℹ️ Không giao diện: tự đăng TikTok đang TẮT → chỉ quét + tải + ghi Excel. Muốn đăng: chạy bản *_TIKTOK.bat "
+                "(hoặc thêm --integrated, hoặc đặt \"tiktok_enabled\": true trong config.json)")
         e.start()
         if getattr(e, "bridge", None) is not None:
             threading.Thread(target=_bridge_start_safe, args=(e, log), daemon=True, name="TT-START").start()

@@ -14,6 +14,8 @@ CÁC CHẾ ĐỘ PHÁT HIỆN (ô "Nguồn phát hiện" trên giao diện, ho�
       Tick "kèm WebSub" để thêm WebSub làm nguồn thứ 3 (cần ngrok). Quota API quản lý như trước.
   BROWSE ONLY (BROWSE_ONLY) — chỉ Browse. KHÔNG gọi YouTube Data API (kể cả để xác minh), KHÔNG cần api_keys.txt,
       KHÔNG cần WebSub/ngrok. Chạy 24/7: START_BROWSE_ONLY_24_7.bat (không giao diện, tự chạy lại nếu thoát).
+      ⚠️ START_BROWSE_ONLY_24_7.bat chỉ QUÉT + TẢI + GHI EXCEL, KHÔNG đăng TikTok (ô "Tự đăng TikTok" trên giao diện không lưu
+      vào config.json). Muốn 24/7 có đăng TikTok: START_BROWSE_ONLY_24_7_TIKTOK.bat (ĐĂNG THẬT; thêm --dry-run-post để chạy thử).
 
 BROWSE QUÉT GÌ (lấy từ V39)
   PRIMARY  BROWSE_UPLOADS   (danh sách Uploads của kênh) — mục tiêu 0,75 s/kênh  ("browse_uploads_period_sec")
