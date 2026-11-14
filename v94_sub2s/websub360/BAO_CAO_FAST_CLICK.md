@@ -46,7 +46,7 @@ Không dùng. Sự kiện do JavaScript tạo có `isTrusted=false`:
 
 Đường ws đạt ~2–3 ms từ READY tới lúc trang nhận nhấn **thật** (trusted). Nhanh hơn nữa không đáng đổi lấy rủi ro.
 
-## 3. An toàn — có test trên Chromium thật (`tests/test_fast_click_lab.py`, 9/9 PASS)
+## 3. An toàn — có test trên Chromium thật (`tests/test_fast_click_lab.py`, 9/9 PASS; toàn bộ bộ test 167/167 PASS)
 | Yêu cầu | Kết quả |
 |---|---|
 | Không bấm khi nút tắt / bị che | lớp che 900 ms: bấm **sau** khi hết che (≤ 150 ms), không bấm lúc che |
