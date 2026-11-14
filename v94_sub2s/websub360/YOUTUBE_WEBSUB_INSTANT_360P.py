@@ -2747,6 +2747,17 @@ class Engine:
 
 
 # =============================== TÍCH HỢP TIKTOK (TAM) =============================== #
+def _bridge_start_safe(e, log):
+    """Khởi động phần đăng TikTok; lỗi (thiếu file TAM, Genlogin…) báo RÕ trong log giao diện, WS360 vẫn chạy."""
+    try:
+        e.bridge.start()
+    except FileNotFoundError as ex:
+        log(f"❌ TikTok KHÔNG chạy: {ex}. Chép tam_INSTANT_POST.py + Genlogin.py + chromedriver.exe vào thư mục tool, HOẶC sửa "
+            f"\"tam_path\" trong config.json trỏ tới file TAM (dùng dấu \\\\ đôi). Quét + tải vẫn chạy bình thường.")
+    except Exception as ex:  # noqa: BLE001
+        log(f"❌ TikTok KHÔNG chạy: {type(ex).__name__}: {ex} — quét + tải vẫn chạy bình thường.")
+
+
 def attach_tiktok(engine, cfg, log, tam=None):
     """Gắn cầu nối TAM vào engine: DOWNLOAD_DONE → job TikTok đúng profile. Gọi TRƯỚC engine.start()."""
     sys.path.insert(0, str(BASE_DIR))
@@ -2930,7 +2941,7 @@ def run_gui(cfg, base):
             try:
                 e.start()
                 if getattr(e, "bridge", None) is not None:
-                    threading.Thread(target=e.bridge.start, daemon=True, name="TT-START").start()   # không chặn WebSub
+                    threading.Thread(target=_bridge_start_safe, args=(e, log), daemon=True, name="TT-START").start()   # không chặn WebSub
                 br.started.emit()
             except Exception as ex:  # noqa: BLE001 — báo lỗi lên cửa sổ log, không im lặng
                 log(f"❌ KHÔNG khởi động được: {type(ex).__name__}: {ex}")
@@ -4286,7 +4297,7 @@ def main(argv=None):
             attach_tiktok(e, cfg, log)
         e.start()
         if getattr(e, "bridge", None) is not None:
-            threading.Thread(target=e.bridge.start, daemon=True, name="TT-START").start()
+            threading.Thread(target=_bridge_start_safe, args=(e, log), daemon=True, name="TT-START").start()
         try:
             while True:
                 time.sleep(1)
