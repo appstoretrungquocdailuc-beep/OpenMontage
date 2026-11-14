@@ -37,7 +37,7 @@ body{font-family:sans-serif;margin:0} #panel div{padding:2px;border-bottom:1px s
 <script>
 const Q = new URLSearchParams(location.search);
 const CFG = {nodes: +(Q.get('nodes') || 60), rerenderBtn: Q.get('rbtn') === '1', cover: Q.get('cover') === '1', chunk: 512 * 1024,
-             coverHold: +(Q.get('coverhold') || 0)};
+             coverHold: +(Q.get('coverhold') || 0), up: Q.get('up') || ''};      // up = origin máy chủ upload khác (vd qua proxy trễ)
 const M = window.__mock = {marks: {}, long: [], chunks: 0, renders: 0, id: null};
 const E = () => performance.timeOrigin + performance.now();
 try { new PerformanceObserver(l => l.getEntries().forEach(e => M.long.push([performance.timeOrigin + e.startTime, e.duration]))).observe({type: 'longtask'}); } catch (e) {}
@@ -73,7 +73,7 @@ async function upload(file) {
   const n = Math.ceil(file.size / CFG.chunk);
   for (let i = 0; i < n; i++) {
     const b = file.slice(i * CFG.chunk, Math.min(file.size, (i + 1) * CFG.chunk));
-    const r = await fetch('/chunk?id=' + M.id + '&i=' + i + '&n=' + n, {method: 'POST', body: b});
+    const r = await fetch(CFG.up + '/chunk?id=' + M.id + '&i=' + i + '&n=' + n + '&X-Sig=SECRETSIG' + M.id, {method: 'POST', body: b});
     await r.text();
     M.chunks++; progress = (i + 1) / n;
   }
@@ -94,6 +94,7 @@ async function upload(file) {
   renderBtn(true);
   M.marks.enabled = E();
 }
+document.cookie = 'sessionid=COOKIESECRET123; path=/';
 document.getElementById('f').addEventListener('change', e => { if (e.target.files.length) upload(e.target.files[0]); });
 </script></body></html>"""
 
@@ -106,6 +107,7 @@ class H(BaseHTTPRequestHandler):
 
     def _send(self, code, body=b"", ctype="application/json"):
         self.send_response(code)
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()

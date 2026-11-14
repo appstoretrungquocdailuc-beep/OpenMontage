@@ -54,7 +54,7 @@ from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 BACKEND_NAME = "tam_INSTANT_POST"
-BACKEND_VERSION = "5.4.0-TEST-FASTCLICK"
+BACKEND_VERSION = "5.5.0-TEST-NET"
 BACKEND_API_LEVEL = 5          # GUI bắt buộc khớp số này (chống GUI mới chạy backend cũ)
 
 
@@ -215,6 +215,11 @@ class _Cfg:
         # ĐƯỜNG BẤM POST: ws (mặc định bản TEST) = chờ nút Post bằng 1 promise CDP KHÔNG đứt quãng qua WebSocket CDP riêng tới ĐÚNG tab
         # của driver, nút sáng là bấm ngay (nhấn/thả gửi liền, không qua chromedriver) | driver = như 5.3.0 (rollback)
         self.click_path = _env_str("TAM_CLICK_PATH", "ws").lower()
+        # ĐO MẠNG UPLOAD bằng CDP (kết nối WebSocket RIÊNG + luồng riêng, KHÔNG nằm trên đường bấm; không ghi cookie/header/body)
+        self.net_trace = _env_flag("TAM_NET_TRACE", True)
+        # TỐI ƯU (A/B): mở sẵn kết nối TCP+TLS (qua proxy) tới máy chủ upload TikTok đã học được, trước khi gắn file
+        self.upload_preconnect = _env_flag("TAM_UPLOAD_PRECONNECT", True)
+        self.upload_hosts_file = _env_str("TAM_UPLOAD_HOSTS_FILE", os.path.join(BASE_DIR, "tam_upload_hosts.json"))
         self.upload_url_path = _env_str("TAM_UPLOAD_URL_PATH", "")           # rỗng => lấy path của TARGET_UPLOAD_URL
         self.bring_to_front = _env_flag("TAM_BRING_TO_FRONT", False)         # CDP Page.bringToFront trước khi upload (A/B tab nền); mặc định TẮT
         self.perf_enable = _env_flag("TAM_PERF", True)
@@ -2535,6 +2540,342 @@ def ws_wait_and_fire(fc: "CdpWs", kill: Callable[[], bool], timeout_s: float, do
         return out
 
 
+
+# ======================================================================================
+# ĐO MẠNG UPLOAD (CDP Network, kết nối RIÊNG) + PRECONNECT máy chủ upload
+#  * Chỉ ghi: phương thức, host + path ĐÃ CHE (bỏ query, che đoạn dài/giống mã), mốc thời gian, mã HTTP, lỗi.
+#    KHÔNG ghi cookie, header, body (Network.enable maxPostDataSize=0 → Chrome không gửi body qua CDP).
+#  * Thời điểm gửi HẾT body: CDP không báo chính xác (sendEnd của Chrome = đã ghi vào socket/tunnel proxy, KHÔNG phải TikTok đã
+#    nhận) → BODY_SENT luôn = UNKNOWN. Upload mạng = request upload ĐẦU bắt đầu → phản hồi request upload CUỐI xong.
+#    TikTok xử lý (quan sát được) = phản hồi upload cuối → nút Post sáng.
+# ======================================================================================
+_HOST_OK = re.compile(r"(http://)?[a-z0-9.\-]{3,120}(:\d{2,5})?")
+UPLOAD_HINT_RE = re.compile(r"(upload|/vod|chunk|/part|partnumber|uploadid|tos-|/video/)", re.I)
+
+
+def _redact_url(u: str) -> Tuple[str, str]:
+    """(host, host+path đã che). Bỏ query/fragment; đoạn path dài ≥ 16 ký tự hoặc nhiều chữ số/giống mã → '*'."""
+    try:
+        pu = urllib.parse.urlsplit(str(u or ""))
+    except Exception:
+        return "", ""
+    host = (pu.netloc.split("@")[-1] or "").lower()               # không bao giờ giữ user:pass
+    if pu.scheme == "http":
+        host = "http://" + host                                     # (chỉ gặp ở lab; TikTok dùng https)
+    segs = []
+    for seg in (pu.path or "").split("/")[:6]:
+        if not seg:
+            continue
+        if len(seg) >= 16 or sum(ch.isdigit() for ch in seg) >= 5 or re.fullmatch(r"[0-9a-fA-F\-_=]{8,}", seg):
+            seg = "*"
+        segs.append(seg[:24])
+    return host, (host.replace("http://", "") + "/" + "/".join(segs))[:120]
+
+
+def _tab_ws_url(driver) -> str:
+    """ws://…/devtools/page/<targetId> của ĐÚNG tab driver đang điều khiển (cache trên driver)."""
+    fc = getattr(driver, "_tam_fc", None)
+    if fc is not None and getattr(fc, "url", None):
+        return fc.url
+    cached = getattr(driver, "_tam_tab_ws", "")
+    addr = _driver_debugger_address(driver)
+    if not addr:
+        return ""
+    try:
+        info = (driver.execute_cdp_cmd("Target.getTargetInfo", {}) or {}).get("targetInfo") or {}
+        tid = str(info.get("targetId") or "")
+    except Exception:
+        return cached
+    url = f"ws://{addr}/devtools/page/{tid}" if tid else ""
+    try:
+        driver._tam_tab_ws = url
+    except Exception:
+        pass
+    return url
+
+
+class NetRecorder(object):
+    """Luồng nền đọc sự kiện Network (trang + worker) qua 1 WebSocket CDP RIÊNG. Không gửi lệnh nào làm đổi hành vi trang."""
+
+    KEEP = 400
+
+    def __init__(self, url: str):
+        self.url = url
+        self.c = None
+        self.reqs = collections.OrderedDict()    # (sid, requestId) → dict
+        self.marks = {}                          # tên → epoch s (phía Python)
+        self.t_origin = None                     # performance.timeOrigin của tài liệu trang upload (ms epoch)
+        self.stop_ev = threading.Event()
+        self.th = None
+        self.err = None
+        self.workers = 0
+        self._n = 1000000
+
+    def _send(self, method, params=None, sid=None):
+        self._n += 1
+        m = {"id": self._n, "method": method, "params": params or {}}
+        if sid:
+            m["sessionId"] = sid
+        self.c.ws.send(json.dumps(m))
+
+    def start(self) -> bool:
+        try:
+            tid = self.url.rsplit("/", 1)[-1]
+            self.c = CdpWs(self.url, tid)
+            self.c.call("Network.enable", {"maxPostDataSize": 0, "maxTotalBufferSize": 1000000, "maxResourceBufferSize": 100000})
+            r = self.c.call("Runtime.evaluate", {"expression": "performance.timeOrigin", "returnByValue": True})
+            self.t_origin = float(((r.get("result") or {}).get("value")) or 0) or None
+            self.c.call("Target.setAutoAttach", {"autoAttach": True, "waitForDebuggerOnStart": False, "flatten": True})
+        except Exception as e:
+            self.err = _exc_text(e)[:120]
+            self.close()
+            return False
+        self.th = threading.Thread(target=self._loop, daemon=True, name="TAM-NET")
+        self.th.start()
+        return True
+
+    def mark(self, name: str):
+        self.marks.setdefault(name, time.time())
+
+    def _loop(self):
+        ws = self.c.ws
+        ws.settimeout(0.2)
+        while not self.stop_ev.is_set():
+            try:
+                raw = ws.recv()
+            except self.c._wsmod.WebSocketTimeoutException:
+                continue
+            except Exception:
+                return
+            try:
+                m = json.loads(raw)
+                self._handle(m.get("method"), m.get("params") or {}, m.get("sessionId"))
+            except Exception:
+                continue
+
+    def _handle(self, meth, p, sid):
+        if not meth:
+            return
+        if meth == "Target.attachedToTarget":
+            ti = p.get("targetInfo") or {}
+            if ti.get("type") in ("worker", "shared_worker", "service_worker") and p.get("sessionId"):
+                self.workers += 1
+                try:
+                    self._send("Network.enable", {"maxPostDataSize": 0}, p["sessionId"])
+                except Exception:
+                    pass
+            return
+        if meth == "Network.requestWillBeSent":
+            rq = p.get("request") or {}
+            mth = str(rq.get("method") or "")
+            if mth not in ("POST", "PUT", "PATCH"):
+                return
+            host, red = _redact_url(rq.get("url"))
+            self.reqs[(sid, p.get("requestId"))] = {"m": mth, "host": host, "u": red, "ts": p.get("timestamp"),
+                                                    "wall": p.get("wallTime"), "post": bool(rq.get("hasPostData")),
+                                                    "w": bool(sid)}
+            while len(self.reqs) > self.KEEP:
+                self.reqs.popitem(last=False)
+            return
+        r = self.reqs.get((sid, p.get("requestId")))
+        if r is None:
+            return
+        if meth == "Network.responseReceived":
+            rs = p.get("response") or {}
+            t = rs.get("timing") or {}
+            r.update(status=rs.get("status"), proto=rs.get("protocol"), reused=rs.get("connectionReused"), resp_ts=p.get("timestamp"),
+                     timing={k: t.get(k) for k in ("requestTime", "proxyStart", "proxyEnd", "dnsStart", "dnsEnd", "connectStart",
+                                                    "connectEnd", "sslStart", "sslEnd", "sendStart", "sendEnd", "receiveHeadersEnd")})
+        elif meth == "Network.loadingFinished":
+            r.update(end_ts=p.get("timestamp"), ok=True)
+        elif meth == "Network.loadingFailed":
+            r.update(end_ts=p.get("timestamp"), ok=False, error=str(p.get("errorText") or "")[:60], canceled=bool(p.get("canceled")))
+
+    def close(self):
+        self.stop_ev.set()
+        if self.c is not None:
+            self.c.close()
+        if self.th is not None:
+            self.th.join(timeout=1.0)
+
+    # ---- tổng hợp ----
+    def _off(self):
+        offs = [r["wall"] - r["ts"] for r in self.reqs.values() if r.get("wall") and r.get("ts")]
+        return statistics.median(offs) if offs else None
+
+    def summary(self, ready_epoch: Optional[float], click_epoch: Optional[float], confirm_epoch: Optional[float]) -> Dict[str, Any]:
+        off = self._off()
+        ep = lambda ts: None if ts is None or off is None else ts + off
+        att = self.marks.get("attach")
+        f1 = lambda a, b: None if a is None or b is None else round((b - a) * 1000.0, 1)
+        rx = None
+        if CFG.upload_url_re:
+            try:
+                rx = re.compile(CFG.upload_url_re, re.I)
+            except re.error:
+                rx = None
+        lim_hi = ready_epoch if ready_epoch is not None else (click_epoch or float("inf"))
+        win = [r for r in self.reqs.values() if att is not None and ep(r.get("ts")) is not None and att - 0.5 <= ep(r["ts"]) <= lim_hi]
+        up = [r for r in win if (rx.search(r["u"]) if rx is not None else (r["post"] and UPLOAD_HINT_RE.search(r["u"])))]
+        out = {"net_body_sent": "UNKNOWN", "net_workers": self.workers, "net_upload_reqs": len(up),
+               "net_upload_failed": sum(1 for r in up if r.get("ok") is False),
+               "net_hosts": sorted({r["host"] for r in up})[:6]}
+        pats = collections.Counter(r["m"] + " " + r["u"] for r in win)
+        out["net_posts_top"] = [f"{k} ×{v}" for k, v in pats.most_common(6)]
+        if up:
+            first = min(up, key=lambda r: r["ts"])
+            ends = [ep(r["end_ts"]) for r in up if r.get("end_ts") is not None]
+            last_end = max(ends) if ends else None
+            t = first.get("timing") or {}
+            ms_ = lambda a, b: None if a is None or b is None or a < 0 or b < 0 else round(b - a, 1)
+            out.update(net_attach_to_upload_start_ms=f1(att, ep(first["ts"])),
+                       net_upload_span_ms=f1(ep(first["ts"]), last_end),
+                       net_attach_to_upload_done_ms=f1(att, last_end),
+                       net_processing_ms=f1(last_end, ready_epoch),
+                       net_first_conn_new=(t.get("connectStart") is not None and t.get("connectStart") >= 0),
+                       net_first_proxy_ms=ms_(t.get("proxyStart"), t.get("proxyEnd")),
+                       net_first_connect_ms=ms_(t.get("connectStart"), t.get("connectEnd")),
+                       net_first_ssl_ms=ms_(t.get("sslStart"), t.get("sslEnd")),
+                       net_first_chrome_send_ms=ms_(t.get("sendStart"), t.get("sendEnd")),
+                       net_first_wait_ms=ms_(t.get("sendEnd"), t.get("receiveHeadersEnd")),
+                       net_new_conns=sum(1 for r in up if ((r.get("timing") or {}).get("connectStart") or -1) >= 0),
+                       net_upload_proto=first.get("proto"))
+        if click_epoch is not None:
+            aft = [r for r in self.reqs.values() if ep(r.get("ts")) is not None and ep(r["ts"]) >= click_epoch - 0.05 and r not in up]
+            if aft:
+                pr = min(aft, key=lambda r: r["ts"])
+                out.update(net_publish_req=pr["m"] + " " + pr["u"], net_click_to_publish_resp_ms=f1(click_epoch, ep(pr.get("resp_ts"))),
+                           net_publish_status=pr.get("status"))
+            out["net_click_to_confirm_ms"] = f1(click_epoch, confirm_epoch)
+        return out
+
+
+def _load_upload_hosts() -> List[str]:
+    try:
+        with open(CFG.upload_hosts_file, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return [h for h in (d.get("hosts") or []) if _HOST_OK.fullmatch(str(h))][:8]
+    except Exception:
+        return []
+
+
+def _learn_upload_hosts(hosts: List[str]):
+    """Ghi lại máy chủ upload THẬT đã thấy (chỉ tên máy chủ, không path/query) → lần sau preconnect."""
+    hosts = [h for h in hosts if _HOST_OK.fullmatch(str(h)) and "." in h]
+    if not hosts:
+        return
+    old = _load_upload_hosts()
+    new = list(dict.fromkeys(hosts + old))[:8]
+    if new == old:
+        return
+    try:
+        tmp = CFG.upload_hosts_file + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"hosts": new, "updated": datetime.datetime.now().isoformat(timespec="seconds")}, f)
+        os.replace(tmp, CFG.upload_hosts_file)
+    except Exception:
+        pass
+
+
+JS_PRECONNECT = r"""(function (hosts) {
+  const head = document.head || document.documentElement; let n = 0;
+  // thẻ cũ (lần trước) → xoá rồi thêm lại: thẻ MỚI mới khiến Chrome mở lại kết nối nếu kết nối cũ đã bị đóng
+  document.querySelectorAll('link[data-tam-pc]').forEach(function (x) { x.remove(); });
+  for (let i = 0; i < hosts.length; i++) {
+    const href = hosts[i].indexOf('://') > 0 ? hosts[i] : 'https://' + hosts[i];
+    for (const co of [null, 'anonymous']) {
+      const l = document.createElement('link'); l.rel = 'preconnect'; l.href = href; if (co) l.crossOrigin = co;
+      l.setAttribute('data-tam-pc', hosts[i] + '|' + co); head.appendChild(l); n++;
+    }
+  }
+  return n;
+})(%s)"""
+
+
+def preconnect_upload_hosts(driver=None, fc: Optional["CdpWs"] = None, ws_url: str = "") -> Tuple[int, str]:
+    """Mở sẵn TCP+TLS (qua proxy của profile) tới máy chủ upload đã học. Không đổi gì khác trên trang (chỉ thêm thẻ <link
+    rel=preconnect>). Dùng WebSocket CDP (không qua chromedriver) khi có. Trả (số thẻ mới, ghi chú)."""
+    if not CFG.upload_preconnect:
+        return 0, "tắt (TAM_UPLOAD_PRECONNECT=0)"
+    hosts = _load_upload_hosts()
+    if not hosts:
+        return 0, "chưa học được máy chủ upload (sẽ học sau lần upload đầu)"
+    expr = JS_PRECONNECT % json.dumps(hosts)
+    own = None
+    try:
+        if fc is None and ws_url:
+            own = fc = CdpWs(ws_url, ws_url.rsplit("/", 1)[-1])
+        if fc is not None:
+            r = fc.call("Runtime.evaluate", {"expression": expr, "returnByValue": True}, timeout=2.0)
+            n = int(((r.get("result") or {}).get("value")) or 0)
+        elif driver is not None:
+            n = int(driver.execute_script("return " + expr) or 0)
+        else:
+            return 0, "không có kết nối tới tab"
+        return n, ",".join(hosts)
+    except Exception as e:
+        return 0, f"lỗi: {_exc_text(e)[:80]}"
+    finally:
+        if own is not None:
+            own.close()
+
+
+def prewarm_upload_connections(driver) -> Tuple[int, str]:
+    """Gọi từ WS360 ngay khi PHÁT HIỆN video mới (lúc đang tải YouTube, ~1–2 s trước khi gắn file). Kết nối WebSocket MỚI, ngắn hạn
+    (không dùng chromedriver → không tranh lệnh với luồng đăng). Chỉ chạy khi đã biết địa chỉ tab (sau lần đăng/mở đầu)."""
+    url = getattr(driver, "_tam_tab_ws", "") or getattr(getattr(driver, "_tam_fc", None), "url", "")
+    if not url:
+        return 0, "chưa biết địa chỉ tab (cần 1 lần mở/đăng trước)"
+    return preconnect_upload_hosts(ws_url=url)
+
+
+def remember_tab(driver) -> str:
+    """Ghi nhớ ws URL của tab (gọi ở luồng đang giữ driver, vd lúc mở profile)."""
+    return _tab_ws_url(driver)
+
+
+def _page_epoch(trace: PerfTrace, name: str, t_origin: Optional[float], py_off: float) -> Optional[float]:
+    m = trace.marks.get(name)
+    if m is None:
+        return None
+    if m.chrome_ms is not None and t_origin:
+        return (t_origin + float(m.chrome_ms)) / 1000.0
+    if m.py_ns is not None:
+        return py_off + m.py_ns / 1e9
+    return None
+
+
+def _finish_net(ctx: "_Ctx", trace: PerfTrace, log):
+    rec = ctx.net
+    if rec is None:
+        return
+    try:
+        time.sleep(0.15)                                           # nhận nốt sự kiện cuối (sau khi đã có kết quả, ngoài đường bấm)
+        py_off = time.time() - time.perf_counter()
+        ready = _page_epoch(trace, "PROCESSING_READY", rec.t_origin, py_off)
+        click = _page_epoch(trace, "POST_CLICKED", rec.t_origin, py_off)
+        conf = _page_epoch(trace, "POST_CONFIRMED", rec.t_origin, py_off)
+        sm = rec.summary(ready, click, conf)
+        for k, v in sm.items():
+            trace.set(k, v)
+        if sm.get("net_hosts"):
+            _learn_upload_hosts(sm["net_hosts"])
+        g = lambda k: "-" if sm.get(k) is None else sm.get(k)
+        conn = ("MỚI (proxy " + str(g("net_first_proxy_ms")) + " | TCP " + str(g("net_first_connect_ms")) + " | TLS "
+                + str(g("net_first_ssl_ms")) + " ms)") if sm.get("net_first_conn_new") else "dùng lại kết nối có sẵn"
+        log(f"🌐 [UPLOAD_NET] gắn file→request upload đầu {g('net_attach_to_upload_start_ms')} ms | upload mạng (request đầu→phản hồi "
+            f"cuối) {g('net_upload_span_ms')} ms, {sm.get('net_upload_reqs')} request, lỗi {sm.get('net_upload_failed')} | kết nối đầu: "
+            f"{conn} | gửi HẾT body: UNKNOWN | upload xong→nút Post sáng (TikTok xử lý) {g('net_processing_ms')} ms | "
+            f"click→phản hồi API đăng {g('net_click_to_publish_resp_ms')} ms | máy chủ {','.join(sm.get('net_hosts') or []) or '?'}"
+            + ("" if sm.get("net_upload_reqs") else f" | KHÔNG nhận ra request upload; POST thấy: {'; '.join(sm.get('net_posts_top') or []) or 'không có'}"
+               " (đặt TAM_UPLOAD_URL_RE nếu cần)"))
+    except Exception as e:
+        trace.set("net_error", _exc_text(e)[:120])
+    finally:
+        rec.close()
+        ctx.net = None
+
+
 def payload_landed(p: Optional[Dict[str, Any]]) -> bool:
     """Có BẤT KỲ sự kiện chuột nào đã tới nút (xuống/lên/click) mà bảo vệ không chặn => coi là ĐÃ bấm, không bao giờ bấm lại.
     (Sự kiện bị chặn nằm ở `blocked`, không nằm ở `ev`; up/click mồ côi sau một lần nhấn bị chặn cũng bị chặn.)"""
@@ -2653,7 +2994,7 @@ def await_confirm(driver, kill: Callable[[], bool], pre_url: str, first: Optiona
 # ======================================================================================
 class _Ctx:
     """Trạng thái dùng chung giữa phần lõi và phần xử lý lỗi (để biết lỗi xảy ra TRƯỚC hay SAU khi bấm)."""
-    __slots__ = ("maybe_clicked", "clicked", "nav", "t_attached", "t_start", "dry_run")
+    __slots__ = ("maybe_clicked", "clicked", "nav", "t_attached", "t_start", "dry_run", "net")
 
     def __init__(self):
         self.maybe_clicked = False     # đã phát lệnh click nhưng chưa biết có trúng nút không
@@ -2662,6 +3003,7 @@ class _Ctx:
         self.t_attached = None
         self.t_start = time.perf_counter()
         self.dry_run = False           # chỉ CLI --bench-upload: dừng ngay trước khi bấm Post
+        self.net = None                # NetRecorder (đo mạng upload, ngoài đường bấm)
 
 
 def _prepare_fsm(fsm: "ProfileFSM"):
@@ -2836,6 +3178,18 @@ def _upload_core(driver, paths: List[str], log, kill, pid: str, trace: PerfTrace
             trace.set("cdp_ws_rtt_ms", fc.rtt_ms)
     else:
         trace.set("click_path", "driver")
+    if CFG.net_trace and ctx.net is None:
+        url = fc.url if fc is not None else _tab_ws_url(driver)
+        if url:
+            rec_ = NetRecorder(url)
+            if rec_.start():
+                ctx.net = rec_
+            else:
+                trace.set("net_error", rec_.err)
+    if CFG.upload_preconnect:
+        n_pc, why_pc = preconnect_upload_hosts(driver, fc)
+        trace.set("preconnect", n_pc)
+        trace.set("preconnect_note", why_pc[:120])
     if info.get("reErr"):
         log(f"⚠️ [Confirm] Regex xác nhận không hợp lệ cho JavaScript: {info['reErr']}")
 
@@ -2848,6 +3202,8 @@ def _upload_core(driver, paths: List[str], log, kill, pid: str, trace: PerfTrace
     # --- 3) gắn file ---
     fsm.to(PState.ATTACHING, "send_keys")
     trace.mark("SEND_KEYS_START")
+    if ctx.net is not None:
+        ctx.net.mark("attach")
     _send_keys_with_refind(driver, el, "\n".join(paths))
     trace.mark("SEND_KEYS_END")
     ctx.t_attached = time.perf_counter()
@@ -3206,6 +3562,7 @@ def upload_video_to_tiktok_ex(driver, video_paths, logger_func=None, check_force
     finally:
         if result is None:                 # BaseException (Ctrl+C...) — vẫn dọn
             result = UploadResult(S.UNKNOWN if (ctx.maybe_clicked or ctx.clicked) else S.FAILED_SAFE, "bị ngắt", ctx.clicked, "", trace, paths)
+        _finish_net(ctx, trace, log)       # sau khi đã có kết quả: không ảnh hưởng đường bấm
         trace.outcome = result.status.value
         trace.set("reason", result.reason)
         if hooks is not None and hooks.after_result is not None:
@@ -5449,6 +5806,146 @@ def cli_bench_watch(pid: str, files: List[str], repeat: int, yes: bool, keep_ope
 
 
 # ======================================================================================
+# NET BENCHMARK (TEST ONLY, DRY-RUN trên TikTok THẬT) — A/B 'base' (như cũ) vs 'pre' (mở sẵn kết nối upload lúc "phát hiện video")
+#  * Mỗi lượt: nạp trang Upload sạch → chờ idle_s (kết nối cũ tự đóng, giống khoảng cách giữa 2 video thật) → [pre: preconnect]
+#    → chờ lead_s (≈ thời gian tải YouTube) → gắn file → chờ nút Post sáng → DỪNG, KHÔNG bấm (2 lớp: dry_run + hook chặn).
+#  * Ghi mốc mạng CDP (NetRecorder) cho CẢ hai nhánh như nhau. Xuất CSV từng lượt + CSV tóm tắt (median, P90, tỷ lệ lỗi).
+# ======================================================================================
+NET_BENCH_KEYS = ("post_ready_ms", "net_attach_to_upload_start_ms", "net_upload_span_ms", "net_attach_to_upload_done_ms",
+                  "net_processing_ms", "net_first_connect_ms", "net_first_ssl_ms", "net_first_proxy_ms")
+
+
+def _write_summary_csv(path: str, groups: Dict[str, List[Dict[str, Any]]], keys=NET_BENCH_KEYS, ok_key: str = "result",
+                       ok_val: str = "OK"):
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["variant", "runs", "ok", "error_rate_pct"] + [f"{k}_{s_}" for k in keys for s_ in ("median", "p90")])
+        for g, rs in groups.items():
+            ok = [r for r in rs if r.get(ok_key) == ok_val]
+            row = [g, len(rs), len(ok), round(100.0 * (len(rs) - len(ok)) / len(rs), 1) if rs else None]
+            for k in keys:
+                pl = _pct_list([r.get(k) for r in ok if isinstance(r.get(k), (int, float))])
+                row += [pl.get("median"), pl.get("p90")]
+            w.writerow(row)
+
+
+def cli_bench_net(pid: str, file: str, repeat: int, yes: bool, keep_open: bool, idle_s: float = 30.0, lead_s: float = 1.5,
+                  variants: str = "base,pre") -> int:
+    vs = [v for v in (x.strip().lower() for x in str(variants).split(",")) if v in ("base", "pre")] or ["base", "pre"]
+    file = os.path.abspath(file)
+    if not os.path.isfile(file):
+        print(f"Không thấy file: {file}")
+        return 2
+    print(f"BENCH NET (DRY-RUN, TikTok thật, KHÔNG bấm Post): profile {pid} | {repeat} vòng × {'/'.join(vs)} (A-B-B-A) | "
+          f"rảnh {idle_s:g} s trước mỗi lượt | preconnect trước khi gắn {lead_s:g} s.")
+    if not yes and input("Tiếp tục? [y/N] ").strip().lower() not in ("y", "yes"):
+        print("Đã huỷ.")
+        return 1
+    drv = _open_one(pid)
+    if drv is None:
+        return 3
+    saved = (CFG.upload_preconnect, CFG.net_trace)
+    rows = []       # type: List[Dict[str, Any]]
+    size = (stat_file(file) or (0, 0))[0]
+    try:
+        CFG.net_trace = True
+        remember_tab(drv)
+        plan = []
+        if not _load_upload_hosts():
+            plan.append(("learn", 0))                            # 1 lượt học máy chủ upload (KHÔNG tính vào kết quả)
+        for r in range(max(1, repeat)):
+            order = vs if r % 2 == 0 else vs[::-1]
+            plan += [(v, r + 1) for v in order]
+        for v, rnd in plan:
+            fsm = get_fsm(pid)
+            fsm.dirty = True
+            prepare_upload_page(drv, lambda *_: None, None, fsm)
+            time.sleep(max(0.0, idle_s))
+            CFG.upload_preconnect = (v == "pre")
+            pre_n, pre_why = (0, "")
+            if v == "pre":
+                pre_n, pre_why = prewarm_upload_connections(drv)
+            time.sleep(max(0.0, lead_s))
+            tr = PerfTrace(label=f"net-{v}#{rnd}", profile=pid, mode="BENCH-NET", n_files=1, n_bytes=size)
+            tr.mark_unknown("FILE_READY", "bench")
+            staged, tmp, _info = stage_files([file], "benchnet", tr)
+            try:
+                res = upload_video_to_tiktok_ex(drv, staged, logger_func=lambda *_: None, pid=pid, mode="BENCH-NET", trace=tr,
+                                                hooks=JobHooks(before_click=lambda: False), dry_run=True)
+            finally:
+                cleanup_stage_dir(tmp)
+            fl = tr.flags
+
+            def d(a, b):
+                ma, mb = tr.marks.get(a), tr.marks.get(b)
+                pa, pb = getattr(ma, "py_ns", None), getattr(mb, "py_ns", None)
+                return None if pa is None or pb is None else round((pb - pa) / 1e6, 1)
+            row = {"variant": v, "round": rnd, "result": "OK" if res.status == PostStatus.DRY_RUN else res.status.value,
+                   "reason": "" if res.status == PostStatus.DRY_RUN else str(res.reason)[:120], "file_mb": round(size / 1e6, 2),
+                   "post_ready_ms": d("SEND_KEYS_END", "PROCESSING_READY"), "prewarm_tags": pre_n,
+                   "clicked": bool(res.clicked)}
+            for k in ("net_attach_to_upload_start_ms", "net_upload_span_ms", "net_attach_to_upload_done_ms", "net_processing_ms",
+                      "net_first_conn_new", "net_new_conns", "net_first_proxy_ms", "net_first_connect_ms", "net_first_ssl_ms",
+                      "net_first_chrome_send_ms", "net_first_wait_ms", "net_upload_reqs", "net_upload_failed", "net_upload_proto",
+                      "net_body_sent", "net_workers", "net_hosts", "net_posts_top", "net_error"):
+                row[k] = fl.get(k)
+            rows.append(row)
+            if CFG.perf_enable:
+                PERF_LOG.write(tr.record())
+            print(f"  {v:5} #{rnd}: {row['result']} | POST_READY {row['post_ready_ms']} ms | upload mạng {row['net_upload_span_ms']} ms | "
+                  f"gắn→upload xong {row['net_attach_to_upload_done_ms']} | TikTok xử lý {row['net_processing_ms']} | kết nối đầu "
+                  f"{'MỚI' if row['net_first_conn_new'] else 'dùng lại' if row['net_first_conn_new'] is False else '?'}"
+                  + (f" | preconnect: {pre_why}" if v == "pre" else "") + (f" | {row['reason']}" if row["reason"] else ""))
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = os.path.join(BASE_DIR, f"tam_bench_net_{stamp}")
+        meas = [x for x in rows if x["variant"] != "learn"]
+        keys = list(dict.fromkeys(k for x in rows for k in x))
+        with open(base + ".csv", "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=keys)
+            w.writeheader()
+            for x in rows:
+                w.writerow({k: (json.dumps(x[k], ensure_ascii=False) if isinstance(x.get(k), (list, dict)) else x.get(k)) for k in keys})
+        groups = {v: [x for x in meas if x["variant"] == v] for v in vs}
+        _write_summary_csv(base + "_summary.csv", groups)
+        md = [f"# TAM BENCH NET (DRY-RUN, không bấm Post) — {stamp} — profile {pid} — {BACKEND_VERSION}", "",
+              f"File {os.path.basename(file)} ({size / 1e6:.2f} MB) | rảnh {idle_s:g} s | preconnect trước gắn {lead_s:g} s", "",
+              "| Nhánh | lượt | OK | POST_READY P50 / P90 | upload mạng P50 | gắn→upload xong P50 / P90 | TikTok xử lý P50 | kết nối đầu MỚI |",
+              "|---|---|---|---|---|---|---|---|"]
+        for v, rs in groups.items():
+            ok = [x for x in rs if x["result"] == "OK"]
+            P = lambda k: _pct_list([x.get(k) for x in ok if isinstance(x.get(k), (int, float))])
+            md.append(f"| {v} | {len(rs)} | {len(ok)} | {P('post_ready_ms').get('median')} / {P('post_ready_ms').get('p90')} | "
+                      f"{P('net_upload_span_ms').get('median')} | {P('net_attach_to_upload_done_ms').get('median')} / "
+                      f"{P('net_attach_to_upload_done_ms').get('p90')} | {P('net_processing_ms').get('median')} | "
+                      f"{sum(1 for x in ok if x.get('net_first_conn_new'))}/{len(ok)} |")
+        verdict = "CHƯA KẾT LUẬN"
+        if len(vs) == 2:
+            for k in ("post_ready_ms", "net_attach_to_upload_done_ms"):
+                xa = [x[k] for x in groups["base"] if x["result"] == "OK" and isinstance(x.get(k), (int, float))]
+                xb = [x[k] for x in groups["pre"] if x["result"] == "OK" and isinstance(x.get(k), (int, float))]
+                if len(xa) >= 5 and len(xb) >= 5:
+                    dd, lo, hi = bootstrap_median_diff(xa, xb)
+                    pv = mann_whitney_p(xa, xb)
+                    good = hi < 0 and pv < 0.05
+                    line = (f"{k}: pre − base = {dd:+.0f} ms, KTC95% [{lo:+.0f}; {hi:+.0f}], p = {pv:.4f} → "
+                            + ("pre NHANH HƠN có ý nghĩa" if good else "pre CHẬM HƠN có ý nghĩa" if (lo > 0 and pv < 0.05) else "chưa khác biệt rõ"))
+                    md += ["", line]
+                    if k == "post_ready_ms":
+                        verdict = ("GIỮ preconnect" if good else "KHÔNG đủ bằng chứng → đặt TAM_UPLOAD_PRECONNECT=0 nếu muốn giữ như cũ")
+            md += ["", f"**Kết luận: {verdict}** (đo trên TikTok thật, DRY-RUN; upload mạng = request upload đầu → phản hồi cuối; "
+                   "gửi HẾT body = UNKNOWN; TikTok xử lý = phản hồi upload cuối → nút Post sáng)"]
+        with open(base + ".md", "w", encoding="utf-8") as f:
+            f.write("\n".join(md) + "\n")
+        with open(base + ".json", "w", encoding="utf-8") as f:
+            json.dump({"profile": pid, "rows": rows, "verdict": verdict, "backend": BACKEND_VERSION}, f, ensure_ascii=False, indent=1)
+        print("\n" + "\n".join(md) + f"\n\nĐã lưu: {base}.csv / _summary.csv / .md / .json")
+        return 0
+    finally:
+        CFG.upload_preconnect, CFG.net_trace = saved
+        _close_one(pid, drv, keep_open)
+
+
+# ======================================================================================
 # CLICK BENCHMARK (TEST ONLY) — độ trễ NÚT POST SÁNG → CLICK trên CHÍNH profile Genlogin / chromedriver / VPS của bạn,
 # nhưng bấm vào TRANG GIẢ chạy ở 127.0.0.1 trong một TAB MỚI. KHÔNG mở TikTok, KHÔNG đăng gì, KHÔNG đụng nhật ký đăng thật.
 #  * Đường cũ (driver: chờ theo lát + 3 lệnh CDP qua chromedriver) và đường mới (ws) xen kẽ A-B-B-A, cùng trang, cùng file.
@@ -5852,6 +6349,10 @@ class ProxyBench:
                "upload_transfer_ms": fl.get("x_net_span_ms"), "cpu_chrome_s": None, "cpu_python_s": None,
                "ram_chrome_mb": (snap.get("ram") or {}).get("chrome_mb"), "ram_python_mb": (snap.get("ram") or {}).get("python_mb"),
                "vis": fl.get("vis_ready"), "clicked": bool(res.clicked)}
+        for key_ in ("net_attach_to_upload_start_ms", "net_upload_span_ms", "net_attach_to_upload_done_ms", "net_processing_ms",
+                     "net_first_conn_new", "net_first_proxy_ms", "net_first_connect_ms", "net_first_ssl_ms", "net_upload_reqs",
+                     "net_upload_failed", "net_body_sent"):
+            row[key_] = fl.get(key_)
         for key in ("chrome", "python"):
             if c0.get(key) is not None and c1.get(key) is not None:
                 row[f"cpu_{key}_s"] = round(c1[key] - c0[key], 3)
@@ -5978,7 +6479,9 @@ class ProxyBench:
             w.writeheader()
             for r in self.rows:
                 w.writerow(r)
-        self.log(f"\n{v}\n📄 Kết quả: {base}.md / .csv / .json")
+        _write_summary_csv(base + "_summary.csv", {l: [r for r in self.rows if r["proxy"] == l] for l in self.labels},
+                           keys=("post_ready_ms",) + NET_BENCH_KEYS[1:] + ("file_attach_ms",))
+        self.log(f"\n{v}\n📄 Kết quả: {base}.md / .csv / _summary.csv / .json")
         return {"verdict": v, "summary": s, "rows": self.rows, "files": [base + ".md", base + ".csv", base + ".json"]}
 
 
@@ -6480,6 +6983,8 @@ def build_parser() -> "argparse.ArgumentParser":
     g.add_argument("--bench-upload", action="store_true", help="chạy thử tới lúc nút Post sáng rồi DỪNG (không đăng); cần --profile --files")
     g.add_argument("--proxy-bench", action="store_true", help="cửa sổ PROXY UPLOAD BENCHMARK (TEST ONLY, không bấm Post)")
     g.add_argument("--proxy-bench-cli", action="store_true", help="như --proxy-bench nhưng dòng lệnh; cần --profile --file")
+    g.add_argument("--bench-net", action="store_true", help="DRY-RUN trên TikTok thật: A/B mở sẵn kết nối upload (base vs pre) + mốc mạng "
+                   "CDP → CSV; cần --profile --files (1 file)")
     g.add_argument("--bench-click", action="store_true", help="độ trễ nút Post sáng→click: đường driver vs ws trên TRANG GIẢ 127.0.0.1 "
                    "trong tab mới của profile (không TikTok, không đăng); cần --profile")
     g.add_argument("--bench-watch", action="store_true", help="A/B/C cơ chế theo dõi nút Post trên TikTok thật (DRY-RUN, không bấm Post); cần --profile --files")
@@ -6511,6 +7016,9 @@ def build_parser() -> "argparse.ArgumentParser":
     ap.add_argument("--stage", choices=["direct", "ram"], help="đặt TAM_STAGE cho lần chạy này")
     ap.add_argument("--force-reload", action="store_true", help="đặt TAM_FORCE_RELOAD=1 cho lần chạy này")
     ap.add_argument("--keep-open", action="store_true", help="không đóng profile sau khi đo")
+    ap.add_argument("--net-idle-s", type=float, default=30.0, help="--bench-net: số giây trang rảnh trước mỗi lượt")
+    ap.add_argument("--net-lead-s", type=float, default=1.5, help="--bench-net: preconnect trước khi gắn file bao lâu (≈ thời gian tải YouTube)")
+    ap.add_argument("--net-variants", default="base,pre", help="--bench-net: base,pre")
     ap.add_argument("--click-paths", default="driver,ws", help="--bench-click: các đường bấm so sánh (driver,ws)")
     ap.add_argument("--coverhold-ms", type=int, default=0, help="--bench-click: nút sáng nhưng bị lớp phủ che thêm N ms")
     ap.add_argument("--window", default="asis", help="--bench-click: asis (giữ nguyên cửa sổ như lúc đăng thật) | front (đưa tab lên trước)")
@@ -6562,6 +7070,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not a.profile or not a.file:
             ap.error("--proxy-bench-cli cần --profile và --file")
         return cli_proxy_bench(a.profile, a.file, a.proxy_a, a.proxy_b, a.per_block, a.secs)
+    if a.bench_net:
+        if not a.profile or not a.files:
+            ap.error("--bench-net cần --profile và --files")
+        return cli_bench_net(a.profile, a.files[0], a.repeat if a.repeat != 3 else 10, a.yes, a.keep_open, a.net_idle_s, a.net_lead_s,
+                             a.net_variants)
     if a.bench_click:
         if not a.profile:
             ap.error("--bench-click cần --profile")

@@ -306,11 +306,43 @@ class TikTokBridge:
                 return False
             with self.tam.drivers_lock:
                 self.tam.drivers[str(pid)] = drv
+            if hasattr(self.tam, "remember_tab"):            # địa chỉ tab cho preconnect lúc phát hiện video (không dùng chromedriver)
+                try:
+                    self.tam.remember_tab(drv)
+                except Exception:  # noqa: BLE001
+                    pass
             s.opened_at = time.time()
             fsm = self.tam.get_fsm(str(pid))
             s.state = "UNKNOWN" if fsm.state == self.tam.PState.UNKNOWN else "READY"
             self.log(f"✅ TikTok {pid}: profile mở + trang Upload sẵn sàng ({_ms(t0, time.perf_counter_ns()):.0f} ms)")
             return True
+
+    # ------------------------------------------------------------------ làm nóng kết nối upload khi PHÁT HIỆN video (A/B: TAM_UPLOAD_PRECONNECT)
+    def prewarm(self, ch: str) -> int:
+        """Gọi ngay khi WS360 phát hiện video mới (đang tải YouTube ~1–2 s): mở sẵn TCP+TLS qua proxy tới máy chủ upload TikTok
+        của các profile nhận kênh này. KHÔNG chặn (luồng nền), KHÔNG dùng chromedriver (WebSocket CDP riêng, ngắn hạn), không đổi
+        gì trên trang ngoài thẻ <link rel=preconnect>. Lỗi → bỏ qua (job vẫn chạy y như cũ)."""
+        fn = getattr(self.tam, "prewarm_upload_connections", None) if self.tam is not None else None
+        if fn is None or not self.accepting:
+            return 0
+        n = 0
+        for pid in list(self.targets.get(ch) or []):
+            drv = self._driver(pid)
+            if drv is None:
+                continue
+            n += 1
+
+            def run(pid=pid, drv=drv):
+                t0 = time.perf_counter_ns()
+                try:
+                    k, why = fn(drv)
+                except Exception as e:  # noqa: BLE001
+                    k, why = 0, f"{type(e).__name__}"
+                self.stats["prewarm"] = f"{pid}: {k} thẻ ({_ms(t0, time.perf_counter_ns()):.0f} ms)"
+                if k:
+                    self.log(f"🔌 TikTok {pid}: mở sẵn kết nối upload ({why}) trong {_ms(t0, time.perf_counter_ns()):.0f} ms")
+            threading.Thread(target=run, daemon=True, name=f"TT-PREWARM-{pid}").start()
+        return n
 
     # ------------------------------------------------------------------ nhận job từ WS360 (đường nóng)
     def submit(self, info: dict) -> list[str]:

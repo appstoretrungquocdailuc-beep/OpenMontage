@@ -1,0 +1,32 @@
+TAM 5.5.0-TEST-NET — ĐO MẠNG UPLOAD TIKTOK + MỞ SẴN KẾT NỐI UPLOAD (BẢN THỬ)
+==========================================================================
+Giữ nguyên: API_BROWSE, Resolver, tải itag 18, Genlogin, SQLite, FASTCLICK WebSocket, cách gắn file, xác nhận POST_CONFIRMED,
+nhật ký chống trùng. Bản trước: WS360\backup\tam_INSTANT_POST_5.4.0_fastclick_truoc_net.py (+ ws360_tam_bridge_truoc_net.py,
+YOUTUBE_WEBSUB_INSTANT_360P_truoc_net.py).
+
+1) BỘ ĐO MẠNG UPLOAD (TAM_NET_TRACE=1, mặc định bật) — chạy NGOÀI đường bấm Post
+   Kết nối CDP RIÊNG (WebSocket) + luồng riêng, đọc sự kiện Network của trang và worker. Mỗi lần upload có dòng:
+   🌐 [UPLOAD_NET] gắn file→request upload đầu … | upload mạng (request đầu→phản hồi cuối) … | kết nối đầu: MỚI (proxy/TCP/TLS)
+      hoặc dùng lại | gửi HẾT body: UNKNOWN | upload xong→nút Post sáng (TikTok xử lý) … | click→phản hồi API đăng … | máy chủ …
+   - "gửi HẾT body" luôn UNKNOWN: CDP không cho biết lúc TikTok nhận byte cuối (Chrome chỉ biết đã ghi vào socket/proxy).
+   - KHÔNG ghi cookie, header, body, query (chữ ký/token). Chỉ ghi host + path đã che.
+   - Lần đầu tool HỌC tên máy chủ upload thật → tam_upload_hosts.json (chỉ tên máy chủ).
+   - Không nhận ra request upload → log in danh sách POST thấy được; đặt TAM_UPLOAD_URL_RE cho đúng.
+
+2) TỐI ƯU: MỞ SẴN KẾT NỐI UPLOAD (TAM_UPLOAD_PRECONNECT=1, mặc định bật trong bản thử)
+   Ngay khi WS360 PHÁT HIỆN video (lúc đang tải YouTube ~1–2 s), tool thêm thẻ <link rel=preconnect> tới máy chủ upload đã học
+   → Chrome mở sẵn CONNECT qua proxy + TCP + TLS. Khi gắn file, request upload đầu dùng kết nối đã mở → bỏ được 1 lần bắt tay
+   qua proxy Nhật. Không đổi gì khác: không gửi dữ liệu, không bấm gì, không dùng chromedriver (kết nối WebSocket ngắn hạn).
+   Tắt ngay: biến môi trường TAM_UPLOAD_PRECONNECT=0 (rồi chạy lại WS360).
+
+3) BẮT BUỘC ĐO TRÊN VPS TRƯỚC KHI TIN (không đăng gì)
+   a. Chép tam_INSTANT_POST.py + BENCH_NET_TIKTOK.bat (thư mục này) vào thư mục TAM của BẢN THỬ.
+   b. Tắt WS360/TAM đang dùng profile thử. Chạy BENCH_NET_TIKTOK.bat → Profile ID + 1 file mp4 360p.
+      DRY-RUN: gắn file → chờ nút Post sáng → DỪNG (2 lớp chặn bấm). TikTok có thể giữ bản nháp; tool nạp lại trang mỗi lượt.
+      10 vòng base/pre xen kẽ, mỗi lượt rảnh 30 s (để kết nối cũ tự đóng như giữa 2 video thật).
+   c. Gửi tam_bench_net_*.csv, *_summary.csv, *.md. Kết luận "GIỮ preconnect" chỉ khi POST_READY của pre nhanh hơn CÓ Ý NGHĨA.
+      Nếu không: đặt TAM_UPLOAD_PRECONNECT=0.
+   d. So proxy: PROXY_BENCH_TIKTOK.bat (như cũ) giờ có thêm cột mạng + file proxy_bench_*_summary.csv
+      (median, P90, tỷ lệ lỗi, POST_READY, upload mạng, TikTok xử lý).
+   e. Tải YouTube lần đầu: BAO_CAO_TAI_LAN_DAU.bat (thư mục WS360) → FIRST_DL_REPORT.md/.csv
+      (resolver, CDN DNS/TCP/TLS/TTFB, truyền, ffprobe của các video mới thật — không có số tải lại từ cache).

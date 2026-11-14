@@ -1650,6 +1650,12 @@ class Engine:
             stmts.append(("INSERT OR IGNORE INTO excel_jobs(video_id, channel_id, url, state, created_at, order_key) "
                           "VALUES(?,?,?,?,?,?)", (vid, ch, url, "PENDING", iso(), okey)))
         self.db.tx(stmts)                                 # các bản ghi cùng 1 giao dịch
+        br = getattr(self, "bridge", None)
+        if br is not None and self.flags["download"] and hasattr(br, "prewarm"):
+            try:
+                br.prewarm(ch)                                # nền: mở sẵn kết nối upload TikTok trong lúc tải YouTube
+            except Exception:  # noqa: BLE001
+                pass
         self.stats["detected"] += 1
         self.stats[f"wins_{engine.lower()}"] = self.stats.get(f"wins_{engine.lower()}", 0) + 1
         self._alert()
@@ -4213,6 +4219,56 @@ def browse_compare(base: Path, v39_dir, db_name="database.sqlite", hours=168.0) 
     return {"rows": rows, "both": len(both), "only_v39": only39, "only_ws360": only_ws, "delta_detect_p50": pct(d_det, 50) if d_det else None}
 
 
+def first_dl_report(base: Path, db_name="database.sqlite", hours=168.0) -> dict:
+    """Video MỚI tải LẦN ĐẦU (mỗi video production chỉ tải 1 lần, không có file cache) → từng chặng: resolver (DNS/TCP/TLS/chờ máy chủ/
+    đọc/parse), CDN googlevideo (kết nối mới?, DNS/TCP/TLS, TTFB, truyền), ffprobe, tổng. CHỈ ĐỌC database → FIRST_DL_REPORT.md/.csv."""
+    db = DB(base / db_name)
+    since = time.time() - hours * 3600
+    rows = []
+    for r in db.all("SELECT video_id, size, resolver_ms, download_ms, total_ms, mbps, net, done_at, attempts FROM videos "
+                    "WHERE state='DONE' AND net IS NOT NULL ORDER BY done_at"):
+        try:
+            dt = datetime.fromisoformat(str(r["done_at"]).replace("Z", "+00:00")).timestamp() if r["done_at"] else None
+        except ValueError:
+            dt = None
+        if dt is not None and dt < since:
+            continue
+        try:
+            n = json.loads(r["net"] or "{}")
+        except ValueError:
+            continue
+        rs, md = n.get("resolver") or {}, n.get("media") or {}
+        rows.append({"video_id": r["video_id"], "attempts": r["attempts"], "size_mb": round((r["size"] or 0) / 1e6, 2),
+                     "detect_to_done_ms": r["total_ms"], "resolver_ms": r["resolver_ms"], "resolver_client": rs.get("client"),
+                     "resolver_new_conn": rs.get("new_conn"), "resolver_dns_ms": rs.get("dns_ms"), "resolver_tcp_ms": rs.get("tcp_ms"),
+                     "resolver_tls_ms": rs.get("tls_ms"), "resolver_server_wait_ms": rs.get("server_wait_ms"),
+                     "cdn_host": md.get("host"), "cdn_new_conns": md.get("new_conns"), "cdn_dns_ms": md.get("dns_ms"),
+                     "cdn_tcp_ms": md.get("tcp_ms"), "cdn_tls_ms": md.get("tls_ms"), "cdn_ttfb_ms": md.get("ttfb_ms"),
+                     "cdn_transfer_ms": md.get("transfer_ms"), "download_ms": r["download_ms"], "mbps": r["mbps"],
+                     "ffprobe_ms": n.get("ffprobe_ms"), "net_mode": n.get("net_mode")})
+    keys = ["detect_to_done_ms", "resolver_ms", "resolver_tls_ms", "resolver_server_wait_ms", "cdn_dns_ms", "cdn_tcp_ms", "cdn_tls_ms",
+            "cdn_ttfb_ms", "cdn_transfer_ms", "download_ms", "ffprobe_ms", "size_mb"]
+    first = [x for x in rows if (x["attempts"] or 1) <= 1]
+    f_ = lambda v: "-" if v is None else f"{v:.0f}" if isinstance(v, (int, float)) else str(v)
+    md_ = [f"# FIRST DOWNLOAD REPORT — {iso()} — {len(first)} video mới tải lần đầu (bỏ {len(rows) - len(first)} video phải thử lại)", "",
+           "Dữ liệu THẬT từ database.sqlite (mỗi video production tải đúng 1 lần — không có kết quả cache).", "",
+           "| Chặng | P50 | P90 | n |", "|---|---|---|---|"]
+    for k in keys:
+        vals = [x[k] for x in first if isinstance(x.get(k), (int, float))]
+        md_.append(f"| {k} | {f_(pct(vals, 50))} | {f_(pct(vals, 90))} | {len(vals)} |")
+    nc = [x for x in first if x.get("cdn_new_conns")]
+    md_ += ["", f"Kết nối CDN mới (DNS+TCP+TLS phải làm lại): {len(nc)}/{len(first)} video | resolver dùng kết nối mới: "
+            f"{sum(1 for x in first if x.get('resolver_new_conn'))}/{len(first)}"]
+    (base / "FIRST_DL_REPORT.md").write_text("\n".join(md_) + "\n", encoding="utf-8")
+    with open(base / "FIRST_DL_REPORT.csv", "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]) if rows else ["video_id"])
+        w.writeheader()
+        for x in rows:
+            w.writerow(x)
+    print("\n".join(md_))
+    return {"rows": rows, "first": len(first)}
+
+
 def browse_probe(cfg, base, channels):
     """Chẩn đoán: 1 lượt Browse (Uploads + tab Videos) cho từng kênh → in mỗi dòng: Video ID, chữ tuổi, kết luận (KHÔNG tải, KHÔNG
     ghi Excel/DB thật: dùng database_PROBE.sqlite riêng). Dùng để kiểm tra parser trên dữ liệu thật của VPS."""
@@ -4329,6 +4385,7 @@ def main(argv=None):
     ap.add_argument("--browse-report", action="store_true", help="thống kê Browse/API/WebSub + tải/đăng theo nguồn thắng → BROWSE_REPORT.md")
     ap.add_argument("--browse-probe", nargs="*", help="gọi Browse 1 lần cho các Channel ID (hoặc cột K) và in dòng + chữ tuổi + kết luận")
     ap.add_argument("--browse-compare", default="", help="thư mục V39 (chứa scanner_ledger.jsonl): so sánh cùng video V39 ↔ WS360 → BROWSE_COMPARE.md")
+    ap.add_argument("--first-dl-report", action="store_true", help="video mới tải lần đầu: resolver/CDN TTFB/truyền/ffprobe → FIRST_DL_REPORT.md/.csv")
     ap.add_argument("--pipeline-report", action="store_true", help="median/P90/P95 từng giai đoạn từ các job đăng thật → PIPELINE_REPORT.md")
     ap.add_argument("--integrated", action="store_true", help="bật sẵn tự đăng TikTok (TAM) khi mở giao diện / headless")
     ap.add_argument("--dry-run-post", action="store_true", help="tích hợp: chạy tới khi nút Post sáng rồi DỪNG, không bấm")
@@ -4369,6 +4426,9 @@ def main(argv=None):
         return 0
     if a.browse_report:
         browse_report(base)
+        return 0
+    if a.first_dl_report:
+        first_dl_report(base)
         return 0
     if a.browse_compare:
         browse_compare(base, Path(a.browse_compare))
