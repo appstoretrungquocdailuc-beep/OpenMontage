@@ -31,6 +31,7 @@ import itertools
 import json
 import os
 import queue
+import random
 import re
 import secrets
 import shutil
@@ -1138,8 +1139,33 @@ _RDR_HOST = {}                      # netloc gốc → (netloc đích, monotonic
 _RDR_SN = {}                        # cụm sn gốc → (netloc đích, monotonic)  (máy chủ rrN chưa gặp vẫn đoán được)
 _RDR_TTL = 600.0
 _HEDGE_BAN = {}                     # netloc replica → hết cấm (monotonic) — chỉ khi replica CHẮC CHẮN trả 403/404/410/429
+_RDR_BLOCK = {}                     # nguồn đã đoán SAI ("netloc" / "sn:<cụm>") → hết chặn (monotonic): không đoán lại nguồn đó 10 phút
+_SPEC_OFF = [0.0]                   # 429 từ googlevideo → TẮT mọi request suy đoán (đoán 302, hedge, mở sẵn mn=, link client khác) tới mốc này
+_SPEC_PAUSE_S = 600.0
+_PRE_LOCK = threading.Lock()
+_PRE_INFLIGHT = set()               # máy chủ đang được mở sẵn (chống mở trùng khi nhiều luồng cùng gọi)
 DL_STATS = {"redirect_skip": 0, "redirect_skip_fail": 0, "mn_preconnect": 0, "hedge_sent": 0, "hedge_win_replica": 0,
-            "hedge_ban": 0, "alt_url": 0}
+            "hedge_ban": 0, "alt_url": 0, "spec_pause_429": 0}
+
+
+def note_429():
+    """Bị giới hạn tốc độ (429) → 10 phút không gửi request suy đoán nào (chỉ còn đúng đường tải của bản trước + lịch chờ ≥ 10 s)."""
+    _SPEC_OFF[0] = time.monotonic() + _SPEC_PAUSE_S
+    DL_STATS["spec_pause_429"] += 1
+
+
+def spec_paused() -> bool:
+    return time.monotonic() < _SPEC_OFF[0]
+
+
+def reset_dl_v2_state():
+    """Xoá bộ nhớ 302, danh sách cấm, chặn đoán, tạm dừng 429 (test/bench)."""
+    with _RDR_LOCK:
+        _RDR_HOST.clear()
+        _RDR_SN.clear()
+        _RDR_BLOCK.clear()
+    _HEDGE_BAN.clear()
+    _SPEC_OFF[0] = 0.0
 
 
 def _netloc(u):
@@ -1168,11 +1194,13 @@ def redirect_predict(url):
     """→ (URL đã đổi sang máy chủ đích đoán được | None, 'host'|'cluster'). Cùng path + query (chữ ký giữ nguyên)."""
     a = _netloc(url)
     now = time.monotonic()
+    sn = _gv_parts(a)[1]
     with _RDR_LOCK:
+        if _RDR_BLOCK.get(a, 0) > now:                       # nguồn này vừa đoán sai → không đoán (kể cả khi URL gốc đã dạy lại)
+            return None, ""
         e, how = _RDR_HOST.get(a), "host"
         if not e or now - e[1] > _RDR_TTL:
-            sn = _gv_parts(a)[1]
-            e, how = (_RDR_SN.get(sn) if sn else None), "cluster"
+            e, how = (_RDR_SN.get(sn) if sn and _RDR_BLOCK.get("sn:" + sn, 0) <= now else None), "cluster"
         if not e or now - e[1] > _RDR_TTL or e[0] == a:
             return None, ""
         dst = e[0]
@@ -1180,13 +1208,17 @@ def redirect_predict(url):
 
 
 def redirect_forget(url):
-    """Dự đoán sai → bỏ cặp học được (không đoán lại sai lần nữa)."""
+    """Dự đoán sai → bỏ cặp đã học VÀ chặn đoán cho nguồn đó (máy chủ + cụm) 10 phút: request về URL gốc sẽ 302 tới đúng đích cũ và
+    dạy lại cặp đó, nên chỉ xoá thì lần sau lại đoán sai (mỗi video thêm 1 request bị từ chối)."""
     a = _netloc(url)
     sn = _gv_parts(a)[1]
+    until = time.monotonic() + _RDR_TTL
     with _RDR_LOCK:
         _RDR_HOST.pop(a, None)
+        _RDR_BLOCK[a] = until
         if sn:
             _RDR_SN.pop(sn, None)
+            _RDR_BLOCK["sn:" + sn] = until
 
 
 def mn_netlocs(url, limit=3):
@@ -1217,11 +1249,23 @@ def _preconnect_one(netloc):
             cp._put_conn(conn)
     except Exception:
         pass                                                # sai/không tới được → không mất gì
+    finally:
+        with _PRE_LOCK:
+            _PRE_INFLIGHT.discard(netloc)
 
 
 def mn_preconnect(url, skip=()):
-    """Nền, KHÔNG chặn: DNS+TCP+TLS tới máy chủ mn= → nếu 302 trỏ vào đó, kết nối đã sẵn trong pool."""
-    hosts = [h for h in mn_netlocs(url) if h not in skip]
+    """Nền, KHÔNG chặn: DNS+TCP+TLS tới máy chủ mn= → nếu 302 trỏ vào đó, kết nối đã sẵn trong pool. Tối đa 3 máy chủ; máy chủ
+    đang được mở sẵn bởi luồng khác thì bỏ qua (không mở trùng). Chỉ ở lớp mạng 'fast' (legacy: kết nối mở sẵn sau TLS 1.3 bị
+    urllib3 coi là đã đứt và bỏ đi → chỉ tốn thêm bắt tay)."""
+    if _NET_MODE != "fast" or NET is None:
+        return []
+    hosts = []
+    with _PRE_LOCK:
+        for h in mn_netlocs(url):
+            if h not in skip and h not in _PRE_INFLIGHT:
+                _PRE_INFLIGHT.add(h)
+                hosts.append(h)
     for h in hosts:
         threading.Thread(target=_preconnect_one, args=(h,), daemon=True, name="MN-PRECONNECT").start()
     return hosts
@@ -1246,7 +1290,23 @@ def _close_quiet(r):
         pass
 
 
-def _hedged_follow(url, replica, delay_s, info, headers=None):
+def _hedge_error(tag, u, e, on_primary_fail):
+    """Ghi nhận lỗi NGAY tại luồng nhận lỗi (kể cả khi bên kia đã thắng và hàm đã trả về): 429 → tạm dừng suy đoán; replica
+    403/404/410/429 CHẮC CHẮN → cấm 10 phút; request chính lỗi → báo cho _open_media (đoán 302 sai). Timeout/lỗi mạng của
+    replica KHÔNG bị cấm (bên thua chậm không phải lỗi)."""
+    if isinstance(e, HttpStatus) and e.code == 429:
+        note_429()
+    if tag == "replica" and isinstance(e, HttpStatus) and e.code in (403, 404, 410, 429):
+        _HEDGE_BAN[_netloc(u)] = time.monotonic() + 600
+        DL_STATS["hedge_ban"] += 1
+    if tag == "primary" and on_primary_fail is not None:
+        try:
+            on_primary_fail(e)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _hedged_follow(url, replica, delay_s, info, headers=None, on_primary_fail=None):
     """Request chính; chưa có header sau delay_s → thêm 1 request tới replica. Bên nào trả 2xx trước thì dùng, bên kia đóng ngay
     (không đọc thân). Request chính lỗi TRƯỚC khi hedge → ném lỗi luôn (không bắn kép khi 403/429). Tối đa 1 request kép."""
     q = queue.Queue()
@@ -1256,6 +1316,7 @@ def _hedged_follow(url, replica, delay_s, info, headers=None):
             r, fin = _follow(u, headers=headers)
             q.put((tag, r, fin, None))
         except Exception as e:  # noqa: BLE001
+            _hedge_error(tag, u, e, on_primary_fail)
             q.put((tag, None, None, e))
     threading.Thread(target=run, args=("primary", url), daemon=True, name="DL-PRIMARY").start()
     started, got = 1, []
@@ -1293,41 +1354,70 @@ def _hedged_follow(url, replica, delay_s, info, headers=None):
                             _close_quiet(x[1])
                 threading.Thread(target=reap, daemon=True, name="DL-REAP").start()
             return r, fin
-        if tag == "replica" and isinstance(err, HttpStatus) and err.code in (403, 404, 410, 429):
-            _HEDGE_BAN[_netloc(replica)] = time.monotonic() + 600
-            DL_STATS["hedge_ban"] += 1
         if tag == "primary":
             perr = err
     raise perr or got[-1][3]
 
 
+def _guess_failed(url, info, e):
+    """Đoán máy chủ đích 302 sai (request tới máy chủ đoán lỗi, kể cả khi hedge đã cứu): ghi nhận + chặn đoán nguồn đó 10 phút."""
+    if info.get("redirect_skip_fail"):
+        return
+    info["redirect_skip_fail"] = f"{type(e).__name__}"[:40] + (f" {e.code}" if isinstance(e, HttpStatus) else "")
+    DL_STATS["redirect_skip_fail"] += 1
+    redirect_forget(url)
+    if isinstance(e, HttpStatus) and e.code == 429:
+        note_429()
+
+
+def _speculative_ok(info) -> bool:
+    """Request suy đoán (đoán 302, hedge, mở sẵn mn=) chỉ khi: lần thử trước không bị 403/429, không phải lượt dùng link client khác
+    sau 403, và chưa có 429 nào trong 10 phút qua."""
+    return not info.get("no_spec") and not info.get("no_hedge") and not spec_paused()
+
+
 def _open_media(url, info, allow_hedge=True, headers=None):
     """Mở GET tải (thay cho _follow(url)) với các tối ưu v2 theo cờ. Tắt hết = _follow(url) y nguyên.
-    Thứ tự: đoán máy chủ đích sau 302 (#2) → [hedge #4 áp cho CHÍNH URL sẽ gửi, kể cả URL đã đoán] → đoán sai: URL gốc ngay."""
-    def open_one(u):
-        if allow_hedge and NET_OPTS.get("dl_hedge") and not info.get("no_hedge"):
+    Thứ tự: đoán máy chủ đích sau 302 (#2) → [hedge #4 áp cho CHÍNH URL sẽ gửi, kể cả URL đã đoán] → đoán sai: URL gốc ngay.
+    An toàn: máy chủ đoán trả 429 → ném 429 luôn (process() chờ ≥ 10 s như bản cũ, KHÔNG gửi thêm); lỗi khác → đúng 1 GET thường
+    tới URL gốc (không hedge, không mở sẵn). Mọi request suy đoán dừng khi _speculative_ok() sai."""
+    spec = _speculative_ok(info)
+    delay = max(0.0, float(NET_OPTS.get("dl_hedge_delay_ms") or 120)) / 1000.0
+
+    def open_one(u, on_fail=None):
+        if allow_hedge and spec and NET_OPTS.get("dl_hedge"):
             rep = _replica_for(u)
             if rep:
-                return _hedged_follow(u, rep, max(0.0, float(NET_OPTS.get("dl_hedge_delay_ms") or 120)) / 1000.0, info, headers)
+                return _hedged_follow(u, rep, delay, info, headers, on_primary_fail=on_fail)
         return _follow(u, headers=headers)
-    if NET_OPTS.get("net_redirect_memory"):
+    if spec and NET_OPTS.get("net_redirect_memory"):
         pred, how = redirect_predict(url)
         if pred:
+            info.update(redirect_skip=how, skipped_to=_netloc(pred))
             try:
-                r, fin = open_one(pred)
-                info.update(redirect_skip=how, skipped_to=_netloc(pred))
-                DL_STATS["redirect_skip"] += 1
+                r, fin = open_one(pred, on_fail=lambda e: _guess_failed(url, info, e))
+                if not info.get("redirect_skip_fail"):
+                    DL_STATS["redirect_skip"] += 1
                 return r, fin
-            except Exception as e:  # noqa: BLE001 — đoán sai: quay về URL gốc NGAY trong cùng lần thử (không chờ lịch thử lại)
-                info["redirect_skip_fail"] = f"{type(e).__name__}"[:40] + (f" {e.code}" if isinstance(e, HttpStatus) else "")
-                DL_STATS["redirect_skip_fail"] += 1
-                redirect_forget(url)
+            except Exception as e:  # noqa: BLE001
+                _guess_failed(url, info, e)
+                if isinstance(e, HttpStatus) and e.code == 429:
+                    raise                                          # bị giới hạn tốc độ → không gửi thêm request nào
+                info["no_spec"] = True                             # quay về URL gốc NGAY (cùng lần thử): đúng 1 GET thường
                 info.pop("hedge_win", None)
-                info.pop("hedge_sent", None)
-    pre = mn_preconnect(url) if NET_OPTS.get("net_mn_preconnect") else []
-    if pre:
-        info["mn_preconnect"] = len(pre)
+                return _follow(url, headers=headers)
+    if spec and NET_OPTS.get("net_mn_preconnect") and not info.get("no_preconnect"):
+        pre = mn_preconnect(url)
+        if pre:
+            info["mn_preconnect"] = len(pre)
     return open_one(url)
+
+
+def _chunks_v2(r):
+    head = r.read(256 * 1024)
+    if head:
+        yield head
+    yield from r.stream(1024 * 1024)
 
 
 def download_single(url: str, dest: Path, info: dict, cancel: threading.Event | None = None) -> int:
@@ -1340,9 +1430,10 @@ def download_single(url: str, dest: Path, info: dict, cancel: threading.Event | 
     expected = int(r.headers.get("Content-Length") or 0)
     v2 = bool(NET_OPTS.get("dl_hotpath_v2"))
     try:
-        # v2 #8: khúc 1 MiB + ghi thẳng (urllib3 đã đệm) | bản trước: khúc 256 KB + bộ đệm file 1 MiB
+        # v2 #8: khúc 1 MiB + ghi thẳng (urllib3 đã đệm) | bản trước: khúc 256 KB + bộ đệm file 1 MiB.
+        # Khúc ĐẦU của v2 vẫn 256 KB → mốc 'byte đầu' (ttfb_ms/transfer_ms) đo y như bản trước, so sánh được giữa các biến thể.
         with open(dest, "wb", buffering=0 if v2 else 1024 * 1024) as f:
-            for chunk in r.stream((1024 if v2 else 256) * 1024):
+            for chunk in (_chunks_v2(r) if v2 else r.stream(256 * 1024)):
                 if first is None:
                     first = time.perf_counter_ns()
                 if cancel is not None and cancel.is_set():
@@ -1386,15 +1477,35 @@ def download_ranges(url: str, dest: Path, size: int, n: int, info: dict, cancel=
     firsts = []
     hops_all = []
     finals = []
+    # v2: đoán máy chủ đích 302 + mở sẵn mn= MỘT lần cho cả file (không phải mỗi đoạn). Đoạn nào gặp lỗi ở máy chủ đoán → các đoạn
+    # sau dùng URL gốc; 429 → ném luôn (không gửi thêm). Đoạn không hedge (giữ ≤ n kết nối).
+    pred, bad_guess, glock = None, threading.Event(), threading.Lock()
+    if _speculative_ok(info):
+        if NET_OPTS.get("net_redirect_memory"):
+            pred, how = redirect_predict(url)
+            if pred:
+                info.update(redirect_skip=how, skipped_to=_netloc(pred))
+        if not pred and NET_OPTS.get("net_mn_preconnect"):
+            pre = mn_preconnect(url)
+            if pre:
+                info["mn_preconnect"] = len(pre)
 
     def one(a, b):
-        if any(NET_OPTS.get(k) for k in ("net_redirect_memory", "net_mn_preconnect")):
-            pinfo = {}                                     # v2: mỗi đoạn cũng GET thẳng máy chủ đích đã học (không hedge từng đoạn)
-            rr, fin = _open_media(url, pinfo, allow_hedge=False, headers={"Range": f"bytes={a}-{b}"})
-            if pinfo.get("redirect_skip"):
-                info["redirect_skip"] = pinfo["redirect_skip"]
+        rng = {"Range": f"bytes={a}-{b}"}
+        if pred and not bad_guess.is_set():
+            try:
+                rr, fin = _follow(pred, headers=rng)
+            except Exception as e:  # noqa: BLE001
+                with glock:
+                    first_bad = not bad_guess.is_set()
+                    bad_guess.set()
+                if first_bad:
+                    _guess_failed(url, info, e)
+                if isinstance(e, HttpStatus) and e.code == 429:
+                    raise
+                rr, fin = _follow(url, headers=rng)
         else:
-            rr, fin = _follow(url, headers={"Range": f"bytes={a}-{b}"}, preload=False)
+            rr, fin = _follow(url, headers=rng, preload=False)
         hops_all.extend(getattr(rr, "_ws_hops", []) or [])
         finals.append(fin)
         if rr.status != 206:
@@ -1422,6 +1533,8 @@ def download_ranges(url: str, dest: Path, size: int, n: int, info: dict, cancel=
     with ThreadPoolExecutor(max_workers=len(parts), thread_name_prefix="Range") as ex:
         total = sum(f.result() for f in [ex.submit(one, a, b) for a, b in parts])
     t_end = time.perf_counter_ns()
+    if pred and not info.get("redirect_skip_fail"):
+        DL_STATS["redirect_skip"] += 1
     sm = lambda k: round(max((h.get(k) or 0) for h in hops_all), 2) if any(h.get(k) is not None for h in hops_all) else None
     info.update(ttfb_ms=ms(t0, min(firsts) if firsts else None), bytes=total, elapsed_ms=ms(t0, t_end), connections=len(parts),
                 hops=len(hops_all), new_conns=sum(1 for h in hops_all if h.get("new_conn")), dns_ms=sm("dns_ms"), tcp_ms=sm("tcp_ms"),
@@ -2156,8 +2269,11 @@ class Engine:
                                 download_started_at=iso(), expected_size=exp_size or None)
             info_v, info_a = {}, {}
             prev_err = str((row["error"] if row is not None and "error" in row.keys() else "") or "")
-            if re.search(r"HTTP (403|429)", prev_err):
-                info_v["no_hedge"] = info_a["no_hedge"] = True          # v2 #4: không bắn kép khi vừa bị 403/429
+            if re.search(r"HTTP (403|410|429)", prev_err):
+                # v2: lần thử trước bị 403/410/429 → lần này KHÔNG request suy đoán nào (hedge, đoán 302, mở sẵn mn=) và không thử lại
+                # link client khác (đã thử ở lần trước) → mỗi lần thử đúng 1 GET như bản cũ
+                for d_ in (info_v, info_a):
+                    d_.update(no_hedge=True, no_spec=True, no_alt=True)
             mux_ms = None
             rc = self.cfg.get("range_connections", 1)
             if str(rc).strip().lower() == "auto":                        # v2 #6: theo dung lượng (chỉ bật khi bench chứng minh)
@@ -2308,6 +2424,7 @@ class Engine:
             wait = sched[min(attempts, len(sched) - 1)]
             if isinstance(e, HttpStatus) and e.code == 429:
                 wait = max(wait, float(e.retry_after or 0), 10.0)
+                note_429()                                      # v2: 10 phút không request suy đoán (cờ tắt: không tác dụng gì)
             with self.active_lock:
                 if isinstance(e, HttpStatus) and e.code in (403, 429):
                     self.nudged |= {(vid, "API"), (vid, "WEBSUB")}   # 403/429: tôn trọng giãn cách, không thử sớm
@@ -2359,8 +2476,11 @@ class Engine:
         try:
             return self._fetch_one(fmt, dest, info, n, cancel)
         except HttpStatus as e:
-            if not (NET_OPTS.get("dl_alt_url_on_403") and alts and e.code in (403, 410)):
+            if not (NET_OPTS.get("dl_alt_url_on_403") and alts and e.code in (403, 410)) or info.get("no_alt"):
                 raise
+            # link client khác: GET THƯỜNG (không hedge, không đoán 302, không mở sẵn), tối đa 1 lần mỗi video (lần thử sau có no_alt)
+            info.update(no_spec=True, no_hedge=True, no_preconnect=True)
+            info.pop("redirect_skip", None)
             for client, fut in alts:                          # v2 #5: link của client khác ĐÃ VỀ, cùng itag + dung lượng → thử ngay
                 if not fut.done():
                     continue
@@ -4028,8 +4148,10 @@ BENCH_DL_VARIANTS.update({
     "v2_hedge":     (dict(NET_OPTS_OFF, net_mode="fast", range_connections=1, **_V2_HEDGE), "warm_all"),
     "v2_full":      (dict(NET_OPTS_OFF, net_mode="fast", range_connections=1, **_V2_FULL), "warm_all"),
     "v2_full_auto": (dict(NET_OPTS_OFF, net_mode="fast", range_connections="auto", **_V2_FULL), "warm_all"),
+    # #6 tách riêng: warm_all + range auto (KHÔNG cờ v2 nào) → so thẳng với warm_all, ngưỡng 100 ms (theo yêu cầu mục 6)
+    "warm_all_auto": (dict(NET_OPTS_OFF, net_mode="fast", range_connections="auto"), "warm_all"),
 })
-BENCH_DL_V2_SET = ["legacy", "warm_all", "v2_ssl", "v2_redirect", "v2_hedge", "v2_full", "v2_full_auto"]
+BENCH_DL_V2_SET = ["legacy", "warm_all", "v2_ssl", "v2_redirect", "v2_hedge", "v2_full", "v2_full_auto", "warm_all_auto"]
 
 
 def _h2_client():
@@ -4154,9 +4276,10 @@ def bench_dl(cfg, base, ids, reps=None, variants=None):
                        "media_server_wait_ms": mn.get("server_wait_ms"), "ttfb_ms": mn.get("ttfb_ms"), "transfer_ms": mn.get("transfer_ms"),
                        "download_ms": row.get("download_ms"), "ffprobe_ms": row.get("ffprobe_ms"), "rename_ms": row.get("rename_ms"),
                        "mbps": row.get("mbps"), "size": row.get("size"), "client": rn.get("client"), "media_host": mn.get("host"),
-                       "tls_resumed": mn.get("tls_resumed"), "redirect_skip": mn.get("redirect_skip") or (
-                           "FAIL:" + str(mn.get("redirect_skip_fail")) if mn.get("redirect_skip_fail") else ""),
-                       "hedge_win": mn.get("hedge_win") or "", "fallback_client": mn.get("fallback_client") or "",
+                       "tls_resumed": mn.get("tls_resumed"), "redirect_skip": (
+                           "FAIL:" + str(mn.get("redirect_skip_fail"))) if mn.get("redirect_skip_fail") else (mn.get("redirect_skip") or ""),
+                       "hedge_win": mn.get("hedge_win") or "", "hedge_sent": 1 if mn.get("hedge_sent") else 0,
+                       "fallback_client": mn.get("fallback_client") or "",
                        "integrity_ms": row.get("integrity_ms"), "range_auto": mn.get("range_auto"),
                        "error": row.get("error") if r != "DONE" else ""}
                 rows.append(out)
@@ -4179,7 +4302,8 @@ def bench_dl(cfg, base, ids, reps=None, variants=None):
           "Mỗi lượt: link MỚI + xoá file trước (không dùng file có sẵn). Giá trị: median / P90 / P95 (ms). TỔNG = từ lúc bắt đầu resolve "
           "tới khi file đã tải xong + ffprobe xác minh + bàn giao (không tính TTFB 2 lần: TTFB nằm trong 'tải').", "",
           "| Phương án | lượt | lỗi | TỔNG | ≤1000 ms | resolver | setup resolver | chờ máy chủ resolver | TTFB | setup tải | "
-          "chờ máy chủ tải | truyền | ffprobe | tls_resumed | redirect_skip | hedge_win (gốc/replica) | fallback_client | integrity_ms |",
+          "chờ máy chủ tải | truyền | ffprobe | tls_resumed | redirect_skip | hedge_win (gốc/replica, trên số lượt có bắn kép) | "
+          "fallback_client | integrity_ms |",
           "|" + "---|" * 18]
     summary = {}
     for v in names:
@@ -4196,31 +4320,51 @@ def bench_dl(cfg, base, ids, reps=None, variants=None):
                   f"{f_(sv['ffprobe_ms'])} | {sum(1 for r in ok if r.get('tls_resumed'))}/{len(ok)} | "
                   f"{sum(1 for r in ok if r.get('redirect_skip') and not str(r.get('redirect_skip')).startswith('FAIL'))} ok / "
                   f"{sum(1 for r in ok if str(r.get('redirect_skip') or '').startswith('FAIL'))} sai | "
-                  f"{sum(1 for r in ok if str(r.get('hedge_win')).startswith('primary'))}/{sum(1 for r in ok if r.get('hedge_win') == 'replica')} | "
+                  f"{sum(1 for r in ok if r.get('hedge_win') == 'primary')}/{sum(1 for r in ok if r.get('hedge_win') == 'replica')} "
+                  f"(bắn kép {sum(1 for r in ok if r.get('hedge_sent'))}) | "
                   f"{sum(1 for r in ok if r.get('fallback_client'))} | "
                   f"{f_(tuple(pct([r['integrity_ms'] for r in ok if r.get('integrity_ms') is not None], p_) for p_ in (50, 90, 95)))} |")
     md += ["", "Phương án: legacy = bản trước (kết nối nguội); fast_cold = lớp mạng mới không giữ ấm; warm_resolver = giữ ấm "
            "Innertube, máy chủ video nguội; warm_all = giữ ấm cả máy chủ video vừa dùng; _r2/_r4 = chia 2/4 đoạn Range; "
-           "warm_apihost = resolver qua youtubei.googleapis.com.",
+           "warm_apihost = resolver qua youtubei.googleapis.com. v2_*: mỗi biến thể bật THÊM 1 nhóm cờ tối ưu tải v2; "
+           "warm_all_auto = warm_all + range_connections \"auto\" (không cờ v2).",
            "Lưu ý: cùng 1 video tải lặp lại thì máy chủ cache của Google (CDN) đã có sẵn → 'chờ máy chủ tải' có thể thấp hơn video "
            "vừa đăng thật; thứ tự xoay vòng để mọi phương án chịu ảnh hưởng như nhau."]
     (base / "BENCH_DL.md").write_text("\n".join(md) + "\n", encoding="utf-8")
     print("\n".join(md))
-    concl = bench_dl_summary(base, names, summary)
+    samples = {v: [r["total_ms"] for r in rows if r["variant"] == v and r["result"] == "DONE" and r.get("total_ms") is not None]
+               for v in names}
+    concl = bench_dl_summary(base, names, summary, samples=samples)
     return {"rows": rows, "summary": summary, "conclusion": concl}
 
 
 V2_CHAIN = ["warm_all", "v2_ssl", "v2_redirect", "v2_hedge", "v2_full", "v2_full_auto"]
 V2_GROUP = {"v2_ssl": "net_shared_ssl + net_rcvbuf_mb", "v2_redirect": "net_redirect_memory + net_mn_preconnect", "v2_hedge": "dl_hedge",
-            "v2_full": "dl_alt_url_on_403 + dl_quick_integrity + dl_hotpath_v2", "v2_full_auto": 'range_connections = "auto"'}
+            "v2_full": "dl_alt_url_on_403 + dl_quick_integrity + dl_hotpath_v2", "v2_full_auto": 'range_connections = "auto"',
+            "warm_all_auto": 'range_connections = "auto"'}
+V2_MIN_GAIN = {"warm_all_auto": 100.0, "v2_full_auto": 100.0}     # mục 6: range auto chỉ đổi mặc định khi thắng warm_all ≥ 100 ms
 
 
-def bench_dl_summary(base, names, summary, ref="warm_all", min_gain_ms=50.0, tol_ms=25.0) -> dict:
-    """BENCH_DL_SUMMARY.md — 2 tiêu chí, CHỈ dựa trên số đo của chính lần bench này:
-    (1) như yêu cầu: biến thể THẮNG mốc warm_all khi median VÀ P90 nhanh hơn ≥ 50 ms, tỷ lệ lỗi không tăng;
-    (2) vì các biến thể v2_* CỘNG DỒN: nhóm cờ mà biến thể đó thêm vào phải KHÔNG làm chậm (median và P90, cho phép nhiễu ≤ 25 ms)
-        so với biến thể liền trước, lỗi không tăng. Đề xuất BẬT nhóm cờ chỉ khi đạt cả (1) và (2); còn lại → GIỮ TẮT."""
+def _boot_ci(a, b, p, reps=2000, seed=12345):
+    """Khoảng tin cậy 90% (bootstrap, hạt giống cố định) của pct(a, p) − pct(b, p). Với 20 lượt và đuôi chậm 10%, P90 nhảy theo việc
+    2 hay 3 lượt rơi vào đuôi → khoảng này cho biết chênh lệch có lớn hơn nhiễu lấy mẫu không."""
+    rnd = random.Random(seed)
+    na, nb = len(a), len(b)
+    ds = sorted(pct([a[rnd.randrange(na)] for _ in range(na)], p) - pct([b[rnd.randrange(nb)] for _ in range(nb)], p)
+                for _ in range(reps))
+    return pct(ds, 5), pct(ds, 95)
+
+
+def bench_dl_summary(base, names, summary, ref="warm_all", min_gain_ms=50.0, tol_ms=25.0, samples=None) -> dict:
+    """BENCH_DL_SUMMARY.md — CHỈ dựa trên số đo của chính lần bench này. Mỗi nhóm cờ có 3 kết luận: BẬT / GIỮ TẮT / CHƯA KẾT LUẬN.
+    (1) Thắng mốc warm_all (như yêu cầu): median VÀ P90 nhanh hơn ≥ 50 ms (range auto: ≥ 100 ms), lỗi không tăng, và — khi có số đo
+        từng lượt — cận dưới khoảng tin cậy 90% (bootstrap) của cả 2 chênh lệch > 0 (không phải nhờ may rủi số lượt rơi vào đuôi chậm).
+        Chắc chắn KHÔNG đạt ngưỡng (cận trên < ngưỡng) hoặc lỗi tăng → GIỮ TẮT. Còn lại → CHƯA KẾT LUẬN (nhiễu lớn: chạy thêm vòng).
+    (2) Các biến thể v2_* CỘNG DỒN: nhóm cờ thêm vào không được làm chậm rõ rệt so với biến thể liền trước (cận dưới khoảng tin cậy
+        của độ chậm thêm > 25 ms ở median hoặc P90, hoặc lỗi tăng → GIỮ TẮT).
+    Range auto: kết luận chung = warm_all_auto (so với warm_all, ≥ 100 ms) VÀ v2_full_auto (không chậm hơn v2_full)."""
     out = {}
+    samples = samples or {}
     lines = [f"# BENCH_DL_SUMMARY — {iso()} — mốc '{ref}' (TỔNG = resolve → tải → ffprobe)", ""]
     if ref not in summary:
         lines.append(f"Không có mốc '{ref}' trong lần chạy này → không kết luận.")
@@ -4228,34 +4372,69 @@ def bench_dl_summary(base, names, summary, ref="warm_all", min_gain_ms=50.0, tol
         return out
     r = summary[ref]
     erate = lambda x: x["fail"] / max(1, x["n"])
-    lines += [f"Mốc {ref}: median {r['total_ms'][0]} ms | P90 {r['total_ms'][1]} ms | lỗi {r['fail']}/{r['n']}", "",
-              "| Biến thể | median | P90 | lỗi | Δ median / Δ P90 so với warm_all | so với biến thể liền trước | Nhóm cờ | Đề xuất |",
-              "|---|---|---|---|---|---|---|---|"]
+    ok_s = lambda v: len(samples.get(v) or []) >= 5
+    slow = lambda v: (f"{sum(1 for t in samples[v] if t > 1000)}/{len(samples[v])}" if ok_s(v) else "-")
+    lines += [f"Mốc {ref}: median {r['total_ms'][0]} ms | P90 {r['total_ms'][1]} ms | lỗi {r['fail']}/{r['n']} | lượt > 1 s: {slow(ref)}", "",
+              "| Biến thể | median | P90 | lỗi | lượt > 1 s | Δ median / Δ P90 so với warm_all [KTC 90%] | so với biến thể liền trước "
+              "[KTC 90%] | Nhóm cờ | Đề xuất |", "|---|---|---|---|---|---|---|---|---|"]
+    fmt_ci = lambda c: f"[{c[0]:+.0f}…{c[1]:+.0f}]" if c else ""
     prev = ref
-    for v in [x for x in V2_CHAIN if x in names and x != ref] + [x for x in names if x not in V2_CHAIN and x != ref]:
+    order = [x for x in V2_CHAIN if x in names and x != ref] + [x for x in names if x not in V2_CHAIN and x != ref]
+    for v in order:
         if v not in summary:
             continue
         x = summary[v]
         if x["total_ms"][0] is None or r["total_ms"][0] is None:
-            lines.append(f"| {v} | - | - | {x['fail']}/{x['n']} | - | - | {V2_GROUP.get(v, '-')} | CHƯA ĐỦ SỐ ĐO |")
+            lines.append(f"| {v} | - | - | {x['fail']}/{x['n']} | - | - | - | {V2_GROUP.get(v, '-')} | CHƯA ĐỦ SỐ ĐO |")
             continue
+        need = V2_MIN_GAIN.get(v, min_gain_ms)
         dm, d9 = r["total_ms"][0] - x["total_ms"][0], r["total_ms"][1] - x["total_ms"][1]
-        win_ref = dm >= min_gain_ms and d9 >= min_gain_ms and erate(x) <= erate(r)
+        cim = ci9 = None
+        if ok_s(v) and ok_s(ref):
+            cim, ci9 = _boot_ci(samples[ref], samples[v], 50), _boot_ci(samples[ref], samples[v], 90)
+        err_up = erate(x) > erate(r)
+        if err_up:
+            vref = "LOSE"
+        elif cim is None:
+            vref = "WIN" if dm >= need and d9 >= need else "LOSE"
+        elif dm >= need and d9 >= need and cim[0] > 0 and ci9[0] > 0:
+            vref = "WIN"
+        elif cim[1] < need or ci9[1] < need:
+            vref = "LOSE"
+        else:
+            vref = "UNSURE"
         inc_ok, inc_txt = True, "-"
         if v in V2_CHAIN and prev in summary and summary[prev]["total_ms"][0] is not None:
             p_ = summary[prev]
             im, i9 = p_["total_ms"][0] - x["total_ms"][0], p_["total_ms"][1] - x["total_ms"][1]
-            inc_ok = im >= -tol_ms and i9 >= -tol_ms and erate(x) <= erate(p_)
-            inc_txt = f"{prev}: {im:+.0f} / {i9:+.0f}"
-        rec = win_ref and inc_ok
-        out[v] = {"win_vs_ref": win_ref, "incremental_ok": inc_ok, "recommend_on": rec, "gain_median_ms": round(dm, 1),
-                  "gain_p90_ms": round(d9, 1), "error_rate": round(erate(x), 3)}
-        lines.append(f"| {v} | {x['total_ms'][0]:.0f} | {x['total_ms'][1]:.0f} | {x['fail']}/{x['n']} | {dm:+.0f} / {d9:+.0f} | {inc_txt} | "
-                     f"{V2_GROUP.get(v, '-')} | " + ("✅ BẬT nhóm cờ này" if rec else "⏸ GIỮ TẮT nhóm cờ này") + " |")
+            pim = pi9 = None
+            if ok_s(v) and ok_s(prev):
+                pim, pi9 = _boot_ci(samples[prev], samples[v], 50), _boot_ci(samples[prev], samples[v], 90)
+                inc_ok = pim[1] >= -tol_ms and pi9[1] >= -tol_ms and erate(x) <= erate(p_)    # chỉ "chậm hơn" khi chắc chắn
+            else:
+                inc_ok = im >= -tol_ms and i9 >= -tol_ms and erate(x) <= erate(p_)
+            inc_txt = f"{prev}: {im:+.0f} {fmt_ci(pim)} / {i9:+.0f} {fmt_ci(pi9)}"
+        decision = "on" if vref == "WIN" and inc_ok else "off" if (vref == "LOSE" or not inc_ok) else "inconclusive"
+        out[v] = {"verdict_vs_ref": vref, "win_vs_ref": vref == "WIN", "incremental_ok": inc_ok, "recommend_on": decision == "on",
+                  "decision": decision, "gain_median_ms": round(dm, 1), "gain_p90_ms": round(d9, 1), "need_gain_ms": need,
+                  "ci_gain_median": cim, "ci_gain_p90": ci9, "error_rate": round(erate(x), 3)}
+        txt = {"on": "✅ BẬT nhóm cờ này", "off": "⏸ GIỮ TẮT nhóm cờ này", "inconclusive": "❔ CHƯA KẾT LUẬN (nhiễu lớn — chạy thêm vòng)"}
+        lines.append(f"| {v} | {x['total_ms'][0]:.0f} | {x['total_ms'][1]:.0f} | {x['fail']}/{x['n']} | {slow(v)} | "
+                     f"{dm:+.0f} {fmt_ci(cim)} / {d9:+.0f} {fmt_ci(ci9)} (ngưỡng {need:.0f}) | {inc_txt} | {V2_GROUP.get(v, '-')} | "
+                     f"{txt[decision]} |")
         if v in V2_CHAIN:
             prev = v
-    lines += ["", f"Δ dương = nhanh hơn. 'So với biến thể liền trước' cho phép nhiễu ≤ {tol_ms:.0f} ms. 'Giữ tắt' = đặt các cờ của nhóm đó "
-              "về false (range_connections = 1) trong config.json."]
+    ra = [out[k] for k in ("warm_all_auto", "v2_full_auto") if k in out]
+    if ra:
+        dec = "on" if all(d["decision"] == "on" for d in ra) else "off" if any(d["decision"] == "off" for d in ra) else "inconclusive"
+        out["range_auto"] = {"decision": dec, "recommend_on": dec == "on"}
+        lines += ["", f"**range_connections = \"auto\"**: " + {"on": "✅ có thể bật (warm_all_auto và v2_full_auto đều đạt)",
+                                                              "off": "⏸ giữ range_connections = 1",
+                                                              "inconclusive": "❔ chưa kết luận — chạy thêm vòng"}[dec]]
+    lines += ["", f"Δ dương = nhanh hơn. [KTC 90%] = khoảng tin cậy 90% bootstrap của chênh lệch (cần ≥ 5 lượt thành công). 'So với "
+              f"biến thể liền trước' chỉ tính là chậm hơn khi chắc chắn chậm hơn > {tol_ms:.0f} ms. 'Giữ tắt' = đặt các cờ của nhóm đó về "
+              "false (range_connections = 1) trong config.json. 'Chưa kết luận' = chênh lệch nằm trong nhiễu lấy mẫu → giữ như hiện tại "
+              "và chạy thêm vòng (BENCH_TAI_360.bat), không suy ra nhanh/chậm."]
     (base / "BENCH_DL_SUMMARY.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return out
 

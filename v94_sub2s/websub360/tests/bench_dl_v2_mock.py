@@ -30,7 +30,7 @@ import ws360_net as NET  # noqa: E402
 from mock_gvs import MockGVS, MockGVSHosts, install_dns, make_cert  # noqa: E402
 
 ws = T.ws
-VARIANTS = ["warm_all", "v2_ssl", "v2_redirect", "v2_hedge", "v2_full", "v2_full_auto"]
+VARIANTS = ["warm_all", "v2_ssl", "v2_redirect", "v2_hedge", "v2_full", "v2_full_auto", "warm_all_auto"]
 
 
 def make_media(work):
