@@ -25,3 +25,6 @@ logs/*.jsonl*
 !DOWNLOAD_ONLY_BENCHMARK.bat
 FIRST_DL_REPORT.*
 BROWSE_COMPARE.md
+tam_upload_hosts.json
+**/tam_upload_hosts.json
+tam_bench_*
