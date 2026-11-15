@@ -1,0 +1,3 @@
+﻿variant,runs,ok,error_rate_pct,post_ready_ms_median,post_ready_ms_p90,net_attach_to_upload_start_ms_median,net_attach_to_upload_start_ms_p90,net_upload_span_ms_median,net_upload_span_ms_p90,net_attach_to_upload_done_ms_median,net_attach_to_upload_done_ms_p90,net_processing_ms_median,net_processing_ms_p90,net_first_connect_ms_median,net_first_connect_ms_p90,net_first_ssl_ms_median,net_first_ssl_ms_p90,net_first_proxy_ms_median,net_first_proxy_ms_p90
+base,10,10,0.0,1176.35,1194.33,385.85,430.4,556.0,561.56,940.9,989.6,623.65,645.17,0.1,0.31,,,,
+pre,10,10,0.0,871.65,883.98,392.55,432.43,254.95,265.47,649.95,687.57,624.1,632.05,,,,,,
