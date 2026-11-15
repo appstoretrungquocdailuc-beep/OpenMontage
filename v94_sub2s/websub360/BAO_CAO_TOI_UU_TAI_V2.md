@@ -62,7 +62,9 @@ nhanh hơn ở median (KTC 90% của mức giảm: 268…296 ms) nhưng P90 khô
 | #8 tải 8,67 MB loopback (30 lượt) | 10,57 ms | 10,79 ms | không phân biệt được trên mock; giữ vì yêu cầu, rollback bằng `dl_hotpath_v2` |
 
 
-## 3. Review đối kháng — 12 lỗi xác nhận ở bản đầu, đã sửa
+## 3. Review đối kháng (3 vòng)
+
+### Vòng 1 — 12 lỗi xác nhận ở bản đầu (70 agent)
 
 Mỗi lỗi được dựng lại trên mock bởi agent kiểm chứng trước khi tính là "xác nhận"; mỗi bản sửa có test hồi quy trong `tests/test_dl_v2.py`.
 
@@ -71,7 +73,7 @@ Mỗi lỗi được dựng lại trên mock bởi agent kiểm chứng trước
 | R0, R3 | Máy chủ đoán (302) trả 429/403 → cùng lần thử gửi lại URL gốc **kèm hedge** (tới 3 request ngay sau 429) | cao | 429 ở máy chủ đoán → ném 429 luôn, **không gửi thêm** (process() chờ ≥ 10 s như cũ); lỗi khác → đúng 1 GET thường về URL gốc (không hedge, không mở sẵn) | `test_predicted_host_429_raises_without_any_extra_request` |
 | R2 | 403/429 về MUỘN từ bên thua hedge bị bỏ qua → không cấm, không quên → mọi lượt sau lại gửi tới máy chủ đang giới hạn | cao | Ghi nhận lỗi ngay tại luồng nhận lỗi (`_hedge_error`): replica 403/404/410/429 → cấm 10 phút; request chính (đoán) lỗi → báo đoán sai; 429 → tạm dừng suy đoán | `test_late_429_from_losing_replica_bans_it_and_pauses_speculation`, `test_late_failure_of_predicted_host_is_reported_and_blocked_even_if_hedge_rescued` |
 | R4 | Link client khác (sau 403) vẫn chạy hedge/đoán/mở sẵn và lặp lại ở MỌI lần thử (≈ 33 request bị 403 thay vì 10) | trung bình | Link client khác = GET thường; lần thử sau một lỗi 403/410/429 có `no_alt`/`no_spec` → mỗi lần thử đúng 1 GET như cũ | `test_alt_urls_are_plain_gets_and_skipped_on_the_next_attempt` |
-| R5 | Range: mỗi đoạn tự đoán 302 → đoán sai/429 nhân n lần, mỗi đoạn lại quay về ngay | trung bình | Đoán 1 lần cho cả file; đoạn đầu gặp lỗi → các đoạn sau dùng URL gốc; 429 → ném luôn | `test_range_prediction_once_per_file_and_429_is_not_retried` |
+| R5 | Range: mỗi đoạn tự đoán 302 → đoán sai/429 nhân n lần, mỗi đoạn lại quay về ngay | trung bình | (vòng 2 làm chặt hơn) **Range không đoán 302 nữa**; 429 của bất kỳ đoạn nào được báo trước | `test_range_parts_never_use_redirect_prediction`, `test_range_reports_429_even_if_another_part_fails_differently` |
 | R6 | Mở sẵn `mn=` chạy ở MỖI đoạn Range, kiểm tra kết nối rảnh bị đua → 24 kết nối thừa/DASH | trung bình | Mở sẵn 1 lần/file + tập "đang mở" có khoá (không mở trùng) | `test_range_mn_preconnect_runs_once_per_file_not_per_part` |
 | R7 | Quên cặp đoán sai nhưng request về URL gốc dạy lại đúng cặp đó → lần nào cũng đoán sai lại | trung bình | Đoán sai → chặn đoán cho máy chủ + cụm đó 10 phút (`_RDR_BLOCK`) | `test_redirect_memory_skips_302_and_falls_back_on_wrong_guess` (phần cuối) |
 | R8 | Mở sẵn vẫn chạy ở `net_mode: legacy` (kết nối mở sẵn bị urllib3 gốc vứt đi → chỉ tốn bắt tay) | thấp | Chỉ mở sẵn ở lớp mạng `fast` | `test_mn_preconnect_is_skipped_in_legacy_net_mode` |
@@ -80,8 +82,29 @@ Mỗi lỗi được dựng lại trên mock bởi agent kiểm chứng trước
 | R10 | 20 lượt + đuôi chậm 10% → P90 nhảy ~1,3 s theo số lượt rơi vào đuôi; dung sai 25 ms làm kết luận lật ngược | trung bình | Khoảng tin cậy 90% bootstrap cho Δ median/Δ P90; kết luận 3 mức BẬT / GIỮ TẮT / **CHƯA KẾT LUẬN**; thêm cột "lượt > 1 s" | `test_summary_marks_p90_flip_from_tail_count_as_inconclusive_not_off` |
 | R11 | Hedge cứu được thì đoán sai vẫn ghi là "đoán đúng"; Range không báo đoán sai | thấp | `redirect_skip_fail` ghi cả khi hedge cứu; cột bench ưu tiên `FAIL:`; Range ghi đoán sai | như R2 + R5 |
 
+### Vòng 2 — kiểm lại bản sửa (60 agent, chỉ đọc code, mỗi phát hiện qua 2 agent bác bỏ)
+Kết quả: 3/12 lỗi vòng 1 sửa trọn; 9 lỗi còn "ca biên"; 18 phát hiện mới đứng vững (4 bị bác). Tất cả đã sửa:
+
+| Nhóm lỗi (vòng 2) | Sửa | Test hồi quy |
+|---|---|---|
+| 429 của replica hedge bị lỗi khác (403 chậm/timeout của bên chính) che → quay về URL gốc, thử link client khác, chỉ chờ 1 s | Có 429 ở bất kỳ bên nào → báo 429; đang tạm dừng vì 429 → không quay về URL gốc; process() coi lần thử có 429 ở nhánh phụ là 429 (chờ ≥ 10 s) | `test_replica_429_is_not_hidden_by_slow_403_of_predicted_host` |
+| Trong 120 ms chờ hedge, luồng khác gặp 429 → vẫn bắn kép | Kiểm lại trạng thái tạm dừng ngay trước khi gửi request dự phòng | (cùng cơ chế `_speculative_ok`) |
+| Link client khác không tôn trọng tạm dừng 429; 2 client trả CÙNG link → gửi 2 lần; lỗi mạng của link phụ che 403 gốc | Bỏ qua khi đang tạm dừng; khử trùng link; link phụ = đúng 1 GET; lỗi mạng của link phụ → báo lại 403 gốc | `test_alt_loop_skipped_during_429_pause_and_alt_network_error_keeps_original_403` |
+| "Thận trọng" ở lần thử sau chỉ dựa vào chữ lỗi cuối → 403 bị che thì lần sau lại suy đoán + thử link phụ | Nhớ THEO VIDEO (trong RAM) mọi 403/410/429 ở bất kỳ request nào → các lần thử sau: không suy đoán, không link phụ | `test_video_remembers_block_across_attempts_even_if_last_error_is_not_http` |
+| `probe_size` nuốt 403/429 → GET ngay sau vẫn hedge/đoán/mở sẵn | Dò bị 403/410/429 → GET sau đó là GET thường (+ tạm dừng nếu 429) | `test_probe_403_makes_following_get_plain` |
+| Range: các đoạn gửi cùng lúc nên "đoán 1 lần" vẫn nhân n request sai; lỗi đoạn đầu che 429 đoạn khác | Range KHÔNG đoán 302; báo lỗi theo thứ tự 429 > 403/410/404 > khác (cờ tắt: như cũ) | 2 test Range ở vòng 1 (đã viết lại) |
+| Bản sửa R1 gây lỗi mới: body `chunked` hỏng khi trộn `read()` + `stream()` | Body chunked: chỉ dùng `stream()` như cũ | `test_v2_hotpath_handles_chunked_responses` |
+| `dl_hedge_delay_ms` sai định dạng (vd "120ms") làm MỌI lượt tải lỗi kể cả khi cờ tắt | Chỉ đọc khi hedge, đọc an toàn (hỏng → 120 ms) | `test_malformed_hedge_delay_never_breaks_downloads` |
+| Replica thắng khi request đoán chưa trả lời → vẫn tính "đoán đúng" | Ghi "chưa rõ" (cột `redirect_skip` = `?host`), không cộng vào số đoán đúng | `test_replica_win_while_predicted_pending_is_not_counted_as_correct_guess` |
+| Bench: 1 lượt 429 làm các biến thể v2 sau đó chạy như đã tắt mà không ai biết | KHÔNG xoá tạm dừng (an toàn), nhưng ghi cột `spec_paused` từng lượt; biến thể có lượt bị ảnh hưởng → CHƯA KẾT LUẬN | `test_summary_marks_variants_measured_during_429_pause_inconclusive` |
+| Bench: so với biến thể liền trước chỉ 2 trạng thái → 1 lượt nhiễu lật BẬT ↔ TẮT | 3 trạng thái: ổn / chậm hơn chắc chắn / chưa rõ | `test_summary_incremental_check_has_unsure_state_and_does_not_flip_on_one_run` |
+| Bench: thiếu hoặc lỗi hết `warm_all_auto` mà vẫn ghi "range auto có thể bật"; dòng auto tự ghi BẬT trái kết luận chung | Range auto BẮT BUỘC có `warm_all_auto`; biến thể 0 lượt thành công = lỗi tăng; dòng auto trỏ về kết luận chung | `test_summary_range_auto_needs_warm_all_auto_and_failed_variants_count` |
+| Chặn đoán theo cụm bị bỏ qua khi máy chủ khác cùng cụm có cặp riêng (bị bác là "không vi phạm", vẫn làm cho chặt) | Kiểm chặn cụm trước mọi tra cứu | (phần cuối test đoán sai) |
+
+⟨ROUND3⟩
+
 Thêm (không có trong yêu cầu, chỉ làm cho an toàn hơn): **bất kỳ 429 nào từ googlevideo → 10 phút không gửi request suy đoán nào**
-(đoán 302, hedge, mở sẵn). Cờ tắt thì biến này không có tác dụng gì.
+(đoán 302, hedge, mở sẵn, link client khác). Cờ tắt hết thì cơ chế này không có tác dụng gì và mọi đường lỗi giữ y bản cũ.
 
 ## 4. Hướng dẫn 5 dòng (đo thật trên máy bạn)
 1. Tắt WS360 đang chạy (để mạng không bị chia), giữ nguyên `config.json` hiện tại (bench tự đổi cờ cho từng biến thể).
@@ -116,7 +139,7 @@ Tất cả về giá trị cột phải = đúng đường code bản trước (
 - **#1 trên Windows**: lợi ích dự kiến đến từ việc không duyệt kho chứng chỉ Windows cho mỗi kết nối — Linux không có chi phí đó (mục 2 cho thấy gần bằng nhau). Chỉ đo được bằng `BENCH_TAI_360.bat`.
 - **TLS resumption (`tls_resumed`)**: Python chỉ resume phiên TLS khi được đưa session cũ; urllib3 không làm việc đó → cột `tls_resumed` gần như luôn `0`. Với TLS 1.3, resume cũng không bớt được vòng mạng nào (chỉ bớt tính toán), nên KHÔNG kỳ vọng lợi ích từ đây.
 - **`SO_RCVBUF` 4 MiB**: đặt cố định thì hệ điều hành thôi tự co giãn bộ đệm nhận (Linux còn giới hạn theo `net.core.rmem_max`; trên mock loopback không có độ trễ/băng thông thật nên không đo được tác dụng); ảnh hưởng thật chỉ đo được trên máy bạn (Windows) → nếu bench `v2_ssl` không thắng, đặt `net_rcvbuf_mb: 0`.
-- **Range + hedge**: yêu cầu ghi "đoạn đầu tiên dùng chính kết nối đang hedge" — bản này KHÔNG hedge từng đoạn Range (giữ số socket ≤ n). Range auto mặc định tắt; chỉ bật khi `BENCH_DL_SUMMARY.md` ghi BẬT cho cả `warm_all_auto` và `v2_full_auto`.
+- **Range + hedge + đoán 302**: yêu cầu ghi "đoạn đầu tiên dùng chính kết nối đang hedge" — bản này KHÔNG hedge và KHÔNG đoán 302 cho đoạn Range (các đoạn gửi cùng lúc nên một lần đoán sai/429 sẽ nhân lên n request trước khi kịp biết — review vòng 2). Range vẫn được mở sẵn `mn=` 1 lần/file. Range auto mặc định tắt; chỉ bật khi `BENCH_DL_SUMMARY.md` ghi BẬT cho cả `warm_all_auto` và `v2_full_auto`.
 - **Mục 6 (range auto)** không đổi mặc định — đúng yêu cầu.
 - **Hedge bắn kép rất thường xuyên với 120 ms**: trên mock, chờ máy chủ cơ bản 150 ms > 120 ms nên **20/20 lượt đều gửi thêm 1 request**
   (đúng giới hạn "tối đa 1 request kép/file", nhưng tăng gấp đôi số GET tới googlevideo). Trên máy thật, nếu cột "chờ máy chủ tải" trong
