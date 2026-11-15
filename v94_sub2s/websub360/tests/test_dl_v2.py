@@ -348,16 +348,18 @@ def test_hedge_also_covers_the_predicted_redirect_target(hosts, cert, tmp_path):
 
 
 @need_openssl
-def test_range_parts_use_learned_redirect_target(hosts, cert, tmp_path):
+def test_range_parts_never_use_redirect_prediction(hosts, cert, tmp_path):
+    """Review vòng 2: mọi đoạn Range gửi cùng lúc → đoán sai/403/429 nhân n lần trước khi kịp biết. Range KHÔNG đoán 302."""
     hosts.host_rules[A1] = {"redirect_to": B1}
     data = bytes(range(256)) * 4000
     hosts.add("/r1", b"x" * 1000)
     hosts.add("/r2", data)
     use(cert, net_redirect_memory=True)
     ws.download_single(hosts.url(A1, "/r1"), tmp_path / "1", {})
+    assert ws.redirect_predict(hosts.url(A1, "/r2"))[0]                               # đã học
     info = {}
     assert ws.download_ranges(hosts.url(A1, "/r2"), tmp_path / "2", len(data), 3, info) == len(data)
-    assert (tmp_path / "2").read_bytes() == data and hosts.reqs[(A1, "/r2")] == 0 and info["redirect_skip"] == "host"
+    assert (tmp_path / "2").read_bytes() == data and hosts.reqs[(A1, "/r2")] == 3 and "redirect_skip" not in info
 
 
 def test_summary_recommends_group_only_if_it_beats_reference_and_its_predecessor(tmp_path):
@@ -482,21 +484,33 @@ def test_late_failure_of_predicted_host_is_reported_and_blocked_even_if_hedge_re
 
 
 @need_openssl
-def test_range_prediction_once_per_file_and_429_is_not_retried(hosts, cert, tmp_path):
-    hosts.host_rules[A3] = {"redirect_to": B1}
+def test_range_reports_429_even_if_another_part_fails_differently(hosts, cert, tmp_path):
+    """Review vòng 2: lỗi của đoạn đầu (vd 404/timeout) không được che 429 của đoạn khác (process phải chờ ≥ 10 s)."""
     data = bytes(range(256)) * 2000
-    hosts.add("/g1", b"x" * 1000)
     hosts.add("/g2", data)
-    use(cert, net_redirect_memory=True, net_mn_preconnect=True)
-    ws.download_single(hosts.url(A3, "/g1"), tmp_path / "1", {})
-    hosts.host_rules[A3] = {"redirect_to": "rr3---sn-bbb.googlevideo.com"}
-    ws.redirect_learn(hosts.url(A3, "/x"), hosts.url("rr3---sn-bbb.googlevideo.com", "/x"))
-    hosts.host_status[("rr3---sn-bbb.googlevideo.com", "/g2")] = 429
-    with pytest.raises(ws.HttpStatus) as ei:
-        ws.download_ranges(hosts.url(A3, "/g2", mn=("sn-aaa", "sn-bbb", "sn-ccc")), tmp_path / "2", len(data), 4, {})
-    time.sleep(0.2)
-    assert ei.value.code == 429 and hosts.reqs[(A3, "/g2")] == 0                     # 429 ở đích đoán → không quay về gửi thêm
-    assert hosts.reqs[("rr3---sn-bbb.googlevideo.com", "/g2")] <= 4
+    real = ws._follow
+
+    def fake(url, headers=None, **k):
+        a = int(headers["Range"].split("=")[1].split("-")[0])
+        if a == 0:
+            raise ws.HttpStatus(404)
+        if a > len(data) // 2:
+            raise ws.HttpStatus(429)
+        return real(url, headers=headers, **k)
+    use(cert, net_mn_preconnect=True)
+    ws_follow = ws._follow
+    ws._follow = fake
+    try:
+        info = {}
+        with pytest.raises(ws.HttpStatus) as ei:
+            ws.download_ranges(hosts.url(A3, "/g2"), tmp_path / "2", len(data), 4, info)
+        assert ei.value.code == 429 and info["saw_block"] == 429
+        ws.set_net_opts(ws.NET_OPTS_OFF)                                             # cờ tắt: như bản cũ (lỗi đoạn đầu)
+        with pytest.raises(ws.HttpStatus) as ei:
+            ws.download_ranges(hosts.url(A3, "/g2"), tmp_path / "3", len(data), 4, {})
+        assert ei.value.code == 404
+    finally:
+        ws._follow = ws_follow
 
 
 @need_openssl
@@ -577,3 +591,180 @@ def test_summary_can_be_regenerated_from_csv_with_reasons(tmp_path):
     assert out["v2_ssl"]["decision"] == "off" and out["v2_ssl"]["error_rate"] > 0 and out["v2_ssl"]["reason"] == "lỗi tăng"
     md = (tmp_path / "BENCH_DL_SUMMARY.md").read_text(encoding="utf-8")
     assert "Lý do" in md and "Cộng dồn" in md
+
+
+# ------------------------------------------------------------------ hồi quy review vòng 2
+@need_openssl
+def test_replica_429_is_not_hidden_by_slow_403_of_predicted_host(hosts, cert, tmp_path):
+    hosts.host_rules[A1] = {"redirect_to": B1}
+    hosts.add("/w1", b"1" * 2000)
+    hosts.add("/w2", b"2" * 2000)
+    use(cert, net_redirect_memory=True, dl_hedge=True, dl_hedge_delay_ms=50)
+    ws.download_single(hosts.url(A1, "/w1", mn=("sn-aaa", "sn-bbb", "sn-ccc")), tmp_path / "1", {})
+    hosts.host_rules[B1] = {"server_wait": (0.3, 0, 0)}
+    hosts.host_status[(B1, "/w2")] = 403                                             # đoán: 403 chậm (sau khi đã hedge)
+    hosts.host_status[(C1, "/w2")] = 429                                             # replica: 429 ngay
+    info = {}
+    with pytest.raises(ws.HttpStatus) as ei:
+        ws.download_single(hosts.url(A1, "/w2", mn=("sn-aaa", "sn-bbb", "sn-ccc")), tmp_path / "2", info)
+    time.sleep(0.2)
+    assert ei.value.code == 429 and hosts.reqs[(A1, "/w2")] == 0 and info["saw_block"] == 429 and ws.spec_paused()
+
+
+@need_openssl
+def test_replica_win_while_predicted_pending_is_not_counted_as_correct_guess(hosts, cert, tmp_path):
+    hosts.host_rules[A1] = {"redirect_to": B1}
+    hosts.add("/u1", b"1" * 2000)
+    hosts.add("/u2", b"2" * 2000)
+    use(cert, net_redirect_memory=True, dl_hedge=True, dl_hedge_delay_ms=50)
+    ws.download_single(hosts.url(A1, "/u1", mn=("sn-aaa", "sn-bbb", "sn-ccc")), tmp_path / "1", {})
+    hosts.host_rules[B1] = {"server_wait": (0.6, 0, 0)}                              # đích đoán chậm, chưa trả lời khi replica thắng
+    before = ws.DL_STATS["redirect_skip"]
+    info = {}
+    ws.download_single(hosts.url(A1, "/u2", mn=("sn-aaa", "sn-bbb", "sn-ccc")), tmp_path / "2", info)
+    assert info["hedge_win"] == "replica" and info["redirect_unconfirmed"] and ws.DL_STATS["redirect_skip"] == before
+
+
+def test_v2_hotpath_handles_chunked_responses(tmp_path):
+    """Review vòng 2: read() + stream() trên body chunked làm hỏng bộ giải mã chunk của urllib3."""
+    import http.server
+    body = bytes(range(256)) * 11719                                                 # ≈ 3 MB
+    class H(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            for i in range(0, len(body), 100_000):
+                c = body[i:i + 100_000]
+                self.wfile.write(f"{len(c):x}\r\n".encode() + c + b"\r\n")
+            self.wfile.write(b"0\r\n\r\n")
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    try:
+        for on in (True, False):
+            ws.set_net_opts(dict(ws.NET_OPTS_OFF, dl_hotpath_v2=on))
+            assert ws.download_single(f"http://127.0.0.1:{srv.server_address[1]}/c", tmp_path / f"c{on}", {}) == len(body)
+            assert (tmp_path / f"c{on}").read_bytes() == body
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_malformed_hedge_delay_never_breaks_downloads(tmp_path, gvs):
+    url = gvs.add("/md", b"m" * 5000, "ok")
+    ws.set_net_opts(dict(ws.NET_OPTS_OFF, dl_hedge_delay_ms="120ms"))                # cờ tắt + giá trị hỏng: như bản cũ
+    assert ws.download_single(url, tmp_path / "a", {}) == 5000
+    ws.set_net_opts(dict(ws.NET_OPTS_OFF, dl_hedge=True, dl_hedge_delay_ms="abc"))
+    assert ws._hedge_delay_s() == 0.12 and ws.download_single(url, tmp_path / "b", {}) == 5000
+
+
+def test_alt_loop_skipped_during_429_pause_and_alt_network_error_keeps_original_403(tmp_path, gvs, monkeypatch):
+    from concurrent.futures import Future
+    bad1 = gvs.add("/alt2/w", b"", "status", code=403)
+    bad2 = gvs.add("/alt2/a", b"", "status", code=403)
+    ws.set_net_opts(dict(ws.NET_OPTS_OFF, dl_alt_url_on_403=True))
+    e = T.make_engine(tmp_path, T.CH[:1], excel_enabled=False)
+    fut = Future()
+    fut.set_result({"pick": {"kind": "progressive", "video": T.mkfmt(bad2, 18, 360, "video/mp4", 100)}})
+    fmt = T.mkfmt(bad1, 18, 360, "video/mp4", 100)
+    ws.note_429()
+    with pytest.raises(ws.HttpStatus):
+        e._fetch(fmt, tmp_path / "o.mp4", {}, 1, alts=[("web_embedded", fut)])
+    assert len(gvs.requests_for("/alt2/a")) == 0                                     # đang tạm dừng vì 429 → không thử link phụ
+    ws.reset_dl_v2_state()
+    real = ws.Engine._fetch_one
+
+    def one(self, f, dest, info, n, cancel=None):
+        if f["url"] == bad2:
+            raise urllib3.exceptions.ReadTimeoutError(None, bad2, "t")
+        return real(self, f, dest, info, n, cancel)
+    monkeypatch.setattr(ws.Engine, "_fetch_one", one)
+    info = {}
+    with pytest.raises(ws.HttpStatus) as ei:
+        e._fetch(fmt, tmp_path / "o.mp4", info, 1, alts=[("web_embedded", fut)])
+    assert ei.value.code == 403 and info["alt_tried"]                                # lỗi mạng của link phụ không che 403 gốc
+
+
+@need_openssl
+def test_probe_403_makes_following_get_plain(hosts, cert, tmp_path):
+    import types
+    hosts.add("/pz", b"z" * 1000)
+    hosts.host_status[(A3, "/pz")] = 403
+    use(cert, net_mn_preconnect=True, dl_hedge=True, dl_hedge_delay_ms=1)
+    eng = types.SimpleNamespace(stop_ev=threading.Event(), log=lambda *a: None)
+    info = {}
+    with pytest.raises(ws.HttpStatus):
+        ws.Engine._fetch_one(eng, {"url": hosts.url(A3, "/pz", mn=("sn-aaa", "sn-bbb", "sn-ccc")), "clen": 0}, tmp_path / "p", info, 2)
+    time.sleep(0.2)
+    assert info["no_spec"] and info["saw_block"] == 403 and "mn_preconnect" not in info and not info.get("hedge_sent")
+    assert hosts.reqs[(A3, "/pz")] == 2                                              # dò + 1 GET thường, không gì thêm
+
+
+@T.need_ff
+def test_video_remembers_block_across_attempts_even_if_last_error_is_not_http(tmp_path, gvs, media, monkeypatch):
+    """Review vòng 2: 403 bị lỗi mạng của link phụ che → lần thử sau vẫn phải 'thận trọng' (không suy đoán, không link phụ)."""
+    vid = "CAUTION0001"
+    bad = gvs.add(f"/vp/{vid}_w", b"", "status", code=403, hdr_delay=0.25)           # 403 chậm → link client khác đã về
+    alt = gvs.add(f"/vp/{vid}_a", b"", "status", code=403)
+    seen = []
+
+    def player(self, v, client):
+        if client != "android_vr":
+            time.sleep(0.05)
+        return {"client": client, "verdict": "ok", "net": {}, "title": "t", "pick": {
+            "kind": "progressive", "audio": None,
+            "video": T.mkfmt(bad if client == "android_vr" else alt, 18, 360, 'video/mp4; codecs="avc1, mp4a"', 1000)}}
+    monkeypatch.setattr(ws.Resolver, "_player", player)
+    real_fetch = ws.Engine._fetch
+    monkeypatch.setattr(ws.Engine, "_fetch", lambda self, fmt, dest, info, n, cancel=None, alts=None: seen.append(dict(info)) or
+                        real_fetch(self, fmt, dest, info, n, cancel, alts))
+    e = T.make_engine(tmp_path, T.CH[:1], excel_enabled=False, retry_schedule_sec=[0.2, 0.2])
+    e.start(websub=False)
+    e.on_event(T.CH[0], vid, "WEBSUB", T.TS)
+    r = T.wait_state(e, vid, states=("FAILED",), t=20)
+    e.stop()
+    assert r["state"] == "FAILED" and len(seen) == 3
+    assert not seen[0].get("no_alt") and all(x.get("no_alt") and x.get("no_spec") for x in seen[1:])
+    assert len(gvs.requests_for(f"/vp/{vid}_a")) == 1                                # link phụ: đúng 1 lần cho cả video
+
+
+def test_summary_incremental_check_has_unsure_state_and_does_not_flip_on_one_run(tmp_path):
+    import csv as _csv
+    rows = list(_csv.DictReader(open(HERE.parent / "BENCH_DL_V2_MOCK.csv", encoding="utf-8")))
+    smp = {}
+    for r in rows:
+        if r["result"] == "DONE" and r["variant"] in ("warm_all", "v2_ssl", "v2_redirect", "v2_hedge", "v2_full"):
+            smp.setdefault(r["variant"], []).append(float(r["total_ms"]))
+    out = ws.bench_dl_summary(tmp_path, list(smp), _summ(smp), samples=smp)
+    h2 = sorted(smp["v2_hedge"])[:-1] + [sorted(smp["v2_hedge"])[len(smp["v2_hedge"]) // 2]]   # bỏ lượt chậm nhất của v2_hedge
+    smp2 = dict(smp, v2_hedge=h2)
+    out2 = ws.bench_dl_summary(tmp_path, list(smp2), _summ(smp2), samples=smp2)
+    assert out["v2_full"]["decision"] != "on" and {out["v2_full"]["decision"], out2["v2_full"]["decision"]} != {"on", "off"}
+
+
+def test_summary_range_auto_needs_warm_all_auto_and_failed_variants_count(tmp_path):
+    import random as _r
+    rnd = _r.Random(6)
+    smp = {"warm_all": _samples(rnd, 900), "v2_full": _samples(rnd, 760), "v2_full_auto": _samples(rnd, 775)}
+    out = ws.bench_dl_summary(tmp_path, list(smp), _summ(smp), samples=smp)
+    assert out["range_auto"]["decision"] == "inconclusive"                           # chưa đo warm_all_auto → không được BẬT
+    names = list(smp) + ["warm_all_auto"]
+    summ = dict(_summ(smp), warm_all_auto={"total_ms": (None, None, None), "n": 20, "fail": 20})
+    out2 = ws.bench_dl_summary(tmp_path, names, summ, samples=smp)
+    assert out2["warm_all_auto"]["decision"] == "off" and out2["range_auto"]["decision"] == "off"
+    md = (tmp_path / "BENCH_DL_SUMMARY.md").read_text(encoding="utf-8")
+    assert "xem dòng range auto" in md
+
+
+def test_summary_marks_variants_measured_during_429_pause_inconclusive(tmp_path):
+    import random as _r
+    rnd = _r.Random(8)
+    smp = {"warm_all": _samples(rnd, 900), "v2_ssl": _samples(rnd, 899), "v2_redirect": _samples(rnd, 600)}
+    out = ws.bench_dl_summary(tmp_path, list(smp), _summ(smp), samples=smp, paused={"v2_redirect": 4})
+    assert out["v2_redirect"]["decision"] == "inconclusive" and "429" in out["v2_redirect"]["reason"]

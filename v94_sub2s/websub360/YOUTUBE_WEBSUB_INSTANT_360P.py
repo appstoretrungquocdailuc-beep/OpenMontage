@@ -1196,11 +1196,11 @@ def redirect_predict(url):
     now = time.monotonic()
     sn = _gv_parts(a)[1]
     with _RDR_LOCK:
-        if _RDR_BLOCK.get(a, 0) > now:                       # nguồn này vừa đoán sai → không đoán (kể cả khi URL gốc đã dạy lại)
-            return None, ""
+        if _RDR_BLOCK.get(a, 0) > now or (sn and _RDR_BLOCK.get("sn:" + sn, 0) > now):
+            return None, ""                                  # nguồn/cụm vừa đoán sai → không đoán (kể cả khi URL gốc đã dạy lại)
         e, how = _RDR_HOST.get(a), "host"
         if not e or now - e[1] > _RDR_TTL:
-            e, how = (_RDR_SN.get(sn) if sn and _RDR_BLOCK.get("sn:" + sn, 0) <= now else None), "cluster"
+            e, how = (_RDR_SN.get(sn) if sn else None), "cluster"
         if not e or now - e[1] > _RDR_TTL or e[0] == a:
             return None, ""
         dst = e[0]
@@ -1290,12 +1290,20 @@ def _close_quiet(r):
         pass
 
 
-def _hedge_error(tag, u, e, on_primary_fail):
+def mark_block(info, e):
+    """Ghi nhận 403/410/429 xảy ra ở BẤT KỲ request nào của lần thử (kể cả nhánh phụ) → process() nhớ theo video: các lần thử sau
+    không request suy đoán, không thử link client khác."""
+    if info is not None and isinstance(e, HttpStatus) and e.code in (403, 410, 429) and info.get("saw_block") != 429:
+        info["saw_block"] = e.code                      # 429 được giữ ưu tiên
+
+
+def _hedge_error(tag, u, e, on_primary_fail, info=None):
     """Ghi nhận lỗi NGAY tại luồng nhận lỗi (kể cả khi bên kia đã thắng và hàm đã trả về): 429 → tạm dừng suy đoán; replica
     403/404/410/429 CHẮC CHẮN → cấm 10 phút; request chính lỗi → báo cho _open_media (đoán 302 sai). Timeout/lỗi mạng của
     replica KHÔNG bị cấm (bên thua chậm không phải lỗi)."""
     if isinstance(e, HttpStatus) and e.code == 429:
         note_429()
+    mark_block(info, e)
     if tag == "replica" and isinstance(e, HttpStatus) and e.code in (403, 404, 410, 429):
         _HEDGE_BAN[_netloc(u)] = time.monotonic() + 600
         DL_STATS["hedge_ban"] += 1
@@ -1316,7 +1324,7 @@ def _hedged_follow(url, replica, delay_s, info, headers=None, on_primary_fail=No
             r, fin = _follow(u, headers=headers)
             q.put((tag, r, fin, None))
         except Exception as e:  # noqa: BLE001
-            _hedge_error(tag, u, e, on_primary_fail)
+            _hedge_error(tag, u, e, on_primary_fail, info)
             q.put((tag, None, None, e))
     threading.Thread(target=run, args=("primary", url), daemon=True, name="DL-PRIMARY").start()
     started, got = 1, []
@@ -1329,6 +1337,12 @@ def _hedged_follow(url, replica, delay_s, info, headers=None, on_primary_fail=No
             raise first[3]
         info["hedge_win"] = "primary(no-hedge)"
         return first[1], first[2]
+    if not _speculative_ok(info):                               # vừa có 429 (luồng khác) trong lúc chờ → không bắn kép, chỉ chờ bên chính
+        tag, r, fin, err = q.get(timeout=60)
+        if err is not None:
+            raise err
+        info["hedge_win"] = "primary(no-hedge)"
+        return r, fin
     threading.Thread(target=run, args=("replica", replica), daemon=True, name="DL-REPLICA").start()
     started += 1
     DL_STATS["hedge_sent"] += 1
@@ -1342,6 +1356,8 @@ def _hedged_follow(url, replica, delay_s, info, headers=None, on_primary_fail=No
             info["hedge_win"] = tag
             if tag == "replica":
                 DL_STATS["hedge_win_replica"] += 1
+                if not any(x[0] == "primary" for x in got):
+                    info["hedge_primary_pending"] = True        # request chính chưa trả lời: chưa biết đúng/sai
             left = started - len(got)
             if left:
                 def reap(n=left):                               # bên thua: đóng ngay khi nó trả về (timeout muộn KHÔNG tính lỗi)
@@ -1356,7 +1372,8 @@ def _hedged_follow(url, replica, delay_s, info, headers=None, on_primary_fail=No
             return r, fin
         if tag == "primary":
             perr = err
-    raise perr or got[-1][3]
+    e429 = next((x[3] for x in got if isinstance(x[3], HttpStatus) and x[3].code == 429), None)
+    raise e429 or perr or got[-1][3]                            # có 429 ở bất kỳ bên nào → báo 429 (process chờ ≥ 10 s)
 
 
 def _guess_failed(url, info, e):
@@ -1365,9 +1382,15 @@ def _guess_failed(url, info, e):
         return
     info["redirect_skip_fail"] = f"{type(e).__name__}"[:40] + (f" {e.code}" if isinstance(e, HttpStatus) else "")
     DL_STATS["redirect_skip_fail"] += 1
+    mark_block(info, e)
     redirect_forget(url)
     if isinstance(e, HttpStatus) and e.code == 429:
         note_429()
+
+
+def _v2_spec_flags() -> bool:
+    """Có bật ít nhất 1 tối ưu gửi request thêm/khác (đoán 302, mở sẵn, hedge, link client khác)? Tắt hết → mọi đường lỗi y bản cũ."""
+    return any(NET_OPTS.get(k) for k in ("net_redirect_memory", "net_mn_preconnect", "dl_hedge", "dl_alt_url_on_403"))
 
 
 def _speculative_ok(info) -> bool:
@@ -1382,13 +1405,12 @@ def _open_media(url, info, allow_hedge=True, headers=None):
     An toàn: máy chủ đoán trả 429 → ném 429 luôn (process() chờ ≥ 10 s như bản cũ, KHÔNG gửi thêm); lỗi khác → đúng 1 GET thường
     tới URL gốc (không hedge, không mở sẵn). Mọi request suy đoán dừng khi _speculative_ok() sai."""
     spec = _speculative_ok(info)
-    delay = max(0.0, float(NET_OPTS.get("dl_hedge_delay_ms") or 120)) / 1000.0
 
     def open_one(u, on_fail=None):
         if allow_hedge and spec and NET_OPTS.get("dl_hedge"):
             rep = _replica_for(u)
             if rep:
-                return _hedged_follow(u, rep, delay, info, headers, on_primary_fail=on_fail)
+                return _hedged_follow(u, rep, _hedge_delay_s(), info, headers, on_primary_fail=on_fail)
         return _follow(u, headers=headers)
     if spec and NET_OPTS.get("net_redirect_memory"):
         pred, how = redirect_predict(url)
@@ -1396,13 +1418,15 @@ def _open_media(url, info, allow_hedge=True, headers=None):
             info.update(redirect_skip=how, skipped_to=_netloc(pred))
             try:
                 r, fin = open_one(pred, on_fail=lambda e: _guess_failed(url, info, e))
-                if not info.get("redirect_skip_fail"):
+                if info.get("hedge_primary_pending"):
+                    info["redirect_unconfirmed"] = True            # replica thắng khi request đoán chưa trả lời → không tính 'đoán đúng'
+                elif not info.get("redirect_skip_fail"):
                     DL_STATS["redirect_skip"] += 1
                 return r, fin
             except Exception as e:  # noqa: BLE001
                 _guess_failed(url, info, e)
-                if isinstance(e, HttpStatus) and e.code == 429:
-                    raise                                          # bị giới hạn tốc độ → không gửi thêm request nào
+                if (isinstance(e, HttpStatus) and e.code == 429) or spec_paused():
+                    raise                                          # có 429 (ở đây hoặc nơi khác) → không gửi thêm request nào
                 info["no_spec"] = True                             # quay về URL gốc NGAY (cùng lần thử): đúng 1 GET thường
                 info.pop("hedge_win", None)
                 return _follow(url, headers=headers)
@@ -1413,7 +1437,17 @@ def _open_media(url, info, allow_hedge=True, headers=None):
     return open_one(url)
 
 
+def _hedge_delay_s():
+    try:
+        return max(0.0, float(NET_OPTS.get("dl_hedge_delay_ms") or 120)) / 1000.0
+    except (TypeError, ValueError):
+        return 0.12                                                # giá trị cấu hình hỏng → 120 ms (không làm hỏng việc tải)
+
+
 def _chunks_v2(r):
+    if getattr(r, "chunked", False):                    # chunked: giữ 1 bộ giải mã (urllib3 read_chunked) như bản cũ
+        yield from r.stream(256 * 1024)
+        return
     head = r.read(256 * 1024)
     if head:
         yield head
@@ -1477,35 +1511,15 @@ def download_ranges(url: str, dest: Path, size: int, n: int, info: dict, cancel=
     firsts = []
     hops_all = []
     finals = []
-    # v2: đoán máy chủ đích 302 + mở sẵn mn= MỘT lần cho cả file (không phải mỗi đoạn). Đoạn nào gặp lỗi ở máy chủ đoán → các đoạn
-    # sau dùng URL gốc; 429 → ném luôn (không gửi thêm). Đoạn không hedge (giữ ≤ n kết nối).
-    pred, bad_guess, glock = None, threading.Event(), threading.Lock()
-    if _speculative_ok(info):
-        if NET_OPTS.get("net_redirect_memory"):
-            pred, how = redirect_predict(url)
-            if pred:
-                info.update(redirect_skip=how, skipped_to=_netloc(pred))
-        if not pred and NET_OPTS.get("net_mn_preconnect"):
-            pre = mn_preconnect(url)
-            if pre:
-                info["mn_preconnect"] = len(pre)
+    # v2: Range KHÔNG đoán máy chủ đích 302 (mọi đoạn gửi cùng lúc nên một lần đoán sai/403/429 sẽ nhân lên n request trước khi kịp
+    # biết) — chỉ mở sẵn mn= MỘT lần cho cả file. Đoạn không hedge (giữ ≤ n kết nối).
+    if _speculative_ok(info) and NET_OPTS.get("net_mn_preconnect") and not info.get("no_preconnect"):
+        pre = mn_preconnect(url)
+        if pre:
+            info["mn_preconnect"] = len(pre)
 
     def one(a, b):
-        rng = {"Range": f"bytes={a}-{b}"}
-        if pred and not bad_guess.is_set():
-            try:
-                rr, fin = _follow(pred, headers=rng)
-            except Exception as e:  # noqa: BLE001
-                with glock:
-                    first_bad = not bad_guess.is_set()
-                    bad_guess.set()
-                if first_bad:
-                    _guess_failed(url, info, e)
-                if isinstance(e, HttpStatus) and e.code == 429:
-                    raise
-                rr, fin = _follow(url, headers=rng)
-        else:
-            rr, fin = _follow(url, headers=rng, preload=False)
+        rr, fin = _follow(url, headers={"Range": f"bytes={a}-{b}"}, preload=False)
         hops_all.extend(getattr(rr, "_ws_hops", []) or [])
         finals.append(fin)
         if rr.status != 206:
@@ -1531,10 +1545,19 @@ def download_ranges(url: str, dest: Path, size: int, n: int, info: dict, cancel=
         finally:
             rr.release_conn()
     with ThreadPoolExecutor(max_workers=len(parts), thread_name_prefix="Range") as ex:
-        total = sum(f.result() for f in [ex.submit(one, a, b) for a, b in parts])
+        futs = [ex.submit(one, a, b) for a, b in parts]
+        errs = [f.exception() for f in futs]
+    errs = [e for e in errs if e is not None]
+    if errs and not _v2_spec_flags():
+        raise errs[0]                                    # cờ tắt: như bản cũ (lỗi của đoạn đầu tiên bị lỗi)
+    if errs:                                             # v2: báo lỗi quan trọng nhất: 429 > 403/410/404 > lỗi khác (không để timeout che 429)
+        for e in errs:
+            mark_block(info, e)
+        rank = lambda e: 0 if isinstance(e, HttpStatus) and e.code == 429 else 1 if isinstance(e, HttpStatus) and e.code in (403, 410, 404) \
+            else 2
+        raise min(errs, key=rank)
+    total = sum(f.result() for f in futs)
     t_end = time.perf_counter_ns()
-    if pred and not info.get("redirect_skip_fail"):
-        DL_STATS["redirect_skip"] += 1
     sm = lambda k: round(max((h.get(k) or 0) for h in hops_all), 2) if any(h.get(k) is not None for h in hops_all) else None
     info.update(ttfb_ms=ms(t0, min(firsts) if firsts else None), bytes=total, elapsed_ms=ms(t0, t_end), connections=len(parts),
                 hops=len(hops_all), new_conns=sum(1 for h in hops_all if h.get("new_conn")), dns_ms=sm("dns_ms"), tcp_ms=sm("tcp_ms"),
@@ -1725,6 +1748,7 @@ class Engine:
         self.db = DB(base / db_name)
         self.excel = ExcelBook(base / cfg["excel_file"], cfg["col_channel"], cfg["col_url"], cfg.get("excel_sheet", ""))
         self.stop_ev = threading.Event()
+        self._dl_caution = set()                          # v2: video đã gặp 403/410/429 (ở bất kỳ request nào) → lần thử sau không suy đoán
         self.channels: dict[str, list] = {}
         self.ch_lock = threading.RLock()
         self.seen_lock = threading.Lock()
@@ -2224,6 +2248,7 @@ class Engine:
         parts = []
         cancel = threading.Event()
         th = None
+        info_v, info_a = {}, {}
         try:
             row = self.db.one("SELECT * FROM videos WHERE video_id=?", (vid,))
             if row is None:                               # worker tới trước lần ghi DB của on_event
@@ -2269,7 +2294,7 @@ class Engine:
                                 download_started_at=iso(), expected_size=exp_size or None)
             info_v, info_a = {}, {}
             prev_err = str((row["error"] if row is not None and "error" in row.keys() else "") or "")
-            if re.search(r"HTTP (403|410|429)", prev_err):
+            if re.search(r"HTTP (403|410|429)", prev_err) or vid in self._dl_caution:
                 # v2: lần thử trước bị 403/410/429 → lần này KHÔNG request suy đoán nào (hedge, đoán 302, mở sẵn mn=) và không thử lại
                 # link client khác (đã thử ở lần trước) → mỗi lần thử đúng 1 GET như bản cũ
                 for d_ in (info_v, info_a):
@@ -2383,7 +2408,8 @@ class Engine:
                        "media": {k: info_v.get(k) for k in ("host", "hops", "new_conns", "dns_ms", "tcp_ms", "tls_ms", "server_wait_ms",
                                                             "headers_ms", "first_byte_after_hdr_ms", "ttfb_ms", "transfer_ms",
                                                             "tls_resumed", "redirect_skip", "redirect_skip_fail", "mn_preconnect",
-                                                            "hedge_sent", "hedge_win", "fallback_client", "range_auto")},
+                                                            "hedge_sent", "hedge_win", "fallback_client", "range_auto",
+                                                            "redirect_unconfirmed", "saw_block")},
                        "integrity_ms": integrity_ms,
                        "ffprobe_ms": verify_ms, "net_mode": _NET_MODE}
                 self.db.upd(vid, net=json.dumps(net, ensure_ascii=False))
@@ -2414,6 +2440,13 @@ class Engine:
             if isinstance(e, InterruptedError) or self.stop_ev.is_set():
                 self.db.upd(vid, state="QUEUED", error="dừng giữa chừng")
                 return "STOPPED"
+            inf_ = (info_v, info_a)
+            if (isinstance(e, HttpStatus) and e.code in (403, 410, 429)) or any(d_.get("saw_block") or d_.get("alt_tried") for d_ in inf_):
+                if len(self._dl_caution) > 5000:
+                    self._dl_caution.clear()
+                self._dl_caution.add(vid)                     # v2: các lần thử sau của video này: không suy đoán, không link client khác
+            if any(d_.get("saw_block") == 429 for d_ in inf_) and not (isinstance(e, HttpStatus) and e.code == 429):
+                e = HttpStatus(429)                           # 429 ở nhánh phụ bị lỗi khác che → vẫn chờ ≥ 10 s như 429
             sched = list(self.cfg.get("retry_schedule_sec") or [1, 2, 5])
             fatal = isinstance(e, Fatal) or (isinstance(e, HttpStatus) and e.code in (404, 410))
             if fatal or attempts + 1 > len(sched):
@@ -2476,11 +2509,13 @@ class Engine:
         try:
             return self._fetch_one(fmt, dest, info, n, cancel)
         except HttpStatus as e:
-            if not (NET_OPTS.get("dl_alt_url_on_403") and alts and e.code in (403, 410)) or info.get("no_alt"):
+            if not (NET_OPTS.get("dl_alt_url_on_403") and alts and e.code in (403, 410)) or info.get("no_alt") or spec_paused():
                 raise
-            # link client khác: GET THƯỜNG (không hedge, không đoán 302, không mở sẵn), tối đa 1 lần mỗi video (lần thử sau có no_alt)
-            info.update(no_spec=True, no_hedge=True, no_preconnect=True)
+            # link client khác: GET THƯỜNG (không hedge, không đoán 302, không mở sẵn, không chia đoạn), tối đa 1 lần mỗi video
+            # (process() nhớ theo video: lần thử sau có no_alt). Đang tạm dừng vì 429 → không thử.
+            info.update(no_spec=True, no_hedge=True, no_preconnect=True, alt_tried=True)
             info.pop("redirect_skip", None)
+            tried = {fmt.get("url")}
             for client, fut in alts:                          # v2 #5: link của client khác ĐÃ VỀ, cùng itag + dung lượng → thử ngay
                 if not fut.done():
                     continue
@@ -2490,18 +2525,26 @@ class Engine:
                     continue
                 p = (alt or {}).get("pick") or {}
                 f2 = p.get("video") if p.get("kind") == "progressive" else None
-                if (not f2 or not f2.get("url") or f2["url"] == fmt.get("url") or str(f2.get("itag")) != str(fmt.get("itag"))
+                if (not f2 or not f2.get("url") or f2["url"] in tried or str(f2.get("itag")) != str(fmt.get("itag"))
                         or int(f2.get("clen") or 0) != int(fmt.get("clen") or 0)):
                     continue
+                tried.add(f2["url"])                          # 2 client trả CÙNG link → chỉ thử 1 lần
                 info["fallback_client"] = client
                 DL_STATS["alt_url"] += 1
                 self.log(f"   ↪️ link client thắng bị HTTP {e.code} → dùng ngay link của client {client} (cùng itag {f2.get('itag')})")
                 try:
-                    return self._fetch_one(f2, dest, info, n, cancel)
+                    return self._fetch_one(f2, dest, info, 1, cancel)
                 except HttpStatus as e2:
-                    if e2.code in (403, 410):
+                    mark_block(info, e2)
+                    if e2.code == 429:
+                        raise
+                    if e2.code in (403, 404, 410):
                         continue
+                    raise e from e2
+                except InterruptedError:
                     raise
+                except Exception as e2:  # noqa: BLE001 — lỗi mạng của link phụ: báo lại lỗi 403 gốc (để lần thử sau nhớ là 403)
+                    raise e from e2
             raise
 
     def _fetch_one(self, fmt, dest, info, n, cancel=None):
@@ -2513,6 +2556,11 @@ class Engine:
                 info["probed_size"] = size
             except Exception as e:  # noqa: BLE001
                 info["probe_error"] = f"{type(e).__name__}"
+                if isinstance(e, HttpStatus) and e.code in (403, 410, 429) and _v2_spec_flags():
+                    mark_block(info, e)                       # v2: GET sau đó là GET thường (không suy đoán) — cờ tắt: không đổi gì
+                    info.update(no_spec=True, no_hedge=True, no_preconnect=True)
+                    if e.code == 429:
+                        note_429()
         if n > 1 and size > 0:
             try:
                 return download_ranges(fmt["url"], dest, size, n, info, _AnyEvent(cancel, self.stop_ev))
@@ -2521,6 +2569,7 @@ class Engine:
             except Exception as e:  # noqa: BLE001
                 if isinstance(e, HttpStatus) and e.code in (403, 404, 410, 429):
                     raise
+                info["no_preconnect"] = True                  # file này đã mở sẵn ở Range
                 self.log(f"   ↩️ Range x{n} lỗi ({type(e).__name__}: {redact(str(e))[:80]}) → 1 GET")
         return download_single(fmt["url"], dest, info, _AnyEvent(cancel, self.stop_ev))
 
@@ -4260,6 +4309,9 @@ def bench_dl(cfg, base, ids, reps=None, variants=None):
                     time.sleep(0.3)
                     continue
                 t = time.perf_counter_ns()
+                paused0, p429_0 = spec_paused(), DL_STATS["spec_pause_429"]
+                with _RDR_LOCK:
+                    blocks0 = sum(1 for x in _RDR_BLOCK.values() if x > time.monotonic())
                 eng.db.x("INSERT INTO videos(video_id, channel_id, url, engine, detected_at, state) VALUES(?,?,?,?,?,?)",
                          (vid, ch, video_url(vid), "BENCH", iso(), "QUEUED"))
                 r = eng.process({"vid": vid, "ch": ch, "t_recv_ns": t, "t_enq_ns": t})
@@ -4277,7 +4329,10 @@ def bench_dl(cfg, base, ids, reps=None, variants=None):
                        "download_ms": row.get("download_ms"), "ffprobe_ms": row.get("ffprobe_ms"), "rename_ms": row.get("rename_ms"),
                        "mbps": row.get("mbps"), "size": row.get("size"), "client": rn.get("client"), "media_host": mn.get("host"),
                        "tls_resumed": mn.get("tls_resumed"), "redirect_skip": (
-                           "FAIL:" + str(mn.get("redirect_skip_fail"))) if mn.get("redirect_skip_fail") else (mn.get("redirect_skip") or ""),
+                           "FAIL:" + str(mn.get("redirect_skip_fail"))) if mn.get("redirect_skip_fail") else (
+                           ("?" + str(mn.get("redirect_skip"))) if mn.get("redirect_unconfirmed") and mn.get("redirect_skip")
+                           else (mn.get("redirect_skip") or "")),
+                       "spec_paused": 1 if (paused0 or DL_STATS["spec_pause_429"] > p429_0) else 0, "rdr_blocks": blocks0,
                        "hedge_win": mn.get("hedge_win") or "", "hedge_sent": 1 if mn.get("hedge_sent") else 0,
                        "fallback_client": mn.get("fallback_client") or "",
                        "integrity_ms": row.get("integrity_ms"), "range_auto": mn.get("range_auto"),
@@ -4303,8 +4358,8 @@ def bench_dl(cfg, base, ids, reps=None, variants=None):
           "tới khi file đã tải xong + ffprobe xác minh + bàn giao (không tính TTFB 2 lần: TTFB nằm trong 'tải').", "",
           "| Phương án | lượt | lỗi | TỔNG | ≤1000 ms | resolver | setup resolver | chờ máy chủ resolver | TTFB | setup tải | "
           "chờ máy chủ tải | truyền | ffprobe | tls_resumed | redirect_skip | hedge_win (gốc/replica, trên số lượt có bắn kép) | "
-          "fallback_client | integrity_ms |",
-          "|" + "---|" * 18]
+          "fallback_client | integrity_ms | đo khi đang tạm dừng vì 429 |",
+          "|" + "---|" * 19]
     summary = {}
     for v in names:
         rs = [r for r in rows if r["variant"] == v]
@@ -4318,12 +4373,14 @@ def bench_dl(cfg, base, ids, reps=None, variants=None):
                   f"{sv['under_1s']}/{len(ok)} | {f_(sv['resolver_ms'])} | {f_(sv['res_setup_ms'])} | {f_(sv['res_server_wait_ms'])} | "
                   f"{f_(sv['ttfb_ms'])} | {f_(sv['media_setup_ms'])} | {f_(sv['media_server_wait_ms'])} | {f_(sv['transfer_ms'])} | "
                   f"{f_(sv['ffprobe_ms'])} | {sum(1 for r in ok if r.get('tls_resumed'))}/{len(ok)} | "
-                  f"{sum(1 for r in ok if r.get('redirect_skip') and not str(r.get('redirect_skip')).startswith('FAIL'))} ok / "
-                  f"{sum(1 for r in ok if str(r.get('redirect_skip') or '').startswith('FAIL'))} sai | "
+                  f"{sum(1 for r in ok if r.get('redirect_skip') and str(r.get('redirect_skip'))[:1] not in ('F', '?'))} ok / "
+                  f"{sum(1 for r in ok if str(r.get('redirect_skip') or '').startswith('FAIL'))} sai / "
+                  f"{sum(1 for r in ok if str(r.get('redirect_skip') or '').startswith('?'))} chưa rõ | "
                   f"{sum(1 for r in ok if r.get('hedge_win') == 'primary')}/{sum(1 for r in ok if r.get('hedge_win') == 'replica')} "
                   f"(bắn kép {sum(1 for r in ok if r.get('hedge_sent'))}) | "
                   f"{sum(1 for r in ok if r.get('fallback_client'))} | "
-                  f"{f_(tuple(pct([r['integrity_ms'] for r in ok if r.get('integrity_ms') is not None], p_) for p_ in (50, 90, 95)))} |")
+                  f"{f_(tuple(pct([r['integrity_ms'] for r in ok if r.get('integrity_ms') is not None], p_) for p_ in (50, 90, 95)))} | "
+                  f"{sum(1 for r in rs if r.get('spec_paused'))}/{len(rs)} |")
     md += ["", "Phương án: legacy = bản trước (kết nối nguội); fast_cold = lớp mạng mới không giữ ấm; warm_resolver = giữ ấm "
            "Innertube, máy chủ video nguội; warm_all = giữ ấm cả máy chủ video vừa dùng; _r2/_r4 = chia 2/4 đoạn Range; "
            "warm_apihost = resolver qua youtubei.googleapis.com. v2_*: mỗi biến thể bật THÊM 1 nhóm cờ tối ưu tải v2; "
@@ -4334,7 +4391,8 @@ def bench_dl(cfg, base, ids, reps=None, variants=None):
     print("\n".join(md))
     samples = {v: [r["total_ms"] for r in rows if r["variant"] == v and r["result"] == "DONE" and r.get("total_ms") is not None]
                for v in names}
-    concl = bench_dl_summary(base, names, summary, samples=samples)
+    paused = {v: sum(1 for r in rows if r["variant"] == v and r.get("spec_paused")) for v in names}
+    concl = bench_dl_summary(base, names, summary, samples=samples, paused=paused)
     return {"rows": rows, "summary": summary, "conclusion": concl}
 
 
@@ -4355,19 +4413,24 @@ def _boot_ci(a, b, p, reps=2000, seed=12345):
     return pct(ds, 5), pct(ds, 95)
 
 
-def bench_dl_summary(base, names, summary, ref="warm_all", min_gain_ms=50.0, tol_ms=25.0, samples=None) -> dict:
+V2_SPECULATIVE = ("v2_redirect", "v2_hedge", "v2_full", "v2_full_auto")   # biến thể có tính năng bị TẮT khi đang tạm dừng vì 429
+
+
+def bench_dl_summary(base, names, summary, ref="warm_all", min_gain_ms=50.0, tol_ms=25.0, samples=None, paused=None) -> dict:
     """BENCH_DL_SUMMARY.md — CHỈ dựa trên số đo của chính lần bench này. Mỗi nhóm cờ có 3 kết luận: BẬT / GIỮ TẮT / CHƯA KẾT LUẬN.
-    (1) Thắng mốc warm_all (như yêu cầu): median VÀ P90 nhanh hơn ≥ 50 ms (range auto: ≥ 100 ms), lỗi không tăng, và — khi có số đo
-        từng lượt — cận dưới khoảng tin cậy 90% (bootstrap) của cả 2 chênh lệch > 0 (không phải nhờ may rủi số lượt rơi vào đuôi chậm).
-        Chắc chắn KHÔNG đạt ngưỡng (cận trên < ngưỡng) hoặc lỗi tăng → GIỮ TẮT. Còn lại → CHƯA KẾT LUẬN (nhiễu lớn: chạy thêm vòng).
-    (2) Các biến thể v2_* CỘNG DỒN: nhóm cờ thêm vào không được làm chậm rõ rệt so với biến thể liền trước (cận dưới khoảng tin cậy
-        của độ chậm thêm > 25 ms ở median hoặc P90, hoặc lỗi tăng → GIỮ TẮT).
-    Range auto: kết luận chung = warm_all_auto (so với warm_all, ≥ 100 ms) VÀ v2_full_auto (không chậm hơn v2_full)."""
+    (1) So với mốc warm_all (như yêu cầu): median VÀ P90 nhanh hơn ≥ 50 ms (range auto: ≥ 100 ms), lỗi không tăng, và — khi có số đo
+        từng lượt — cận dưới khoảng tin cậy 90% (bootstrap) của cả 2 chênh lệch > 0. Chắc chắn KHÔNG đạt ngưỡng (cận trên < ngưỡng)
+        hoặc lỗi tăng → GIỮ TẮT. Còn lại → CHƯA KẾT LUẬN.
+    (2) Các biến thể v2_* CỘNG DỒN → so với biến thể liền trước: 'chậm hơn' (chắc chắn chậm hơn > 25 ms ở median hoặc P90, hoặc lỗi
+        tăng) → GIỮ TẮT; 'ổn' (không chậm hơn quá 25 ms: điểm ước lượng, hoặc cận dưới KTC) → được xét BẬT; còn lại 'chưa rõ' → CHƯA
+        KẾT LUẬN.
+    (3) Biến thể v2 có lượt đo khi đang tạm dừng vì 429 (tính năng bị tắt để an toàn) → CHƯA KẾT LUẬN.
+    Range auto: kết luận chung, BẮT BUỘC có warm_all_auto (so với warm_all, ≥ 100 ms) VÀ v2_full_auto không chậm hơn v2_full."""
     out = {}
-    samples = samples or {}
+    samples, paused = samples or {}, paused or {}
     lines = [f"# BENCH_DL_SUMMARY — {iso()} — mốc '{ref}' (TỔNG = resolve → tải → ffprobe)", ""]
-    if ref not in summary:
-        lines.append(f"Không có mốc '{ref}' trong lần chạy này → không kết luận.")
+    if ref not in summary or summary[ref]["total_ms"][0] is None:
+        lines.append(f"Không có (đủ) số đo mốc '{ref}' trong lần chạy này → không kết luận.")
         (base / "BENCH_DL_SUMMARY.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
         return out
     r = summary[ref]
@@ -4378,14 +4441,19 @@ def bench_dl_summary(base, names, summary, ref="warm_all", min_gain_ms=50.0, tol
               "| Biến thể | median | P90 | lỗi | lượt > 1 s | Δ median / Δ P90 so với warm_all [KTC 90%] | so với biến thể liền trước "
               "[KTC 90%] | Nhóm cờ | Đề xuất | Lý do |", "|---|---|---|---|---|---|---|---|---|---|"]
     fmt_ci = lambda c: f"[{c[0]:+.0f}…{c[1]:+.0f}]" if c else ""
+    txt = {"on": "✅ BẬT nhóm cờ này", "off": "⏸ GIỮ TẮT nhóm cờ này", "inconclusive": "❔ CHƯA KẾT LUẬN (chạy thêm vòng)"}
     prev = ref
     order = [x for x in V2_CHAIN if x in names and x != ref] + [x for x in names if x not in V2_CHAIN and x != ref]
     for v in order:
         if v not in summary:
             continue
         x = summary[v]
-        if x["total_ms"][0] is None or r["total_ms"][0] is None:
-            lines.append(f"| {v} | - | - | {x['fail']}/{x['n']} | - | - | - | {V2_GROUP.get(v, '-')} | CHƯA ĐỦ SỐ ĐO | - |")
+        if x["total_ms"][0] is None:                              # không có lượt thành công nào → lỗi tăng → giữ tắt
+            out[v] = {"verdict_vs_ref": "LOSE", "win_vs_ref": False, "incremental_ok": False, "inc_state": "slower",
+                      "recommend_on": False, "decision": "off", "reason": "không có lượt thành công", "error_rate": round(erate(x), 3)}
+            lines.append(f"| {v} | - | - | {x['fail']}/{x['n']} | - | - | - | {V2_GROUP.get(v, '-')} | {txt['off']} | không có lượt thành công |")
+            if v in V2_CHAIN:
+                prev = v
             continue
         need = V2_MIN_GAIN.get(v, min_gain_ms)
         dm, d9 = r["total_ms"][0] - x["total_ms"][0], r["total_ms"][1] - x["total_ms"][1]
@@ -4403,19 +4471,32 @@ def bench_dl_summary(base, names, summary, ref="warm_all", min_gain_ms=50.0, tol
             vref = "LOSE"
         else:
             vref = "UNSURE"
-        inc_ok, inc_txt, inc_err = True, "-", False
-        if v in V2_CHAIN and prev in summary and summary[prev]["total_ms"][0] is not None:
-            p_ = summary[prev]
+        inc_state, inc_txt, inc_err = "ok", "-", False
+        p_ = summary.get(prev)
+        if v in V2_CHAIN and prev != ref and p_ is not None and p_["total_ms"][0] is not None:
             im, i9 = p_["total_ms"][0] - x["total_ms"][0], p_["total_ms"][1] - x["total_ms"][1]
             pim = pi9 = None
+            inc_err = erate(x) > erate(p_)
             if ok_s(v) and ok_s(prev):
                 pim, pi9 = _boot_ci(samples[prev], samples[v], 50), _boot_ci(samples[prev], samples[v], 90)
-                inc_ok = pim[1] >= -tol_ms and pi9[1] >= -tol_ms and erate(x) <= erate(p_)    # chỉ "chậm hơn" khi chắc chắn
+                if inc_err or pim[1] < -tol_ms or pi9[1] < -tol_ms:
+                    inc_state = "slower"                          # chắc chắn chậm hơn > dung sai
+                elif (im >= -tol_ms and i9 >= -tol_ms) or (pim[0] >= -tol_ms and pi9[0] >= -tol_ms):
+                    inc_state = "ok"
+                else:
+                    inc_state = "unsure"                          # có thể chậm hơn, nằm trong nhiễu
             else:
-                inc_ok = im >= -tol_ms and i9 >= -tol_ms and erate(x) <= erate(p_)
+                inc_state = "ok" if (im >= -tol_ms and i9 >= -tol_ms and not inc_err) else "slower"
             inc_txt = f"{prev}: {im:+.0f} {fmt_ci(pim)} / {i9:+.0f} {fmt_ci(pi9)}"
-            inc_err = erate(x) > erate(p_)
-        decision = "on" if vref == "WIN" and inc_ok else "off" if (vref == "LOSE" or not inc_ok) else "inconclusive"
+        n_paused = int(paused.get(v) or 0)
+        if vref == "LOSE" or inc_state == "slower":
+            decision = "off"
+        elif n_paused and v in V2_SPECULATIVE:
+            decision = "inconclusive"                             # một phần lượt đo chạy với tính năng v2 bị tắt (429)
+        elif vref == "WIN" and inc_state == "ok":
+            decision = "on"
+        else:
+            decision = "inconclusive"
 
         def _why(lbl, d, ci):
             if ci is None:
@@ -4423,33 +4504,44 @@ def bench_dl_summary(base, names, summary, ref="warm_all", min_gain_ms=50.0, tol
             return f"{lbl} " + ("chắc chắn nhanh hơn" if d >= need and ci[0] > 0 else "chắc chắn KHÔNG đạt ngưỡng" if ci[1] < need
                                  else "trong nhiễu")
         reason = "lỗi tăng" if err_up else f"{_why('median', dm, cim)}; {_why('P90', d9, ci9)}"
-        if not inc_ok and prev != ref:
+        if inc_state == "slower":
             reason += f"; lỗi tăng so với {prev}" if inc_err else f"; chậm hơn rõ so với {prev}"
-        elif not inc_ok and not inc_err:
-            reason += f"; chậm hơn rõ so với {prev}"
-        out[v] = {"verdict_vs_ref": vref, "win_vs_ref": vref == "WIN", "incremental_ok": inc_ok, "recommend_on": decision == "on",
-                  "decision": decision, "gain_median_ms": round(dm, 1), "gain_p90_ms": round(d9, 1), "need_gain_ms": need,
-                  "ci_gain_median": cim, "ci_gain_p90": ci9, "error_rate": round(erate(x), 3)}
-        txt = {"on": "✅ BẬT nhóm cờ này", "off": "⏸ GIỮ TẮT nhóm cờ này", "inconclusive": "❔ CHƯA KẾT LUẬN (nhiễu lớn — chạy thêm vòng)"}
+        elif inc_state == "unsure":
+            reason += f"; có thể chậm hơn {prev} (trong nhiễu)"
+        if n_paused and v in V2_SPECULATIVE:
+            reason += f"; {n_paused} lượt đo khi đang tạm dừng vì 429 (tính năng v2 bị tắt)"
+        out[v] = {"verdict_vs_ref": vref, "win_vs_ref": vref == "WIN", "incremental_ok": inc_state == "ok", "inc_state": inc_state,
+                  "recommend_on": decision == "on", "decision": decision, "gain_median_ms": round(dm, 1), "gain_p90_ms": round(d9, 1),
+                  "need_gain_ms": need, "ci_gain_median": cim, "ci_gain_p90": ci9, "error_rate": round(erate(x), 3), "reason": reason,
+                  "paused_runs": n_paused}
+        shown = "→ xem dòng range auto bên dưới" if v in ("warm_all_auto", "v2_full_auto") else txt[decision]
         lines.append(f"| {v} | {x['total_ms'][0]:.0f} | {x['total_ms'][1]:.0f} | {x['fail']}/{x['n']} | {slow(v)} | "
                      f"{dm:+.0f} {fmt_ci(cim)} / {d9:+.0f} {fmt_ci(ci9)} (ngưỡng {need:.0f}) | {inc_txt} | {V2_GROUP.get(v, '-')} | "
-                     f"{txt[decision]} | {reason} |")
-        out[v]["reason"] = reason
+                     f"{shown} | {reason} |")
         if v in V2_CHAIN:
             prev = v
-    ra = [out[k] for k in ("warm_all_auto", "v2_full_auto") if k in out]
-    if ra:
-        dec = "on" if all(d["decision"] == "on" for d in ra) else "off" if any(d["decision"] == "off" for d in ra) else "inconclusive"
-        out["range_auto"] = {"decision": dec, "recommend_on": dec == "on"}
-        lines += ["", f"**range_connections = \"auto\"**: " + {"on": "✅ có thể bật (warm_all_auto và v2_full_auto đều đạt)",
-                                                              "off": "⏸ giữ range_connections = 1",
-                                                              "inconclusive": "❔ chưa kết luận — chạy thêm vòng"}[dec]]
+    if "warm_all_auto" in names or "v2_full_auto" in names:
+        wa, fa = out.get("warm_all_auto"), out.get("v2_full_auto")
+        if wa is None:
+            dec, why = "inconclusive", "chưa đo warm_all_auto (bắt buộc: so thẳng với warm_all)"
+        elif wa["decision"] != "on":
+            dec, why = wa["decision"], "warm_all_auto: " + wa["reason"]
+        elif fa is not None and fa["inc_state"] != "ok":
+            dec = "off" if fa["inc_state"] == "slower" else "inconclusive"
+            why = "v2_full_auto so với v2_full: " + fa["reason"]
+        else:
+            dec, why = "on", "warm_all_auto thắng warm_all ≥ 100 ms" + (" và v2_full_auto không chậm hơn v2_full" if fa else "")
+        out["range_auto"] = {"decision": dec, "recommend_on": dec == "on", "reason": why}
+        lines += ["", "**range_connections = \"auto\"**: " + {"on": "✅ có thể bật", "off": "⏸ giữ range_connections = 1",
+                                                              "inconclusive": "❔ chưa kết luận — giữ range_connections = 1"}[dec]
+                  + f" ({why})"]
     lines += ["", "**Cộng dồn:** v2_redirect đo khi đã bật nhóm của v2_ssl; v2_hedge khi đã bật cả v2_ssl + v2_redirect; … Bật một nhóm "
               "sau mà TẮT nhóm trước nó = cấu hình CHƯA được đo (nên giữ các nhóm trước như lúc đo, trừ nhóm bị 'chậm hơn rõ' hoặc lỗi tăng)."]
     lines += ["", f"Δ dương = nhanh hơn. [KTC 90%] = khoảng tin cậy 90% bootstrap của chênh lệch (cần ≥ 5 lượt thành công). 'So với "
               f"biến thể liền trước' chỉ tính là chậm hơn khi chắc chắn chậm hơn > {tol_ms:.0f} ms. 'Giữ tắt' = đặt các cờ của nhóm đó về "
               "false (range_connections = 1) trong config.json. 'Chưa kết luận' = chênh lệch nằm trong nhiễu lấy mẫu → giữ như hiện tại "
-              "và chạy thêm vòng (BENCH_TAI_360.bat), không suy ra nhanh/chậm."]
+              "và chạy thêm vòng (BENCH_TAI_360.bat), không suy ra nhanh/chậm. Gặp 429 trong lúc đo: các tối ưu gửi thêm request bị tắt "
+              "10 phút (an toàn) → các lượt đó không đo được tác dụng v2 (cột 'đo khi đang tạm dừng vì 429' trong BENCH_DL.md)."]
     (base / "BENCH_DL_SUMMARY.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return out
 
@@ -4462,12 +4554,13 @@ def bench_dl_summary_from_csv(csv_path, out_dir=None) -> dict:
     num = lambda x: float(x) if x not in (None, "") else None
     names = list(dict.fromkeys(r["variant"] for r in rows))
     summary, samples = {}, {}
+    paused = {v: sum(1 for r in rows if r["variant"] == v and str(r.get("spec_paused") or "0") not in ("0", "")) for v in names}
     for v in names:
         rs = [r for r in rows if r["variant"] == v]
         ok = [num(r.get("total_ms")) for r in rs if r.get("result") == "DONE" and num(r.get("total_ms")) is not None]
         samples[v] = ok
         summary[v] = {"total_ms": tuple(pct(ok, p_) for p_ in (50, 90, 95)), "n": len(rs), "fail": len(rs) - len(ok)}
-    return bench_dl_summary(Path(out_dir) if out_dir else csv_path.parent, names, summary, samples=samples)
+    return bench_dl_summary(Path(out_dir) if out_dir else csv_path.parent, names, summary, samples=samples, paused=paused)
 
 
 PIPE_COLS = [("detect_to_done_ms", "PHÁT HIỆN→DOWNLOAD_DONE"), ("resolver_ms", "  resolver"), ("ttfb_ms", "  TTFB tải"),
