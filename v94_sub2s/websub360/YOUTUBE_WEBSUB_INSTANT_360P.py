@@ -4376,7 +4376,7 @@ def bench_dl_summary(base, names, summary, ref="warm_all", min_gain_ms=50.0, tol
     slow = lambda v: (f"{sum(1 for t in samples[v] if t > 1000)}/{len(samples[v])}" if ok_s(v) else "-")
     lines += [f"Mốc {ref}: median {r['total_ms'][0]} ms | P90 {r['total_ms'][1]} ms | lỗi {r['fail']}/{r['n']} | lượt > 1 s: {slow(ref)}", "",
               "| Biến thể | median | P90 | lỗi | lượt > 1 s | Δ median / Δ P90 so với warm_all [KTC 90%] | so với biến thể liền trước "
-              "[KTC 90%] | Nhóm cờ | Đề xuất |", "|---|---|---|---|---|---|---|---|---|"]
+              "[KTC 90%] | Nhóm cờ | Đề xuất | Lý do |", "|---|---|---|---|---|---|---|---|---|---|"]
     fmt_ci = lambda c: f"[{c[0]:+.0f}…{c[1]:+.0f}]" if c else ""
     prev = ref
     order = [x for x in V2_CHAIN if x in names and x != ref] + [x for x in names if x not in V2_CHAIN and x != ref]
@@ -4385,7 +4385,7 @@ def bench_dl_summary(base, names, summary, ref="warm_all", min_gain_ms=50.0, tol
             continue
         x = summary[v]
         if x["total_ms"][0] is None or r["total_ms"][0] is None:
-            lines.append(f"| {v} | - | - | {x['fail']}/{x['n']} | - | - | - | {V2_GROUP.get(v, '-')} | CHƯA ĐỦ SỐ ĐO |")
+            lines.append(f"| {v} | - | - | {x['fail']}/{x['n']} | - | - | - | {V2_GROUP.get(v, '-')} | CHƯA ĐỦ SỐ ĐO | - |")
             continue
         need = V2_MIN_GAIN.get(v, min_gain_ms)
         dm, d9 = r["total_ms"][0] - x["total_ms"][0], r["total_ms"][1] - x["total_ms"][1]
@@ -4403,7 +4403,7 @@ def bench_dl_summary(base, names, summary, ref="warm_all", min_gain_ms=50.0, tol
             vref = "LOSE"
         else:
             vref = "UNSURE"
-        inc_ok, inc_txt = True, "-"
+        inc_ok, inc_txt, inc_err = True, "-", False
         if v in V2_CHAIN and prev in summary and summary[prev]["total_ms"][0] is not None:
             p_ = summary[prev]
             im, i9 = p_["total_ms"][0] - x["total_ms"][0], p_["total_ms"][1] - x["total_ms"][1]
@@ -4414,14 +4414,27 @@ def bench_dl_summary(base, names, summary, ref="warm_all", min_gain_ms=50.0, tol
             else:
                 inc_ok = im >= -tol_ms and i9 >= -tol_ms and erate(x) <= erate(p_)
             inc_txt = f"{prev}: {im:+.0f} {fmt_ci(pim)} / {i9:+.0f} {fmt_ci(pi9)}"
+            inc_err = erate(x) > erate(p_)
         decision = "on" if vref == "WIN" and inc_ok else "off" if (vref == "LOSE" or not inc_ok) else "inconclusive"
+
+        def _why(lbl, d, ci):
+            if ci is None:
+                return f"{lbl} {'đạt' if d >= need else 'không đạt'} ngưỡng (không có số từng lượt)"
+            return f"{lbl} " + ("chắc chắn nhanh hơn" if d >= need and ci[0] > 0 else "chắc chắn KHÔNG đạt ngưỡng" if ci[1] < need
+                                 else "trong nhiễu")
+        reason = "lỗi tăng" if err_up else f"{_why('median', dm, cim)}; {_why('P90', d9, ci9)}"
+        if not inc_ok and prev != ref:
+            reason += f"; lỗi tăng so với {prev}" if inc_err else f"; chậm hơn rõ so với {prev}"
+        elif not inc_ok and not inc_err:
+            reason += f"; chậm hơn rõ so với {prev}"
         out[v] = {"verdict_vs_ref": vref, "win_vs_ref": vref == "WIN", "incremental_ok": inc_ok, "recommend_on": decision == "on",
                   "decision": decision, "gain_median_ms": round(dm, 1), "gain_p90_ms": round(d9, 1), "need_gain_ms": need,
                   "ci_gain_median": cim, "ci_gain_p90": ci9, "error_rate": round(erate(x), 3)}
         txt = {"on": "✅ BẬT nhóm cờ này", "off": "⏸ GIỮ TẮT nhóm cờ này", "inconclusive": "❔ CHƯA KẾT LUẬN (nhiễu lớn — chạy thêm vòng)"}
         lines.append(f"| {v} | {x['total_ms'][0]:.0f} | {x['total_ms'][1]:.0f} | {x['fail']}/{x['n']} | {slow(v)} | "
                      f"{dm:+.0f} {fmt_ci(cim)} / {d9:+.0f} {fmt_ci(ci9)} (ngưỡng {need:.0f}) | {inc_txt} | {V2_GROUP.get(v, '-')} | "
-                     f"{txt[decision]} |")
+                     f"{txt[decision]} | {reason} |")
+        out[v]["reason"] = reason
         if v in V2_CHAIN:
             prev = v
     ra = [out[k] for k in ("warm_all_auto", "v2_full_auto") if k in out]
@@ -4431,12 +4444,30 @@ def bench_dl_summary(base, names, summary, ref="warm_all", min_gain_ms=50.0, tol
         lines += ["", f"**range_connections = \"auto\"**: " + {"on": "✅ có thể bật (warm_all_auto và v2_full_auto đều đạt)",
                                                               "off": "⏸ giữ range_connections = 1",
                                                               "inconclusive": "❔ chưa kết luận — chạy thêm vòng"}[dec]]
+    lines += ["", "**Cộng dồn:** v2_redirect đo khi đã bật nhóm của v2_ssl; v2_hedge khi đã bật cả v2_ssl + v2_redirect; … Bật một nhóm "
+              "sau mà TẮT nhóm trước nó = cấu hình CHƯA được đo (nên giữ các nhóm trước như lúc đo, trừ nhóm bị 'chậm hơn rõ' hoặc lỗi tăng)."]
     lines += ["", f"Δ dương = nhanh hơn. [KTC 90%] = khoảng tin cậy 90% bootstrap của chênh lệch (cần ≥ 5 lượt thành công). 'So với "
               f"biến thể liền trước' chỉ tính là chậm hơn khi chắc chắn chậm hơn > {tol_ms:.0f} ms. 'Giữ tắt' = đặt các cờ của nhóm đó về "
               "false (range_connections = 1) trong config.json. 'Chưa kết luận' = chênh lệch nằm trong nhiễu lấy mẫu → giữ như hiện tại "
               "và chạy thêm vòng (BENCH_TAI_360.bat), không suy ra nhanh/chậm."]
     (base / "BENCH_DL_SUMMARY.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return out
+
+
+def bench_dl_summary_from_csv(csv_path, out_dir=None) -> dict:
+    """Tạo lại BENCH_DL_SUMMARY.md từ BENCH_DL.csv có sẵn (không tải lại)."""
+    csv_path = Path(csv_path)
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    num = lambda x: float(x) if x not in (None, "") else None
+    names = list(dict.fromkeys(r["variant"] for r in rows))
+    summary, samples = {}, {}
+    for v in names:
+        rs = [r for r in rows if r["variant"] == v]
+        ok = [num(r.get("total_ms")) for r in rs if r.get("result") == "DONE" and num(r.get("total_ms")) is not None]
+        samples[v] = ok
+        summary[v] = {"total_ms": tuple(pct(ok, p_) for p_ in (50, 90, 95)), "n": len(rs), "fail": len(rs) - len(ok)}
+    return bench_dl_summary(Path(out_dir) if out_dir else csv_path.parent, names, summary, samples=samples)
 
 
 PIPE_COLS = [("detect_to_done_ms", "PHÁT HIỆN→DOWNLOAD_DONE"), ("resolver_ms", "  resolver"), ("ttfb_ms", "  TTFB tải"),
@@ -4979,6 +5010,7 @@ def main(argv=None):
     ap.add_argument("--bench360", nargs="*", help="đo đường tải thật N lượt/video → BENCH360.csv (median/p90 từng bước)")
     ap.add_argument("--bench-dl", nargs="*", help="so sánh các phương án mạng/tải trên video thật → BENCH_DL.md/.csv (≥20 lượt mỗi phương án)")
     ap.add_argument("--variants", default="", help="--bench-dl: danh sách phương án, cách nhau dấu phẩy")
+    ap.add_argument("--bench-summary", default="", help="tạo lại BENCH_DL_SUMMARY.md từ một BENCH_DL.csv có sẵn (không tải lại)")
     ap.add_argument("--download-bench", nargs="*", help="DOWNLOAD ONLY BENCHMARK: đúng thuật toán tải WS360 (http nguội/ấm + aria2c), "
                     "N vòng, không API/Excel/TAM/TikTok → DOWNLOAD_ONLY_BENCHMARK.md/.csv")
     ap.add_argument("--bench-pipeline", nargs="*", help="toàn tuyến thật CHẠY THỬ (không bấm Post): tải → TikTok → POST_READY; cần --profile")
@@ -5043,6 +5075,10 @@ def main(argv=None):
             return 2
         bench_pipeline(cfg, base, ids, a.profile, a.reps if a.reps != 3 else None)
         return 0
+    if a.bench_summary:
+        out = bench_dl_summary_from_csv(a.bench_summary)
+        print((Path(a.bench_summary).parent / "BENCH_DL_SUMMARY.md").read_text(encoding="utf-8"))
+        return 0 if out else 1
     if a.bench_dl is not None:
         ids = [v for v in (extract_vid(x) for x in a.bench_dl) if v]
         if not ids:

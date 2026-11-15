@@ -61,9 +61,9 @@ def main():
                     if ws._POOL is not None:
                         ws._POOL.clear()
                     ws._POOL = None
+                c0 = len(calls)                                             # gồm cả context tạo lúc dựng pool
                 p = ws.pool()
                 p.connection_pool_kw.update(ca_certs=crt, cert_reqs="CERT_REQUIRED")
-                c0 = len(calls)
                 cp = p.connection_from_host(f"rr{rnd + 1}---sn-aaa.googlevideo.com", g.port, scheme="https")
                 conn = cp._get_conn()
                 t0 = time.perf_counter()

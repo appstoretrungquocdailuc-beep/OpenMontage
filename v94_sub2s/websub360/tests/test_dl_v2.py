@@ -560,3 +560,20 @@ def test_v2_ttfb_first_read_is_256k_like_old_path(tmp_path, gvs, monkeypatch):
         ws.set_net_opts(dict(ws.NET_OPTS_OFF, dl_hotpath_v2=on))
         assert ws.download_single(url, tmp_path / f"t{on}", {}) == 3_000_000
     assert firsts == [256 * 1024, 256 * 1024]
+
+
+def test_summary_can_be_regenerated_from_csv_with_reasons(tmp_path):
+    import csv as _csv
+    import random as _r
+    rnd = _r.Random(9)
+    rows = [{"variant": v, "video_id": "X", "rep": i, "result": "DONE", "total_ms": round(t, 1)}
+            for v, med_ in (("warm_all", 900), ("v2_ssl", 780)) for i, t in enumerate(_samples(rnd, med_))]
+    rows.append({"variant": "v2_ssl", "video_id": "X", "rep": 99, "result": "FAILED", "total_ms": ""})
+    with open(tmp_path / "BENCH_DL.csv", "w", newline="", encoding="utf-8") as f:
+        w = _csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    out = ws.bench_dl_summary_from_csv(tmp_path / "BENCH_DL.csv")
+    assert out["v2_ssl"]["decision"] == "off" and out["v2_ssl"]["error_rate"] > 0 and out["v2_ssl"]["reason"] == "lỗi tăng"
+    md = (tmp_path / "BENCH_DL_SUMMARY.md").read_text(encoding="utf-8")
+    assert "Lý do" in md and "Cộng dồn" in md

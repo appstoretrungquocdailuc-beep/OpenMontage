@@ -1,0 +1,44 @@
+{
+ "note": "SỐ MOCK (127.0.0.1) — KHÔNG phải YouTube",
+ "item1_new_tls_conn_ms": {
+  "shared": {
+   "median": 2.7,
+   "p90": 3.19,
+   "n": 20
+  },
+  "per_conn": {
+   "median": 2.98,
+   "p90": 3.38,
+   "n": 20
+  }
+ },
+ "item1_ssl_contexts_created_per_20_conns": {
+  "shared": 1,
+  "per_conn": 20
+ },
+ "item1_note": "per_conn: urllib3 tạo SSLContext + load_default_certs cho mỗi kết nối; shared: 1 context (SSL_STATS đếm context dùng chung)",
+ "item7": {
+  "file_mb": 7.7,
+  "quick_check_ms": {
+   "median": 0.07,
+   "p90": 0.08
+  },
+  "ffprobe_ms": {
+   "median": 50.88,
+   "p90": 62.96
+  },
+  "note": "kiểm nhanh chạy TRƯỚC ffprobe (không thay ffprobe): file hỏng bị loại sớm hơn ~ffprobe_ms"
+ },
+ "item8_download_8_67MB_ms": {
+  "v2_1MiB_unbuffered": {
+   "median": 10.79,
+   "p90": 55.7,
+   "n": 30
+  },
+  "old_256KB_buffered": {
+   "median": 10.57,
+   "p90": 53.77,
+   "n": 30
+  }
+ }
+}
