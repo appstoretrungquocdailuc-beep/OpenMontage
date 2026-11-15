@@ -324,3 +324,45 @@ def test_all_flags_off_takes_exactly_the_old_path(tmp_path, gvs, monkeypatch):
     url = gvs.add("/off", b"o" * 10_000, "ok")
     assert ws.download_single(url, tmp_path / "off", {}) == 10_000
     assert "ssl_context" not in ws.pool().connection_pool_kw
+
+
+@need_openssl
+def test_hedge_also_covers_the_predicted_redirect_target(hosts, cert, tmp_path):
+    """Hồi quy (mock bench): URL đã đoán (#2) phải được hedge (#4); trước đây nhánh đoán đúng bỏ qua hedge → đuôi chậm còn nguyên."""
+    hosts.host_rules[A1] = {"redirect_to": B1}
+    hosts.add("/p1", b"1" * 5000)
+    hosts.add("/p2", b"2" * 5000)
+    use(cert, net_redirect_memory=True, dl_hedge=True, dl_hedge_delay_ms=120)
+    ws.download_single(hosts.url(A1, "/p1", mn=("sn-aaa", "sn-bbb", "sn-ccc")), tmp_path / "1", {})
+    hosts.host_rules[B1] = {"server_wait": (0.8, 0, 0)}                              # đích đã học trở nên chậm
+    info = {}
+    t0 = time.perf_counter()
+    ws.download_single(hosts.url(A1, "/p2", mn=("sn-aaa", "sn-bbb", "sn-ccc")), tmp_path / "2", info)
+    assert info["redirect_skip"] == "host" and info["hedge_win"] == "replica" and time.perf_counter() - t0 < 0.6
+    assert hosts.reqs[(C1, "/p2")] == 1 and hosts.reqs[(A1, "/p2")] == 0               # dự phòng = sn-ccc (không phải máy chủ 302)
+
+
+@need_openssl
+def test_range_parts_use_learned_redirect_target(hosts, cert, tmp_path):
+    hosts.host_rules[A1] = {"redirect_to": B1}
+    data = bytes(range(256)) * 4000
+    hosts.add("/r1", b"x" * 1000)
+    hosts.add("/r2", data)
+    use(cert, net_redirect_memory=True)
+    ws.download_single(hosts.url(A1, "/r1"), tmp_path / "1", {})
+    info = {}
+    assert ws.download_ranges(hosts.url(A1, "/r2"), tmp_path / "2", len(data), 3, info) == len(data)
+    assert (tmp_path / "2").read_bytes() == data and hosts.reqs[(A1, "/r2")] == 0 and info["redirect_skip"] == "host"
+
+
+def test_summary_recommends_group_only_if_it_beats_reference_and_its_predecessor(tmp_path):
+    S = lambda m, p9, fail=0: {"total_ms": (m, p9, p9), "n": 20, "fail": fail}
+    summ = {"warm_all": S(640, 1990), "v2_ssl": S(650, 1985), "v2_redirect": S(360, 450), "v2_hedge": S(355, 440),
+            "v2_full": S(357, 445), "v2_full_auto": S(540, 1900)}
+    out = ws.bench_dl_summary(tmp_path, list(summ), summ)
+    assert out["v2_ssl"]["recommend_on"] is False                                    # không thắng warm_all
+    assert out["v2_redirect"]["recommend_on"] is True and out["v2_hedge"]["recommend_on"] is True
+    assert out["v2_full"]["recommend_on"] is True                                    # chậm hơn v2_hedge 2–5 ms = nhiễu (≤ 25 ms)
+    assert out["v2_full_auto"]["win_vs_ref"] is True and out["v2_full_auto"]["recommend_on"] is False   # chỉ thắng nhờ nhóm trước
+    md = (tmp_path / "BENCH_DL_SUMMARY.md").read_text(encoding="utf-8")
+    assert "GIỮ TẮT nhóm cờ này" in md and 'range_connections = "auto"' in md

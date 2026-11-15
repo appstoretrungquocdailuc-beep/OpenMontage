@@ -1228,12 +1228,15 @@ def mn_preconnect(url, skip=()):
 
 
 def _replica_for(url):
+    """Máy chủ dự phòng cho hedge: trong mn=, khác máy chủ hiện tại, không bị cấm, ưu tiên máy chủ KHÔNG đã biết là sẽ 302
+    (máy chủ 302 thì request dự phòng phải đi thêm 1 chặng)."""
     now = time.monotonic()
-    for h in mn_netlocs(url):
-        if _HEDGE_BAN.get(h, 0) > now:
-            continue
-        return urlparse(url)._replace(netloc=h).geturl()
-    return None
+    with _RDR_LOCK:
+        redirectors = set(_RDR_HOST)
+        red_sn = set(_RDR_SN)
+    cands = [h for h in mn_netlocs(url) if _HEDGE_BAN.get(h, 0) <= now]
+    cands.sort(key=lambda h: (h in redirectors or _gv_parts(h)[1] in red_sn))
+    return urlparse(url)._replace(netloc=cands[0]).geturl() if cands else None
 
 
 def _close_quiet(r):
@@ -1243,14 +1246,14 @@ def _close_quiet(r):
         pass
 
 
-def _hedged_follow(url, replica, delay_s, info):
+def _hedged_follow(url, replica, delay_s, info, headers=None):
     """Request chính; chưa có header sau delay_s → thêm 1 request tới replica. Bên nào trả 2xx trước thì dùng, bên kia đóng ngay
     (không đọc thân). Request chính lỗi TRƯỚC khi hedge → ném lỗi luôn (không bắn kép khi 403/429). Tối đa 1 request kép."""
     q = queue.Queue()
 
     def run(tag, u):
         try:
-            r, fin = _follow(u)
+            r, fin = _follow(u, headers=headers)
             q.put((tag, r, fin, None))
         except Exception as e:  # noqa: BLE001
             q.put((tag, None, None, e))
@@ -1298,13 +1301,20 @@ def _hedged_follow(url, replica, delay_s, info):
     raise perr or got[-1][3]
 
 
-def _open_media(url, info, allow_hedge=True):
-    """Mở GET tải (thay cho _follow(url) trong download_single) với các tối ưu v2 theo cờ. Tắt hết = _follow(url) y nguyên."""
+def _open_media(url, info, allow_hedge=True, headers=None):
+    """Mở GET tải (thay cho _follow(url)) với các tối ưu v2 theo cờ. Tắt hết = _follow(url) y nguyên.
+    Thứ tự: đoán máy chủ đích sau 302 (#2) → [hedge #4 áp cho CHÍNH URL sẽ gửi, kể cả URL đã đoán] → đoán sai: URL gốc ngay."""
+    def open_one(u):
+        if allow_hedge and NET_OPTS.get("dl_hedge") and not info.get("no_hedge"):
+            rep = _replica_for(u)
+            if rep:
+                return _hedged_follow(u, rep, max(0.0, float(NET_OPTS.get("dl_hedge_delay_ms") or 120)) / 1000.0, info, headers)
+        return _follow(u, headers=headers)
     if NET_OPTS.get("net_redirect_memory"):
         pred, how = redirect_predict(url)
         if pred:
             try:
-                r, fin = _follow(pred)
+                r, fin = open_one(pred)
                 info.update(redirect_skip=how, skipped_to=_netloc(pred))
                 DL_STATS["redirect_skip"] += 1
                 return r, fin
@@ -1312,14 +1322,12 @@ def _open_media(url, info, allow_hedge=True):
                 info["redirect_skip_fail"] = f"{type(e).__name__}"[:40] + (f" {e.code}" if isinstance(e, HttpStatus) else "")
                 DL_STATS["redirect_skip_fail"] += 1
                 redirect_forget(url)
+                info.pop("hedge_win", None)
+                info.pop("hedge_sent", None)
     pre = mn_preconnect(url) if NET_OPTS.get("net_mn_preconnect") else []
     if pre:
         info["mn_preconnect"] = len(pre)
-    if allow_hedge and NET_OPTS.get("dl_hedge") and not info.get("no_hedge"):
-        rep = _replica_for(url)
-        if rep:
-            return _hedged_follow(url, rep, max(0.0, float(NET_OPTS.get("dl_hedge_delay_ms") or 120)) / 1000.0, info)
-    return _follow(url)
+    return open_one(url)
 
 
 def download_single(url: str, dest: Path, info: dict, cancel: threading.Event | None = None) -> int:
@@ -1380,7 +1388,13 @@ def download_ranges(url: str, dest: Path, size: int, n: int, info: dict, cancel=
     finals = []
 
     def one(a, b):
-        rr, fin = _follow(url, headers={"Range": f"bytes={a}-{b}"}, preload=False)
+        if any(NET_OPTS.get(k) for k in ("net_redirect_memory", "net_mn_preconnect")):
+            pinfo = {}                                     # v2: mỗi đoạn cũng GET thẳng máy chủ đích đã học (không hedge từng đoạn)
+            rr, fin = _open_media(url, pinfo, allow_hedge=False, headers={"Range": f"bytes={a}-{b}"})
+            if pinfo.get("redirect_skip"):
+                info["redirect_skip"] = pinfo["redirect_skip"]
+        else:
+            rr, fin = _follow(url, headers={"Range": f"bytes={a}-{b}"}, preload=False)
         hops_all.extend(getattr(rr, "_ws_hops", []) or [])
         finals.append(fin)
         if rr.status != 206:
@@ -4196,35 +4210,52 @@ def bench_dl(cfg, base, ids, reps=None, variants=None):
     return {"rows": rows, "summary": summary, "conclusion": concl}
 
 
-def bench_dl_summary(base, names, summary, ref="warm_all", min_gain_ms=50.0) -> dict:
-    """BENCH_DL_SUMMARY.md: biến thể nào THẮNG mốc (warm_all) theo median VÀ P90 ≥ 50 ms, tỷ lệ lỗi không tăng → đề xuất bật mặc định;
-    không thắng → đề xuất giữ tắt. Chỉ dựa trên số đo của chính lần bench này."""
+V2_CHAIN = ["warm_all", "v2_ssl", "v2_redirect", "v2_hedge", "v2_full", "v2_full_auto"]
+V2_GROUP = {"v2_ssl": "net_shared_ssl + net_rcvbuf_mb", "v2_redirect": "net_redirect_memory + net_mn_preconnect", "v2_hedge": "dl_hedge",
+            "v2_full": "dl_alt_url_on_403 + dl_quick_integrity + dl_hotpath_v2", "v2_full_auto": 'range_connections = "auto"'}
+
+
+def bench_dl_summary(base, names, summary, ref="warm_all", min_gain_ms=50.0, tol_ms=25.0) -> dict:
+    """BENCH_DL_SUMMARY.md — 2 tiêu chí, CHỈ dựa trên số đo của chính lần bench này:
+    (1) như yêu cầu: biến thể THẮNG mốc warm_all khi median VÀ P90 nhanh hơn ≥ 50 ms, tỷ lệ lỗi không tăng;
+    (2) vì các biến thể v2_* CỘNG DỒN: nhóm cờ mà biến thể đó thêm vào phải KHÔNG làm chậm (median và P90, cho phép nhiễu ≤ 25 ms)
+        so với biến thể liền trước, lỗi không tăng. Đề xuất BẬT nhóm cờ chỉ khi đạt cả (1) và (2); còn lại → GIỮ TẮT."""
     out = {}
-    lines = [f"# BENCH_DL_SUMMARY — {iso()} — so với mốc '{ref}' (TỔNG = resolve → tải → ffprobe)", ""]
+    lines = [f"# BENCH_DL_SUMMARY — {iso()} — mốc '{ref}' (TỔNG = resolve → tải → ffprobe)", ""]
     if ref not in summary:
         lines.append(f"Không có mốc '{ref}' trong lần chạy này → không kết luận.")
-    else:
-        r = summary[ref]
-        er = r["fail"] / max(1, r["n"])
-        lines += [f"Mốc {ref}: median {r['total_ms'][0]} ms | P90 {r['total_ms'][1]} ms | lỗi {r['fail']}/{r['n']}", "",
-                  "| Biến thể | median | P90 | lỗi | Δ median | Δ P90 | Đề xuất |", "|---|---|---|---|---|---|---|"]
-        for v in names:
-            if v == ref or v not in summary:
-                continue
-            x = summary[v]
-            if x["total_ms"][0] is None or r["total_ms"][0] is None:
-                lines.append(f"| {v} | - | - | {x['fail']}/{x['n']} | - | - | CHƯA ĐỦ SỐ ĐO |")
-                continue
-            dm, d9 = r["total_ms"][0] - x["total_ms"][0], r["total_ms"][1] - x["total_ms"][1]
-            ex = x["fail"] / max(1, x["n"])
-            win = dm >= min_gain_ms and d9 >= min_gain_ms and ex <= er
-            out[v] = {"win": win, "gain_median_ms": round(dm, 1), "gain_p90_ms": round(d9, 1), "error_rate": round(ex, 3)}
-            lines.append(f"| {v} | {x['total_ms'][0]:.0f} | {x['total_ms'][1]:.0f} | {x['fail']}/{x['n']} | {dm:+.0f} | {d9:+.0f} | "
-                         + ("✅ BẬT mặc định" if win else "⏸ GIỮ TẮT (chưa thắng đủ ≥ 50 ms ở cả median và P90, hoặc lỗi tăng)") + " |")
-        lines += ["", "Δ dương = nhanh hơn mốc. Biến thể v2_* cộng dồn (mỗi biến thể thêm đúng 1 nhóm so với biến thể trước): nhóm nào "
-                  "không làm biến thể của nó thắng biến thể liền trước thì không đáng bật. Cờ tương ứng trong config.json: "
-                  "v2_ssl → net_shared_ssl/net_rcvbuf_mb; v2_redirect → net_redirect_memory/net_mn_preconnect; v2_hedge → dl_hedge; "
-                  "v2_full → dl_alt_url_on_403/dl_quick_integrity/dl_hotpath_v2; v2_full_auto → range_connections=\"auto\"."]
+        (base / "BENCH_DL_SUMMARY.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return out
+    r = summary[ref]
+    erate = lambda x: x["fail"] / max(1, x["n"])
+    lines += [f"Mốc {ref}: median {r['total_ms'][0]} ms | P90 {r['total_ms'][1]} ms | lỗi {r['fail']}/{r['n']}", "",
+              "| Biến thể | median | P90 | lỗi | Δ median / Δ P90 so với warm_all | so với biến thể liền trước | Nhóm cờ | Đề xuất |",
+              "|---|---|---|---|---|---|---|---|"]
+    prev = ref
+    for v in [x for x in V2_CHAIN if x in names and x != ref] + [x for x in names if x not in V2_CHAIN and x != ref]:
+        if v not in summary:
+            continue
+        x = summary[v]
+        if x["total_ms"][0] is None or r["total_ms"][0] is None:
+            lines.append(f"| {v} | - | - | {x['fail']}/{x['n']} | - | - | {V2_GROUP.get(v, '-')} | CHƯA ĐỦ SỐ ĐO |")
+            continue
+        dm, d9 = r["total_ms"][0] - x["total_ms"][0], r["total_ms"][1] - x["total_ms"][1]
+        win_ref = dm >= min_gain_ms and d9 >= min_gain_ms and erate(x) <= erate(r)
+        inc_ok, inc_txt = True, "-"
+        if v in V2_CHAIN and prev in summary and summary[prev]["total_ms"][0] is not None:
+            p_ = summary[prev]
+            im, i9 = p_["total_ms"][0] - x["total_ms"][0], p_["total_ms"][1] - x["total_ms"][1]
+            inc_ok = im >= -tol_ms and i9 >= -tol_ms and erate(x) <= erate(p_)
+            inc_txt = f"{prev}: {im:+.0f} / {i9:+.0f}"
+        rec = win_ref and inc_ok
+        out[v] = {"win_vs_ref": win_ref, "incremental_ok": inc_ok, "recommend_on": rec, "gain_median_ms": round(dm, 1),
+                  "gain_p90_ms": round(d9, 1), "error_rate": round(erate(x), 3)}
+        lines.append(f"| {v} | {x['total_ms'][0]:.0f} | {x['total_ms'][1]:.0f} | {x['fail']}/{x['n']} | {dm:+.0f} / {d9:+.0f} | {inc_txt} | "
+                     f"{V2_GROUP.get(v, '-')} | " + ("✅ BẬT nhóm cờ này" if rec else "⏸ GIỮ TẮT nhóm cờ này") + " |")
+        if v in V2_CHAIN:
+            prev = v
+    lines += ["", f"Δ dương = nhanh hơn. 'So với biến thể liền trước' cho phép nhiễu ≤ {tol_ms:.0f} ms. 'Giữ tắt' = đặt các cờ của nhóm đó "
+              "về false (range_connections = 1) trong config.json."]
     (base / "BENCH_DL_SUMMARY.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return out
 

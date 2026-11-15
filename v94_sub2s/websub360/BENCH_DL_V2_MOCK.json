@@ -2,125 +2,125 @@
  "note": "SỐ MOCK (127.0.0.1, TLS thật, bắt tay 60 ms/kết nối mới, chờ máy chủ 150 ms/10% 1500 ms) — KHÔNG phải YouTube",
  "bench_dl": {
   "warm_all": {
-   "n": 2,
+   "n": 20,
    "fail": 0,
    "total_ms_p50_p90_p95": [
-    1328.753,
-    1868.338,
-    1935.786
+    638.34,
+    1990.55,
+    1992.204
    ],
    "ttfb_ms_p50_p90_p95": [
-    1105.827,
-    1644.661,
-    1712.015
+    430.319,
+    1780.231,
+    1780.639
    ]
   },
   "v2_ssl": {
-   "n": 2,
+   "n": 20,
    "fail": 0,
    "total_ms_p50_p90_p95": [
-    1317.947,
-    1858.358,
-    1925.91
+    649.235,
+    1983.544,
+    1988.122
    ],
    "ttfb_ms_p50_p90_p95": [
-    1105.645,
-    1646.407,
-    1714.003
+    430.17,
+    1779.268,
+    1779.492
    ]
   },
   "v2_redirect": {
-   "n": 2,
+   "n": 20,
    "fail": 0,
    "total_ms_p50_p90_p95": [
-    477.546,
-    568.552,
-    579.928
+    359.103,
+    452.056,
+    636.571
    ],
    "ttfb_ms_p50_p90_p95": [
-    260.361,
-    346.899,
-    357.716
+    152.251,
+    230.692,
+    426.358
    ]
   },
   "v2_hedge": {
-   "n": 2,
+   "n": 20,
    "fail": 0,
    "total_ms_p50_p90_p95": [
-    362.072,
-    365.648,
-    366.095
+    370.045,
+    1714.85,
+    1775.753
    ],
    "ttfb_ms_p50_p90_p95": [
-    152.292,
-    152.488,
-    152.513
+    152.213,
+    1509.458,
+    1565.885
    ]
   },
   "v2_full": {
-   "n": 2,
+   "n": 20,
    "fail": 0,
    "total_ms_p50_p90_p95": [
-    1031.703,
-    1574.45,
-    1642.294
+    369.329,
+    1705.438,
+    1705.753
    ],
    "ttfb_ms_p50_p90_p95": [
-    829.249,
-    1370.435,
-    1438.084
+    152.786,
+    1502.46,
+    1502.802
    ]
   },
   "v2_full_auto": {
-   "n": 2,
+   "n": 20,
    "fail": 0,
    "total_ms_p50_p90_p95": [
-    507.118,
-    619.105,
-    633.104
+    538.905,
+    1929.016,
+    1935.506
    ],
    "ttfb_ms_p50_p90_p95": [
-    293.846,
-    406.726,
-    420.836
+    323.616,
+    436.187,
+    436.356
    ]
   }
  },
  "conclusion": {
   "v2_ssl": {
    "win": false,
-   "gain_median_ms": 10.8,
-   "gain_p90_ms": 10.0,
+   "gain_median_ms": -10.9,
+   "gain_p90_ms": 7.0,
    "error_rate": 0.0
   },
   "v2_redirect": {
    "win": true,
-   "gain_median_ms": 851.2,
-   "gain_p90_ms": 1299.8,
+   "gain_median_ms": 279.2,
+   "gain_p90_ms": 1538.5,
    "error_rate": 0.0
   },
   "v2_hedge": {
    "win": true,
-   "gain_median_ms": 966.7,
-   "gain_p90_ms": 1502.7,
+   "gain_median_ms": 268.3,
+   "gain_p90_ms": 275.7,
    "error_rate": 0.0
   },
   "v2_full": {
    "win": true,
-   "gain_median_ms": 297.0,
-   "gain_p90_ms": 293.9,
+   "gain_median_ms": 269.0,
+   "gain_p90_ms": 285.1,
    "error_rate": 0.0
   },
   "v2_full_auto": {
    "win": true,
-   "gain_median_ms": 821.6,
-   "gain_p90_ms": 1249.2,
+   "gain_median_ms": 99.4,
+   "gain_p90_ms": 61.5,
    "error_rate": 0.0
   }
  },
  "ssl_contexts_created": 1,
  "dl_stats": {
-  "redirect_skip": 6,
+  "redirect_skip": 69,
   "redirect_skip_fail": 0,
   "mn_preconnect": 2,
   "hedge_sent": 0,
@@ -135,62 +135,62 @@
   "off": {
    "runs": [
     {
-     "ms": 404,
-     "state": "DONE",
-     "attempts": 1
+     "ms": 3634,
+     "state": "FAILED",
+     "attempts": 3
     },
     {
-     "ms": 404,
-     "state": "DONE",
-     "attempts": 1
+     "ms": 3626,
+     "state": "FAILED",
+     "attempts": 3
     },
     {
-     "ms": 403,
-     "state": "DONE",
-     "attempts": 1
+     "ms": 3624,
+     "state": "FAILED",
+     "attempts": 3
     },
     {
-     "ms": 1765,
-     "state": "DONE",
-     "attempts": 1
+     "ms": 3634,
+     "state": "FAILED",
+     "attempts": 3
     },
     {
-     "ms": 403,
-     "state": "DONE",
-     "attempts": 1
+     "ms": 3626,
+     "state": "FAILED",
+     "attempts": 3
     }
    ],
-   "median_ms": 404
+   "median_ms": 3626
   },
   "on": {
    "runs": [
     {
-     "ms": 1766,
+     "ms": 303,
      "state": "DONE",
      "attempts": 1
     },
     {
-     "ms": 1761,
+     "ms": 303,
      "state": "DONE",
      "attempts": 1
     },
     {
-     "ms": 403,
+     "ms": 303,
      "state": "DONE",
      "attempts": 1
     },
     {
-     "ms": 405,
+     "ms": 303,
      "state": "DONE",
      "attempts": 1
     },
     {
-     "ms": 403,
+     "ms": 303,
      "state": "DONE",
      "attempts": 1
     }
    ],
-   "median_ms": 405
+   "median_ms": 303
   }
  }
 }
