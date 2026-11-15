@@ -19,6 +19,8 @@ import urllib3
 from urllib3.connection import HTTPSConnection
 from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
 from urllib3.util.connection import create_connection
+from urllib3.util.wait import wait_for_read
+import ssl as _ssl
 
 _TL = threading.local()
 GV_RE = re.compile(r"^rr(\d+)---(sn-[a-z0-9-]+)\.googlevideo\.com$", re.I)
@@ -80,8 +82,39 @@ class DNSCache:
 DNS = DNSCache()
 
 
+# v2 #3: kết nối MỞ SẴN (chưa gửi request) qua TLS 1.3 nhận NewSessionTicket SAU bắt tay → socket "có dữ liệu chờ đọc" → urllib3
+# tưởng kết nối đã đứt (is_connection_dropped) → đóng và mở lại → mở sẵn vô ích. Bật cờ này: đọc thử không chặn; chỉ có bản ghi TLS
+# (ticket) → vẫn sống. Có dữ liệu ứng dụng lạ / đã đóng → coi là đứt như cũ. (Engine bật cùng net_mn_preconnect.)
+TICKET_AWARE = False
+TICKET_STATS = {"kept": 0}
+
+
 class TimedHTTPSConnection(HTTPSConnection):
     """Tách DNS / TCP / TLS; đánh dấu thời điểm gửi request và nhận header (SERVER_WAIT)."""
+
+    @property
+    def is_connected(self) -> bool:
+        if self.sock is None:
+            return False
+        if not wait_for_read(self.sock, timeout=0.0):
+            return True
+        if not TICKET_AWARE or not isinstance(self.sock, _ssl.SSLSocket):
+            return False
+        old = self.sock.gettimeout()
+        try:
+            self.sock.settimeout(0.0)
+            self.sock.recv(1)
+            return False                                   # có dữ liệu ứng dụng lạ hoặc b"" (đã đóng) → coi là đứt
+        except (_ssl.SSLWantReadError, BlockingIOError):
+            TICKET_STATS["kept"] += 1
+            return True                                    # chỉ là ticket TLS 1.3 → kết nối còn dùng được
+        except Exception:
+            return False
+        finally:
+            try:
+                self.sock.settimeout(old)
+            except Exception:
+                pass
 
     def _new_conn(self):
         t = _cur()
@@ -110,11 +143,15 @@ class TimedHTTPSConnection(HTTPSConnection):
         t0 = time.perf_counter_ns()
         super().connect()
         t1 = time.perf_counter_ns()
+        CONN_STATS["new"] += 1
         if t is not None:
             t["new_conn"] = True
             t["conns"] = t.get("conns", 0) + 1
             t["tls_ms"] = _ms(getattr(self, "_t_tcp_done", t0), t1)
             t["connect_total_ms"] = _ms(t0, t1)
+            reused = getattr(self.sock, "session_reused", None)       # TLS session resumption (Python chỉ resume khi được đưa session)
+            if reused is not None:
+                t["tls_resumed"] = bool(reused)
 
     def request(self, *a, **k):
         t = _cur()
@@ -138,8 +175,57 @@ class TimedHTTPSPool(HTTPSConnectionPool):
     ConnectionCls = TimedHTTPSConnection
 
 
-def make_pool(mode="fast"):
+# ------------------------------------------------------------------ SSLContext DÙNG CHUNG (v2 #1)
+# urllib3 (không truyền ssl_context) tạo SSLContext MỚI + load_default_certs() cho TỪNG kết nối mới. Windows: duyệt kho chứng chỉ
+# hệ thống mỗi lần (~30–100 ms, giữ GIL). Dùng chung 1 context (tạo 1 lần) → bỏ chi phí đó; vẫn xác minh chứng chỉ + hostname
+# (urllib3 đặt verify_mode=CERT_REQUIRED, check_hostname=True như bản thường).
+_SSL_CTX = None
+_SSL_LOCK = threading.Lock()
+SSL_STATS = {"created": 0}
+CONN_STATS = {"new": 0}
+
+
+def shared_ssl_context():
+    global _SSL_CTX
+    if _SSL_CTX is None:
+        with _SSL_LOCK:
+            if _SSL_CTX is None:
+                from urllib3.util import ssl_ as _u3ssl
+                ctx = _u3ssl.create_urllib3_context()
+                ctx.load_default_certs()
+                SSL_STATS["created"] += 1
+                _SSL_CTX = ctx
+    return _SSL_CTX
+
+
+def reset_shared_ssl_context():
+    """Chỉ cho test/bench: bỏ context dùng chung (lần sau tạo lại)."""
+    global _SSL_CTX
+    with _SSL_LOCK:
+        _SSL_CTX = None
+
+
+def socket_opts(rcvbuf_mb=0.0):
+    """TCP_NODELAY (= mặc định urllib3) + SO_RCVBUF (nếu rcvbuf_mb > 0). Truyền socket_options sẽ THAY danh sách mặc định nên
+    phải giữ TCP_NODELAY."""
+    opts = [(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)]
+    if rcvbuf_mb and float(rcvbuf_mb) > 0:
+        opts.append((socket.SOL_SOCKET, socket.SO_RCVBUF, int(float(rcvbuf_mb) * 1024 * 1024)))
+    return opts
+
+
+def pool_kwargs(shared_ssl=False, rcvbuf_mb=0.0):
+    kw = {}
+    if shared_ssl:
+        kw["ssl_context"] = shared_ssl_context()
+    if rcvbuf_mb and float(rcvbuf_mb) > 0:
+        kw["socket_options"] = socket_opts(rcvbuf_mb)
+    return kw
+
+
+def make_pool(mode="fast", shared_ssl=False, rcvbuf_mb=0.0):
     kw = dict(num_pools=48, maxsize=24, block=False, retries=False, timeout=urllib3.Timeout(connect=2.0, read=8.0))
+    kw.update(pool_kwargs(shared_ssl, rcvbuf_mb))
     pm = urllib3.PoolManager(**kw)
     if mode == "fast":
         pm.pool_classes_by_scheme = {"http": HTTPConnectionPool, "https": TimedHTTPSPool}

@@ -1,0 +1,196 @@
+{
+ "note": "SỐ MOCK (127.0.0.1, TLS thật, bắt tay 60 ms/kết nối mới, chờ máy chủ 150 ms/10% 1500 ms) — KHÔNG phải YouTube",
+ "bench_dl": {
+  "warm_all": {
+   "n": 2,
+   "fail": 0,
+   "total_ms_p50_p90_p95": [
+    1328.753,
+    1868.338,
+    1935.786
+   ],
+   "ttfb_ms_p50_p90_p95": [
+    1105.827,
+    1644.661,
+    1712.015
+   ]
+  },
+  "v2_ssl": {
+   "n": 2,
+   "fail": 0,
+   "total_ms_p50_p90_p95": [
+    1317.947,
+    1858.358,
+    1925.91
+   ],
+   "ttfb_ms_p50_p90_p95": [
+    1105.645,
+    1646.407,
+    1714.003
+   ]
+  },
+  "v2_redirect": {
+   "n": 2,
+   "fail": 0,
+   "total_ms_p50_p90_p95": [
+    477.546,
+    568.552,
+    579.928
+   ],
+   "ttfb_ms_p50_p90_p95": [
+    260.361,
+    346.899,
+    357.716
+   ]
+  },
+  "v2_hedge": {
+   "n": 2,
+   "fail": 0,
+   "total_ms_p50_p90_p95": [
+    362.072,
+    365.648,
+    366.095
+   ],
+   "ttfb_ms_p50_p90_p95": [
+    152.292,
+    152.488,
+    152.513
+   ]
+  },
+  "v2_full": {
+   "n": 2,
+   "fail": 0,
+   "total_ms_p50_p90_p95": [
+    1031.703,
+    1574.45,
+    1642.294
+   ],
+   "ttfb_ms_p50_p90_p95": [
+    829.249,
+    1370.435,
+    1438.084
+   ]
+  },
+  "v2_full_auto": {
+   "n": 2,
+   "fail": 0,
+   "total_ms_p50_p90_p95": [
+    507.118,
+    619.105,
+    633.104
+   ],
+   "ttfb_ms_p50_p90_p95": [
+    293.846,
+    406.726,
+    420.836
+   ]
+  }
+ },
+ "conclusion": {
+  "v2_ssl": {
+   "win": false,
+   "gain_median_ms": 10.8,
+   "gain_p90_ms": 10.0,
+   "error_rate": 0.0
+  },
+  "v2_redirect": {
+   "win": true,
+   "gain_median_ms": 851.2,
+   "gain_p90_ms": 1299.8,
+   "error_rate": 0.0
+  },
+  "v2_hedge": {
+   "win": true,
+   "gain_median_ms": 966.7,
+   "gain_p90_ms": 1502.7,
+   "error_rate": 0.0
+  },
+  "v2_full": {
+   "win": true,
+   "gain_median_ms": 297.0,
+   "gain_p90_ms": 293.9,
+   "error_rate": 0.0
+  },
+  "v2_full_auto": {
+   "win": true,
+   "gain_median_ms": 821.6,
+   "gain_p90_ms": 1249.2,
+   "error_rate": 0.0
+  }
+ },
+ "ssl_contexts_created": 1,
+ "dl_stats": {
+  "redirect_skip": 6,
+  "redirect_skip_fail": 0,
+  "mn_preconnect": 2,
+  "hedge_sent": 0,
+  "hedge_win_replica": 0,
+  "hedge_ban": 0,
+  "alt_url": 0
+ },
+ "ticket_kept": {
+  "kept": 1
+ },
+ "item5_alt_url_on_403": {
+  "off": {
+   "runs": [
+    {
+     "ms": 404,
+     "state": "DONE",
+     "attempts": 1
+    },
+    {
+     "ms": 404,
+     "state": "DONE",
+     "attempts": 1
+    },
+    {
+     "ms": 403,
+     "state": "DONE",
+     "attempts": 1
+    },
+    {
+     "ms": 1765,
+     "state": "DONE",
+     "attempts": 1
+    },
+    {
+     "ms": 403,
+     "state": "DONE",
+     "attempts": 1
+    }
+   ],
+   "median_ms": 404
+  },
+  "on": {
+   "runs": [
+    {
+     "ms": 1766,
+     "state": "DONE",
+     "attempts": 1
+    },
+    {
+     "ms": 1761,
+     "state": "DONE",
+     "attempts": 1
+    },
+    {
+     "ms": 403,
+     "state": "DONE",
+     "attempts": 1
+    },
+    {
+     "ms": 405,
+     "state": "DONE",
+     "attempts": 1
+    },
+    {
+     "ms": 403,
+     "state": "DONE",
+     "attempts": 1
+    }
+   ],
+   "median_ms": 405
+  }
+ }
+}

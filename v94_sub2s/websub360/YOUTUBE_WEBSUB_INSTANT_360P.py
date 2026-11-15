@@ -161,6 +161,16 @@ DEFAULT_CONFIG = {
     "net_warm_innertube_conns": 3,     # = số client resolver chạy song song
     "net_warm_media_hosts": 6,
     "resolver_host": "",               # "" = www.youtube.com (như yt-dlp) | "youtubei.googleapis.com" (máy chủ API của app Android)
+    # ---- TỐI ƯU TẢI V2 (mỗi cờ tắt = đúng hành vi bản trước; đo bằng BENCH_TAI_360.bat trước khi tin) ----
+    "net_shared_ssl": True,            # #1 1 SSLContext dùng chung (không tạo + nạp kho chứng chỉ cho TỪNG kết nối mới)
+    "net_rcvbuf_mb": 4,                # #1 SO_RCVBUF mỗi socket (MiB); 0 = không đặt (để hệ điều hành tự chỉnh)
+    "net_redirect_memory": True,       # #2 nhớ máy chủ đích sau 302 → lần sau GET thẳng máy chủ đích (sai → quay về URL gốc ngay)
+    "net_mn_preconnect": True,         # #3 mở sẵn TCP+TLS (nền) tới tối đa 3 máy chủ trong tham số mn= của link
+    "dl_hedge": True,                  # #4 request đầu chưa có header sau dl_hedge_delay_ms → gửi thêm 1 request tới máy chủ dự phòng
+    "dl_hedge_delay_ms": 120,
+    "dl_alt_url_on_403": True,         # #5 link client thắng bị 403/410 → dùng ngay link của client resolver khác (cùng itag, cùng dung lượng)
+    "dl_quick_integrity": True,        # #7 kiểm cấu trúc MP4 (ftyp/moov/mdat, tổng box = dung lượng) TRƯỚC ffprobe (ffprobe vẫn chạy)
+    "dl_hotpath_v2": True,             # #8 khúc đọc 1 MiB + ghi thẳng (buffering=0); DASH: 1 lần ghi VERIFYING thay vì 2
     # ---- TÊN FILE ----
     "filename_mode": "TITLE",          # TITLE: '<tiêu đề gốc>.mp4' | TITLE_ID: '<tiêu đề>_<ID>.mp4' | ID_360P: '<ID>_360p.mp4'
     "filename_title_max": 0,           # 0 = không tự cắt (chỉ cắt khi vượt giới hạn đường dẫn Windows)
@@ -474,7 +484,7 @@ class DB:
             self.con.execute("PRAGMA synchronous=NORMAL")
             for col in ("db_verifying_ms", "db_lock_wait_ms", "pre_verify_gap_ms", "ffprobe_ms", "rename_ms",
                         "post_verify_gap_ms", "sum_check_ms", "expected_size", "db_resolving_ms", "db_downloading_ms",
-                        "tiktok", "t_done_wall"):
+                        "tiktok", "t_done_wall", "integrity_ms"):
                 try:
                     self.con.execute(f"ALTER TABLE videos ADD COLUMN {col} REAL")
                 except sqlite3.OperationalError:
@@ -741,6 +751,12 @@ class HttpStatus(Exception):
 _POOL = None
 _POOL_LOCK = threading.Lock()
 _NET_MODE = "fast"                  # fast: đo DNS/TCP/TLS/SERVER_WAIT + DNS cache (ws360_net) | legacy: PoolManager cũ y nguyên
+# Cờ tối ưu tải v2 (Engine/bench gọi set_net_opts(cfg)). Mặc định module = TẮT hết (= bản trước) để hàm dùng riêng lẻ không đổi hành vi.
+NET_OPTS_KEYS = ("net_shared_ssl", "net_rcvbuf_mb", "net_redirect_memory", "net_mn_preconnect", "dl_hedge", "dl_hedge_delay_ms",
+                 "dl_alt_url_on_403", "dl_quick_integrity", "dl_hotpath_v2")
+NET_OPTS = {"net_shared_ssl": False, "net_rcvbuf_mb": 0, "net_redirect_memory": False, "net_mn_preconnect": False, "dl_hedge": False,
+            "dl_hedge_delay_ms": 120, "dl_alt_url_on_403": False, "dl_quick_integrity": False, "dl_hotpath_v2": False}
+NET_OPTS_OFF = dict(NET_OPTS)       # = đúng bản trước (dùng cho bench 'legacy'/'warm_all' và rollback)
 NET_LEARN = None                    # Engine gắn: học máy chủ video vừa dùng để giữ kết nối ấm
 try:
     sys.path.insert(0, str(Path(os.path.dirname(os.path.abspath(__file__)))))
@@ -778,16 +794,39 @@ def set_net_mode(mode: str):
     return mode
 
 
+def set_net_opts(cfg: dict) -> dict:
+    """Áp các cờ tối ưu tải v2 từ cấu hình. Đổi SSLContext/SO_RCVBUF → dựng lại pool (kết nối cũ đóng)."""
+    global _POOL
+    new = dict(NET_OPTS)
+    for k in NET_OPTS_KEYS:
+        if k in cfg:
+            new[k] = cfg[k]
+    with _POOL_LOCK:
+        if _POOL is not None and (bool(new["net_shared_ssl"]) != bool(NET_OPTS["net_shared_ssl"])
+                                  or float(new["net_rcvbuf_mb"] or 0) != float(NET_OPTS["net_rcvbuf_mb"] or 0)):
+            try:
+                _POOL.clear()
+            except Exception:
+                pass
+            _POOL = None
+        NET_OPTS.update(new)
+        if NET is not None:
+            NET.TICKET_AWARE = bool(NET_OPTS.get("net_mn_preconnect"))    # kết nối mở sẵn không bị coi là đứt vì ticket TLS 1.3
+    return dict(NET_OPTS)
+
+
 def pool():
     global _POOL
     if _POOL is None:
         with _POOL_LOCK:
             if _POOL is None:
+                ssl_on, rcv = bool(NET_OPTS.get("net_shared_ssl")), float(NET_OPTS.get("net_rcvbuf_mb") or 0)
                 if _NET_MODE == "fast" and NET is not None:
-                    _POOL = NET.make_pool("fast")
+                    _POOL = NET.make_pool("fast", shared_ssl=ssl_on, rcvbuf_mb=rcv)
                 else:
+                    extra = NET.pool_kwargs(ssl_on, rcv) if NET is not None else {}
                     _POOL = urllib3.PoolManager(num_pools=32, maxsize=24, block=False, retries=False,
-                                                timeout=urllib3.Timeout(connect=2.0, read=8.0))
+                                                timeout=urllib3.Timeout(connect=2.0, read=8.0), **extra)
     return _POOL
 
 
@@ -898,6 +937,8 @@ def _net_phases(d: dict, t0=None, t1=None) -> dict:
     """Gom số đo 1 request: kết nối mới (DNS/TCP/TLS) hay dùng lại, SERVER_WAIT (gửi xong → header), đọc thân."""
     out = {"new_conn": bool(d.get("new_conn")), "dns_ms": d.get("dns_ms"), "tcp_ms": d.get("tcp_ms"), "tls_ms": d.get("tls_ms"),
            "server_wait_ms": d.get("server_wait_ms")}
+    if "tls_resumed" in d:
+        out["tls_resumed"] = d["tls_resumed"]
     if t0 is not None and t1 is not None:
         out["total_ms"] = ms(t0, t1)
         if d.get("t_hdr"):
@@ -985,6 +1026,8 @@ class Resolver:
                         r["source"] = f"INNERTUBE_{r['client'].upper()}"
                         r["resolve_ms"] = r["done_ms"]
                         r["race_ms"] = {x.get("client"): x.get("done_ms") for x in results}
+                        # v2 #5: KHÔNG chờ các client còn lại; chỉ giữ future để _fetch dùng link của chúng nếu link thắng bị 403/410
+                        r["alt_futs"] = [(c, x) for c, x in zip(self.CLIENTS, futs) if x is not f]
                         return r
         except FTE:
             pass
@@ -1059,7 +1102,10 @@ def _follow(url, headers=None, method="GET", preload=False, timeout=None):
             r.release_conn()
             if not loc:
                 raise HttpStatus(r.status)
-            cur = urljoin(cur, loc)
+            nxt = urljoin(cur, loc)
+            if NET_OPTS.get("net_redirect_memory"):
+                redirect_learn(cur, nxt)
+            cur = nxt
             continue
         if r.status >= 400:
             ra = r.headers.get("Retry-After")
@@ -1085,17 +1131,210 @@ def probe_size(url: str) -> int:
     return int(m.group(1))
 
 
+# ---------------- TỐI ƯU TẢI V2: nhớ 302 (#2) | mở sẵn máy chủ mn= (#3) | hedged GET (#4) ----------------
+_GV_HOST_RE = re.compile(r"^rr(\d+)---(sn-[a-z0-9-]+)\.googlevideo\.com$", re.I)
+_RDR_LOCK = threading.Lock()
+_RDR_HOST = {}                      # netloc gốc → (netloc đích, monotonic)
+_RDR_SN = {}                        # cụm sn gốc → (netloc đích, monotonic)  (máy chủ rrN chưa gặp vẫn đoán được)
+_RDR_TTL = 600.0
+_HEDGE_BAN = {}                     # netloc replica → hết cấm (monotonic) — chỉ khi replica CHẮC CHẮN trả 403/404/410/429
+DL_STATS = {"redirect_skip": 0, "redirect_skip_fail": 0, "mn_preconnect": 0, "hedge_sent": 0, "hedge_win_replica": 0,
+            "hedge_ban": 0, "alt_url": 0}
+
+
+def _netloc(u):
+    p = urlparse(u)
+    return (p.hostname or "").lower() + (f":{p.port}" if p.port else "")
+
+
+def _gv_parts(netloc):
+    m = _GV_HOST_RE.match((netloc or "").split(":", 1)[0])
+    return (int(m.group(1)), m.group(2).lower()) if m else (None, None)
+
+
+def redirect_learn(src_url, dst_url):
+    a, b = _netloc(src_url), _netloc(dst_url)
+    if not a or not b or a == b or "googlevideo.com" not in a or "googlevideo.com" not in b:
+        return
+    now = time.monotonic()
+    with _RDR_LOCK:
+        _RDR_HOST[a] = (b, now)
+        sn = _gv_parts(a)[1]
+        if sn:
+            _RDR_SN[sn] = (b, now)
+
+
+def redirect_predict(url):
+    """→ (URL đã đổi sang máy chủ đích đoán được | None, 'host'|'cluster'). Cùng path + query (chữ ký giữ nguyên)."""
+    a = _netloc(url)
+    now = time.monotonic()
+    with _RDR_LOCK:
+        e, how = _RDR_HOST.get(a), "host"
+        if not e or now - e[1] > _RDR_TTL:
+            sn = _gv_parts(a)[1]
+            e, how = (_RDR_SN.get(sn) if sn else None), "cluster"
+        if not e or now - e[1] > _RDR_TTL or e[0] == a:
+            return None, ""
+        dst = e[0]
+    return urlparse(url)._replace(netloc=dst).geturl(), how
+
+
+def redirect_forget(url):
+    """Dự đoán sai → bỏ cặp học được (không đoán lại sai lần nữa)."""
+    a = _netloc(url)
+    sn = _gv_parts(a)[1]
+    with _RDR_LOCK:
+        _RDR_HOST.pop(a, None)
+        if sn:
+            _RDR_SN.pop(sn, None)
+
+
+def mn_netlocs(url, limit=3):
+    """Máy chủ cùng số rrN trong các cụm của tham số mn= (trừ máy chủ hiện tại)."""
+    p = urlparse(url)
+    rr, sn0 = _gv_parts(_netloc(url))
+    if rr is None:
+        return []
+    mn = ((parse_qs(p.query).get("mn") or [""])[0]).split(",")
+    port = f":{p.port}" if p.port else ""
+    out = [f"rr{rr}---{sn.strip().lower()}.googlevideo.com{port}" for sn in mn if sn.strip().lower().startswith("sn-")
+           and sn.strip().lower() != sn0]
+    return list(dict.fromkeys(out))[:limit]
+
+
+def _preconnect_one(netloc):
+    try:
+        host, _, port = netloc.partition(":")
+        cp = pool().connection_from_host(host, int(port or 443), scheme="https")
+        if any(c is not None and getattr(c, "sock", None) is not None for c in list(cp.pool.queue)):
+            return                                          # đã có kết nối rảnh tới máy chủ này
+        conn = cp._get_conn()
+        try:
+            if getattr(conn, "sock", None) is None:
+                conn.connect()
+                DL_STATS["mn_preconnect"] += 1
+        finally:
+            cp._put_conn(conn)
+    except Exception:
+        pass                                                # sai/không tới được → không mất gì
+
+
+def mn_preconnect(url, skip=()):
+    """Nền, KHÔNG chặn: DNS+TCP+TLS tới máy chủ mn= → nếu 302 trỏ vào đó, kết nối đã sẵn trong pool."""
+    hosts = [h for h in mn_netlocs(url) if h not in skip]
+    for h in hosts:
+        threading.Thread(target=_preconnect_one, args=(h,), daemon=True, name="MN-PRECONNECT").start()
+    return hosts
+
+
+def _replica_for(url):
+    now = time.monotonic()
+    for h in mn_netlocs(url):
+        if _HEDGE_BAN.get(h, 0) > now:
+            continue
+        return urlparse(url)._replace(netloc=h).geturl()
+    return None
+
+
+def _close_quiet(r):
+    try:
+        r.close()
+    except Exception:
+        pass
+
+
+def _hedged_follow(url, replica, delay_s, info):
+    """Request chính; chưa có header sau delay_s → thêm 1 request tới replica. Bên nào trả 2xx trước thì dùng, bên kia đóng ngay
+    (không đọc thân). Request chính lỗi TRƯỚC khi hedge → ném lỗi luôn (không bắn kép khi 403/429). Tối đa 1 request kép."""
+    q = queue.Queue()
+
+    def run(tag, u):
+        try:
+            r, fin = _follow(u)
+            q.put((tag, r, fin, None))
+        except Exception as e:  # noqa: BLE001
+            q.put((tag, None, None, e))
+    threading.Thread(target=run, args=("primary", url), daemon=True, name="DL-PRIMARY").start()
+    started, got = 1, []
+    try:
+        first = q.get(timeout=delay_s)
+    except queue.Empty:
+        first = None
+    if first is not None:
+        if first[3] is not None:
+            raise first[3]
+        info["hedge_win"] = "primary(no-hedge)"
+        return first[1], first[2]
+    threading.Thread(target=run, args=("replica", replica), daemon=True, name="DL-REPLICA").start()
+    started += 1
+    DL_STATS["hedge_sent"] += 1
+    info["hedge_sent"] = True
+    perr = None
+    while len(got) < started:
+        res = q.get(timeout=30)
+        got.append(res)
+        tag, r, fin, err = res
+        if err is None:
+            info["hedge_win"] = tag
+            if tag == "replica":
+                DL_STATS["hedge_win_replica"] += 1
+            left = started - len(got)
+            if left:
+                def reap(n=left):                               # bên thua: đóng ngay khi nó trả về (timeout muộn KHÔNG tính lỗi)
+                    for _ in range(n):
+                        try:
+                            x = q.get(timeout=30)
+                        except queue.Empty:
+                            return
+                        if x[1] is not None:
+                            _close_quiet(x[1])
+                threading.Thread(target=reap, daemon=True, name="DL-REAP").start()
+            return r, fin
+        if tag == "replica" and isinstance(err, HttpStatus) and err.code in (403, 404, 410, 429):
+            _HEDGE_BAN[_netloc(replica)] = time.monotonic() + 600
+            DL_STATS["hedge_ban"] += 1
+        if tag == "primary":
+            perr = err
+    raise perr or got[-1][3]
+
+
+def _open_media(url, info, allow_hedge=True):
+    """Mở GET tải (thay cho _follow(url) trong download_single) với các tối ưu v2 theo cờ. Tắt hết = _follow(url) y nguyên."""
+    if NET_OPTS.get("net_redirect_memory"):
+        pred, how = redirect_predict(url)
+        if pred:
+            try:
+                r, fin = _follow(pred)
+                info.update(redirect_skip=how, skipped_to=_netloc(pred))
+                DL_STATS["redirect_skip"] += 1
+                return r, fin
+            except Exception as e:  # noqa: BLE001 — đoán sai: quay về URL gốc NGAY trong cùng lần thử (không chờ lịch thử lại)
+                info["redirect_skip_fail"] = f"{type(e).__name__}"[:40] + (f" {e.code}" if isinstance(e, HttpStatus) else "")
+                DL_STATS["redirect_skip_fail"] += 1
+                redirect_forget(url)
+    pre = mn_preconnect(url) if NET_OPTS.get("net_mn_preconnect") else []
+    if pre:
+        info["mn_preconnect"] = len(pre)
+    if allow_hedge and NET_OPTS.get("dl_hedge") and not info.get("no_hedge"):
+        rep = _replica_for(url)
+        if rep:
+            return _hedged_follow(url, rep, max(0.0, float(NET_OPTS.get("dl_hedge_delay_ms") or 120)) / 1000.0, info)
+    return _follow(url)
+
+
 def download_single(url: str, dest: Path, info: dict, cancel: threading.Event | None = None) -> int:
     """1 GET, ghi thẳng vào file tạm. info nhận ttfb_ms/bytes/elapsed_ms."""
     t0 = time.perf_counter_ns()
-    r, final = _follow(url)
+    r, final = _open_media(url, info)
     t_hdr = time.perf_counter_ns()
     total = 0
     first = None
     expected = int(r.headers.get("Content-Length") or 0)
+    v2 = bool(NET_OPTS.get("dl_hotpath_v2"))
     try:
-        with open(dest, "wb", buffering=1024 * 1024) as f:
-            for chunk in r.stream(256 * 1024):
+        # v2 #8: khúc 1 MiB + ghi thẳng (urllib3 đã đệm) | bản trước: khúc 256 KB + bộ đệm file 1 MiB
+        with open(dest, "wb", buffering=0 if v2 else 1024 * 1024) as f:
+            for chunk in r.stream((1024 if v2 else 256) * 1024):
                 if first is None:
                     first = time.perf_counter_ns()
                 if cancel is not None and cancel.is_set():
@@ -1114,7 +1353,8 @@ def download_single(url: str, dest: Path, info: dict, cancel: threading.Event | 
     info.update(hops=len(hops), new_conns=sum(1 for h in hops if h.get("new_conn")), dns_ms=sm("dns_ms"), tcp_ms=sm("tcp_ms"),
                 tls_ms=sm("tls_ms"), server_wait_ms=sm("server_wait_ms"), headers_ms=ms(t0, t_hdr),
                 first_byte_after_hdr_ms=ms(t_hdr, first) if first else None, transfer_ms=ms(first, t_end) if first else None,
-                host=urlparse(final).hostname)
+                host=urlparse(final).hostname,
+                tls_resumed=any(h.get("tls_resumed") for h in hops) if any("tls_resumed" in h for h in hops) else None)
     if NET_LEARN is not None:
         try:
             NET_LEARN(final)
@@ -1193,6 +1433,47 @@ def download_aria2(url: str, dest: Path, n: int, info: dict) -> int:
     total = dest.stat().st_size
     info.update(bytes=total, elapsed_ms=ms(t0, time.perf_counter_ns()), connections=n)
     return total
+
+
+def mp4_quick_check(path) -> tuple:
+    """v2 #7 — kiểm cấu trúc MP4 thuần Python (< 2 ms): duyệt box cấp 1 bằng seek (chỉ đọc 8–16 byte/box).
+    Bắt buộc: box đầu là ftyp, có moov và mdat, tổng kích thước box == dung lượng file (file cụt/thừa → sai). Không thay ffprobe."""
+    try:
+        size = os.path.getsize(path)
+    except OSError as e:
+        return False, f"không đọc được: {e}"
+    if size < 16:
+        return False, f"file quá nhỏ ({size} byte)"
+    seen = []
+    pos = 0
+    with open(path, "rb") as f:
+        while pos < size:
+            f.seek(pos)
+            hdr = f.read(16)
+            if len(hdr) < 8:
+                return False, f"header box cụt tại byte {pos}"
+            sz = int.from_bytes(hdr[:4], "big")
+            typ = hdr[4:8]
+            if sz == 1:
+                if len(hdr) < 16:
+                    return False, f"largesize cụt tại byte {pos}"
+                sz = int.from_bytes(hdr[8:16], "big")
+            elif sz == 0:
+                sz = size - pos
+            if sz < 8 or not all(32 <= c < 127 for c in typ):
+                return False, f"box lạ tại byte {pos} ({typ!r}, {sz})"
+            seen.append(typ.decode("ascii"))
+            pos += sz
+            if len(seen) > 256:
+                return False, "quá nhiều box cấp 1"
+    if pos != size:
+        return False, f"tổng box {pos} ≠ dung lượng {size} (file cụt)"
+    if seen[0] != "ftyp":
+        return False, f"không bắt đầu bằng ftyp ({seen[0]})"
+    miss = [b for b in ("moov", "mdat") if b not in seen]
+    if miss:
+        return False, "thiếu " + "/".join(miss)
+    return True, ",".join(seen)
 
 
 def ffprobe_info(path: Path) -> dict:
@@ -1333,6 +1614,7 @@ class Engine:
         self.pending_ok = {}                  # (channel, mode) → thời điểm đã chấp nhận xác minh
         self.hub_lock = threading.Lock()
         self.net_mode = set_net_mode(cfg.get("net_mode", "fast"))
+        self.net_opts = set_net_opts(cfg)
         self.resolver = Resolver(log)
         self.resolver.host_override = str(cfg.get("resolver_host") or "")
         self.warmer = None
@@ -1859,15 +2141,23 @@ class Engine:
                                 itags=",".join(str(f["itag"]) for f in (pick["video"], pick["audio"]) if f),
                                 download_started_at=iso(), expected_size=exp_size or None)
             info_v, info_a = {}, {}
+            prev_err = str((row["error"] if row is not None and "error" in row.keys() else "") or "")
+            if re.search(r"HTTP (403|429)", prev_err):
+                info_v["no_hedge"] = info_a["no_hedge"] = True          # v2 #4: không bắn kép khi vừa bị 403/429
             mux_ms = None
-            n = int(self.cfg.get("range_connections", 1))
+            rc = self.cfg.get("range_connections", 1)
+            if str(rc).strip().lower() == "auto":                        # v2 #6: theo dung lượng (chỉ bật khi bench chứng minh)
+                n = 1 if exp_size < 2 * 2 ** 20 else 2 if exp_size <= 6 * 2 ** 20 else 4
+                info_v["range_auto"] = n
+            else:
+                n = int(rc or 1)
             atomic = bool(self.cfg.get("atomic_rename", False)) or self.on_done is not None   # tích hợp: luôn .part → đổi tên
             # atomic_rename=False (mặc định theo yêu cầu): ghi THẲNG vào tên cuối; DONE chỉ sau ffprobe + đúng dung lượng;
             # lỗi → xoá file. atomic_rename=True: ghi .part rồi os.replace.
             out_tmp = (tmpdir / f".{vid}.part.mp4") if atomic else final        # uploader KHÔNG BAO GIỜ nhận .part
             parts.append(out_tmp)
             if pick["kind"] == "progressive":
-                self._fetch(pick["video"], out_tmp, info_v, n, cancel)
+                self._fetch(pick["video"], out_tmp, info_v, n, cancel, alts=plan.get("alt_futs"))
                 if exp_size and out_tmp.stat().st_size != exp_size:
                     raise IOError(f"dung lượng {out_tmp.stat().st_size} ≠ {exp_size} byte YouTube báo")
             else:
@@ -1891,7 +2181,8 @@ class Engine:
                     th = None
                     if errs:
                         raise errs[0]
-                self.db.upd(vid, state="VERIFYING")
+                if not NET_OPTS.get("dl_hotpath_v2"):              # v2 #8: bỏ lần ghi VERIFYING thứ nhất (lần dưới vẫn ghi)
+                    self.db.upd(vid, state="VERIFYING")
                 if not FFMPEG:
                     raise Fatal("cần ffmpeg để ghép/đóng gói 360p DASH")
                 mux_ms = ffmpeg_mux(vtmp, atmp if pick["audio"] else None, out_tmp)
@@ -1899,7 +2190,14 @@ class Engine:
             t_db0 = time.perf_counter_ns()
             db_v = self.db.upd(vid, state="VERIFYING")                     # DB_VERIFYING (gồm chờ khoá)
             t_db1 = time.perf_counter_ns()
-            t_v0 = time.perf_counter_ns()                                  # PRE_VERIFY_GAP = t_db1→t_v0
+            integrity_ms = None
+            if NET_OPTS.get("dl_quick_integrity"):                         # v2 #7: < 2 ms, TRƯỚC ffprobe (ffprobe vẫn là chốt cuối)
+                t_i0 = time.perf_counter_ns()
+                ok_i, why_i = mp4_quick_check(out_tmp)
+                integrity_ms = ms(t_i0, time.perf_counter_ns())
+                if not ok_i:
+                    raise IOError(f"MP4 hỏng (kiểm nhanh, chưa cần ffprobe): {why_i}")
+            t_v0 = time.perf_counter_ns()                                  # PRE_VERIFY_GAP = t_db1→t_v0 (gồm integrity_ms)
             v = ffprobe_info(out_tmp)
             t_v1 = time.perf_counter_ns()                                  # FFPROBE = t_v0→t_v1
             verify_ms = ms(t_v0, t_v1)
@@ -1921,7 +2219,7 @@ class Engine:
             steps = {"db_verifying_ms": ms(t_db0, t_db1), "db_lock_wait_ms": db_v[1], "pre_verify_gap_ms": ms(t_db1, t_v0),
                      "ffprobe_ms": verify_ms, "rename_ms": ms(t_r0, t_r1),
                      "post_verify_gap_ms": round(ms(t_v1, t_r0) + ms(t_r1, t_end), 3),
-                     "db_resolving_ms": db_res[0], "db_downloading_ms": db_dl[0]}
+                     "db_resolving_ms": db_res[0], "db_downloading_ms": db_dl[0], "integrity_ms": integrity_ms}
             parts_sum = (ms(job["t_recv_ns"], t_start) if job.get("t_recv_ns") else 0) + ms(t_start, t_res) + dl_ms + \
                 (mux_ms or 0) + steps["db_verifying_ms"] + steps["pre_verify_gap_ms"] + steps["ffprobe_ms"] + \
                 steps["post_verify_gap_ms"] + steps["rename_ms"]
@@ -1953,7 +2251,10 @@ class Engine:
                 rn = plan.get("net") or {}
                 net = {"resolver": dict(rn, client=plan.get("client"), race_ms=plan.get("race_ms")),
                        "media": {k: info_v.get(k) for k in ("host", "hops", "new_conns", "dns_ms", "tcp_ms", "tls_ms", "server_wait_ms",
-                                                            "headers_ms", "first_byte_after_hdr_ms", "ttfb_ms", "transfer_ms")},
+                                                            "headers_ms", "first_byte_after_hdr_ms", "ttfb_ms", "transfer_ms",
+                                                            "tls_resumed", "redirect_skip", "redirect_skip_fail", "mn_preconnect",
+                                                            "hedge_sent", "hedge_win", "fallback_client", "range_auto")},
+                       "integrity_ms": integrity_ms,
                        "ffprobe_ms": verify_ms, "net_mode": _NET_MODE}
                 self.db.upd(vid, net=json.dumps(net, ensure_ascii=False))
                 f_ = lambda v: "-" if v is None else (f"{v:.0f}" if isinstance(v, (int, float)) else str(v))
@@ -2040,7 +2341,36 @@ class Engine:
             self.db.upd(vid, target_file=str(p))
             return p
 
-    def _fetch(self, fmt, dest, info, n, cancel=None):
+    def _fetch(self, fmt, dest, info, n, cancel=None, alts=None):
+        try:
+            return self._fetch_one(fmt, dest, info, n, cancel)
+        except HttpStatus as e:
+            if not (NET_OPTS.get("dl_alt_url_on_403") and alts and e.code in (403, 410)):
+                raise
+            for client, fut in alts:                          # v2 #5: link của client khác ĐÃ VỀ, cùng itag + dung lượng → thử ngay
+                if not fut.done():
+                    continue
+                try:
+                    alt = fut.result()
+                except Exception:  # noqa: BLE001
+                    continue
+                p = (alt or {}).get("pick") or {}
+                f2 = p.get("video") if p.get("kind") == "progressive" else None
+                if (not f2 or not f2.get("url") or f2["url"] == fmt.get("url") or str(f2.get("itag")) != str(fmt.get("itag"))
+                        or int(f2.get("clen") or 0) != int(fmt.get("clen") or 0)):
+                    continue
+                info["fallback_client"] = client
+                DL_STATS["alt_url"] += 1
+                self.log(f"   ↪️ link client thắng bị HTTP {e.code} → dùng ngay link của client {client} (cùng itag {f2.get('itag')})")
+                try:
+                    return self._fetch_one(f2, dest, info, n, cancel)
+                except HttpStatus as e2:
+                    if e2.code in (403, 410):
+                        continue
+                    raise
+            raise
+
+    def _fetch_one(self, fmt, dest, info, n, cancel=None):
         size = int(fmt.get("clen") or 0)
         cancel = cancel or self.stop_ev
         if n > 1 and size <= 0:
@@ -3671,6 +4001,21 @@ BENCH_DL_VARIANTS = {
     "warm_apihost":  ({"net_mode": "fast", "range_connections": 1, "resolver_host": "youtubei.googleapis.com"}, "warm_all"),
     "warm_h2":       ({"net_mode": "fast", "range_connections": 1}, "warm_all"),  # tải bằng HTTP/2 (cần: pip install "httpx[http2]")
 }
+# TỐI ƯU TẢI V2 — mỗi biến thể bật THÊM đúng 1 nhóm so với biến thể trước (tách tác dụng). Các biến thể cũ ở trên: tắt hết cờ v2.
+_V2_SSL = {"net_shared_ssl": True, "net_rcvbuf_mb": 4}
+_V2_RDR = dict(_V2_SSL, net_redirect_memory=True, net_mn_preconnect=True)
+_V2_HEDGE = dict(_V2_RDR, dl_hedge=True, dl_hedge_delay_ms=120)
+_V2_FULL = dict(_V2_HEDGE, dl_alt_url_on_403=True, dl_quick_integrity=True, dl_hotpath_v2=True)
+for _k, (_o, _p) in list(BENCH_DL_VARIANTS.items()):
+    BENCH_DL_VARIANTS[_k] = (dict(NET_OPTS_OFF, **_o), _p)
+BENCH_DL_VARIANTS.update({
+    "v2_ssl":       (dict(NET_OPTS_OFF, net_mode="fast", range_connections=1, **_V2_SSL), "warm_all"),
+    "v2_redirect":  (dict(NET_OPTS_OFF, net_mode="fast", range_connections=1, **_V2_RDR), "warm_all"),
+    "v2_hedge":     (dict(NET_OPTS_OFF, net_mode="fast", range_connections=1, **_V2_HEDGE), "warm_all"),
+    "v2_full":      (dict(NET_OPTS_OFF, net_mode="fast", range_connections=1, **_V2_FULL), "warm_all"),
+    "v2_full_auto": (dict(NET_OPTS_OFF, net_mode="fast", range_connections="auto", **_V2_FULL), "warm_all"),
+})
+BENCH_DL_V2_SET = ["legacy", "warm_all", "v2_ssl", "v2_redirect", "v2_hedge", "v2_full", "v2_full_auto"]
 
 
 def _h2_client():
@@ -3750,6 +4095,7 @@ def bench_dl(cfg, base, ids, reps=None, variants=None):
                 over, prep = BENCH_DL_VARIANTS[v]
                 eng.cfg.update(dict({"range_connections": 1, "resolver_host": ""}, **over))
                 set_net_mode(eng.cfg["net_mode"])
+                set_net_opts(eng.cfg)
                 eng.resolver.host_override = eng.cfg.get("resolver_host") or ""
                 p = pool()
                 if prep == "cold" or prep == "warm_inner":
@@ -3794,6 +4140,10 @@ def bench_dl(cfg, base, ids, reps=None, variants=None):
                        "media_server_wait_ms": mn.get("server_wait_ms"), "ttfb_ms": mn.get("ttfb_ms"), "transfer_ms": mn.get("transfer_ms"),
                        "download_ms": row.get("download_ms"), "ffprobe_ms": row.get("ffprobe_ms"), "rename_ms": row.get("rename_ms"),
                        "mbps": row.get("mbps"), "size": row.get("size"), "client": rn.get("client"), "media_host": mn.get("host"),
+                       "tls_resumed": mn.get("tls_resumed"), "redirect_skip": mn.get("redirect_skip") or (
+                           "FAIL:" + str(mn.get("redirect_skip_fail")) if mn.get("redirect_skip_fail") else ""),
+                       "hedge_win": mn.get("hedge_win") or "", "fallback_client": mn.get("fallback_client") or "",
+                       "integrity_ms": row.get("integrity_ms"), "range_auto": mn.get("range_auto"),
                        "error": row.get("error") if r != "DONE" else ""}
                 rows.append(out)
                 log(f"BENCH-DL {v:14} {vid} #{rep_i + 1}: {r} TỔNG {out['total_ms']} ms | resolver {out['resolver_ms']} "
@@ -3803,6 +4153,7 @@ def bench_dl(cfg, base, ids, reps=None, variants=None):
                 time.sleep(0.3)
     NET_LEARN = None
     set_net_mode(cfg.get("net_mode", "fast"))
+    set_net_opts(cfg)
     shutil.rmtree(eng.dl_dir, ignore_errors=True)
     with open(base / "BENCH_DL.csv", "w", newline="", encoding="utf-8") as f:
         keys = list(dict.fromkeys(k for r in rows for k in r)) or ["variant"]
@@ -3814,7 +4165,8 @@ def bench_dl(cfg, base, ids, reps=None, variants=None):
           "Mỗi lượt: link MỚI + xoá file trước (không dùng file có sẵn). Giá trị: median / P90 / P95 (ms). TỔNG = từ lúc bắt đầu resolve "
           "tới khi file đã tải xong + ffprobe xác minh + bàn giao (không tính TTFB 2 lần: TTFB nằm trong 'tải').", "",
           "| Phương án | lượt | lỗi | TỔNG | ≤1000 ms | resolver | setup resolver | chờ máy chủ resolver | TTFB | setup tải | "
-          "chờ máy chủ tải | truyền | ffprobe |", "|" + "---|" * 13]
+          "chờ máy chủ tải | truyền | ffprobe | tls_resumed | redirect_skip | hedge_win (gốc/replica) | fallback_client | integrity_ms |",
+          "|" + "---|" * 18]
     summary = {}
     for v in names:
         rs = [r for r in rows if r["variant"] == v]
@@ -3827,7 +4179,12 @@ def bench_dl(cfg, base, ids, reps=None, variants=None):
         md.append(f"| {v} | {sv['n']} | {sv['fail']} ({100 * sv['fail'] / max(1, sv['n']):.0f}%) | {f_(sv['total_ms'])} | "
                   f"{sv['under_1s']}/{len(ok)} | {f_(sv['resolver_ms'])} | {f_(sv['res_setup_ms'])} | {f_(sv['res_server_wait_ms'])} | "
                   f"{f_(sv['ttfb_ms'])} | {f_(sv['media_setup_ms'])} | {f_(sv['media_server_wait_ms'])} | {f_(sv['transfer_ms'])} | "
-                  f"{f_(sv['ffprobe_ms'])} |")
+                  f"{f_(sv['ffprobe_ms'])} | {sum(1 for r in ok if r.get('tls_resumed'))}/{len(ok)} | "
+                  f"{sum(1 for r in ok if r.get('redirect_skip') and not str(r.get('redirect_skip')).startswith('FAIL'))} ok / "
+                  f"{sum(1 for r in ok if str(r.get('redirect_skip') or '').startswith('FAIL'))} sai | "
+                  f"{sum(1 for r in ok if str(r.get('hedge_win')).startswith('primary'))}/{sum(1 for r in ok if r.get('hedge_win') == 'replica')} | "
+                  f"{sum(1 for r in ok if r.get('fallback_client'))} | "
+                  f"{f_(tuple(pct([r['integrity_ms'] for r in ok if r.get('integrity_ms') is not None], p_) for p_ in (50, 90, 95)))} |")
     md += ["", "Phương án: legacy = bản trước (kết nối nguội); fast_cold = lớp mạng mới không giữ ấm; warm_resolver = giữ ấm "
            "Innertube, máy chủ video nguội; warm_all = giữ ấm cả máy chủ video vừa dùng; _r2/_r4 = chia 2/4 đoạn Range; "
            "warm_apihost = resolver qua youtubei.googleapis.com.",
@@ -3835,7 +4192,41 @@ def bench_dl(cfg, base, ids, reps=None, variants=None):
            "vừa đăng thật; thứ tự xoay vòng để mọi phương án chịu ảnh hưởng như nhau."]
     (base / "BENCH_DL.md").write_text("\n".join(md) + "\n", encoding="utf-8")
     print("\n".join(md))
-    return {"rows": rows, "summary": summary}
+    concl = bench_dl_summary(base, names, summary)
+    return {"rows": rows, "summary": summary, "conclusion": concl}
+
+
+def bench_dl_summary(base, names, summary, ref="warm_all", min_gain_ms=50.0) -> dict:
+    """BENCH_DL_SUMMARY.md: biến thể nào THẮNG mốc (warm_all) theo median VÀ P90 ≥ 50 ms, tỷ lệ lỗi không tăng → đề xuất bật mặc định;
+    không thắng → đề xuất giữ tắt. Chỉ dựa trên số đo của chính lần bench này."""
+    out = {}
+    lines = [f"# BENCH_DL_SUMMARY — {iso()} — so với mốc '{ref}' (TỔNG = resolve → tải → ffprobe)", ""]
+    if ref not in summary:
+        lines.append(f"Không có mốc '{ref}' trong lần chạy này → không kết luận.")
+    else:
+        r = summary[ref]
+        er = r["fail"] / max(1, r["n"])
+        lines += [f"Mốc {ref}: median {r['total_ms'][0]} ms | P90 {r['total_ms'][1]} ms | lỗi {r['fail']}/{r['n']}", "",
+                  "| Biến thể | median | P90 | lỗi | Δ median | Δ P90 | Đề xuất |", "|---|---|---|---|---|---|---|"]
+        for v in names:
+            if v == ref or v not in summary:
+                continue
+            x = summary[v]
+            if x["total_ms"][0] is None or r["total_ms"][0] is None:
+                lines.append(f"| {v} | - | - | {x['fail']}/{x['n']} | - | - | CHƯA ĐỦ SỐ ĐO |")
+                continue
+            dm, d9 = r["total_ms"][0] - x["total_ms"][0], r["total_ms"][1] - x["total_ms"][1]
+            ex = x["fail"] / max(1, x["n"])
+            win = dm >= min_gain_ms and d9 >= min_gain_ms and ex <= er
+            out[v] = {"win": win, "gain_median_ms": round(dm, 1), "gain_p90_ms": round(d9, 1), "error_rate": round(ex, 3)}
+            lines.append(f"| {v} | {x['total_ms'][0]:.0f} | {x['total_ms'][1]:.0f} | {x['fail']}/{x['n']} | {dm:+.0f} | {d9:+.0f} | "
+                         + ("✅ BẬT mặc định" if win else "⏸ GIỮ TẮT (chưa thắng đủ ≥ 50 ms ở cả median và P90, hoặc lỗi tăng)") + " |")
+        lines += ["", "Δ dương = nhanh hơn mốc. Biến thể v2_* cộng dồn (mỗi biến thể thêm đúng 1 nhóm so với biến thể trước): nhóm nào "
+                  "không làm biến thể của nó thắng biến thể liền trước thì không đáng bật. Cờ tương ứng trong config.json: "
+                  "v2_ssl → net_shared_ssl/net_rcvbuf_mb; v2_redirect → net_redirect_memory/net_mn_preconnect; v2_hedge → dl_hedge; "
+                  "v2_full → dl_alt_url_on_403/dl_quick_integrity/dl_hotpath_v2; v2_full_auto → range_connections=\"auto\"."]
+    (base / "BENCH_DL_SUMMARY.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return out
 
 
 PIPE_COLS = [("detect_to_done_ms", "PHÁT HIỆN→DOWNLOAD_DONE"), ("resolver_ms", "  resolver"), ("ttfb_ms", "  TTFB tải"),

@@ -236,3 +236,162 @@ class MockGVS:
 
     def stop(self):
         self.__exit__()
+
+
+# ======================================================================================================
+# MockGVSHosts (thêm cho WS360 tối ưu tải v2) — TLS THẬT, NHIỀU "máy chủ" googlevideo trên 1 cổng loopback (phân biệt theo
+# SNI/Host). Mô phỏng: bắt tay kết nối mới tốn conn_delay (≈ RTT TCP+TLS), server_wait theo phân phối (median + % lượt chậm),
+# 302 từ host A sang host B (cùng path+query), tham số mn= trong URL, trả mã lỗi theo client (?c=...) hoặc theo host.
+# Đếm: số kết nối TLS mới / số request theo host. Ánh xạ tên *.googlevideo.com → 127.0.0.1 bằng install_dns(ws360_net).
+# ======================================================================================================
+import collections
+import ssl
+import subprocess
+from urllib.parse import parse_qs, urlsplit
+
+
+def make_cert(d):
+    """Chứng chỉ tự ký cho *.googlevideo.com + localhost (cần openssl). Trả (crt, key)."""
+    crt, key = os.path.join(str(d), "gvs.crt"), os.path.join(str(d), "gvs.key")
+    if not os.path.exists(crt):
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", crt, "-days", "2",
+                        "-subj", "/CN=googlevideo.test", "-addext", "subjectAltName=DNS:*.googlevideo.com,DNS:localhost"],
+                       check=True, capture_output=True)
+    return crt, key
+
+
+class MockGVSHosts:
+    def __init__(self, crt, key, conn_delay=0.0, seed=7):
+        self.ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        self.ctx.load_cert_chain(crt, key)
+        self.conn_delay = float(conn_delay)
+        self.files = {}                         # path → bytes
+        self.host_rules = {}                    # host → {redirect_to, server_wait=(base, p_slow, slow), status}
+        self.client_status = {}                 # (path, client) → mã HTTP
+        self.host_status = {}                   # (host, path) → mã HTTP
+        self.conns = collections.Counter()      # host → số kết nối (đã có request) | handshakes = tổng kết nối TLS mới
+        self.handshakes = 0
+        self.reqs = collections.Counter()       # (host, path) → số request
+        self.lock = threading.Lock()
+        self.rng = random.Random(seed)
+        mock = self
+
+        class H(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def setup(self):
+                if mock.conn_delay:
+                    time.sleep(mock.conn_delay)                     # 'RTT' bắt tay của kết nối MỚI
+                self.request = mock.ctx.wrap_socket(self.request, server_side=True)
+                with mock.lock:
+                    mock.handshakes += 1
+                self._seen = False
+                super().setup()
+
+            def do_GET(self):
+                host = (self.headers.get("Host") or "").split(":", 1)[0].lower()
+                u = urlsplit(self.path)
+                path, q = u.path, parse_qs(u.query)
+                with mock.lock:
+                    mock.reqs[(host, path)] += 1
+                    if not self._seen:                              # 1 handler = 1 kết nối (keep-alive): đếm theo host ở request đầu
+                        self._seen = True
+                        mock.conns[host] += 1
+                if path == "/generate_204":
+                    return self._send(204, b"")
+                rule = mock.host_rules.get(host) or {}
+                sw = rule.get("server_wait")
+                if sw:
+                    base, p_slow, slow = sw
+                    with mock.lock:
+                        w = slow if mock.rng.random() < p_slow else base
+                    time.sleep(w)
+                code = mock.host_status.get((host, path)) or mock.client_status.get((path, (q.get("c") or [""])[0]))
+                if code:
+                    return self._send(int(code), b"denied")
+                if rule.get("redirect_to"):
+                    port = self.server.server_address[1]
+                    self.send_response(302)
+                    self.send_header("Location", f"https://{rule['redirect_to']}:{port}{self.path}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                data = mock.files.get(path)
+                if data is None:
+                    return self._send(404, b"nf")
+                rng = self.headers.get("Range")
+                if rng:
+                    a, b = rng.split("=", 1)[1].split("-", 1)
+                    st, en = int(a), (int(b) if b else len(data) - 1)
+                    body = data[st:en + 1]
+                    self.send_response(206)
+                    self.send_header("Content-Range", f"bytes {st}-{st + len(body) - 1}/{len(data)}")
+                else:
+                    body = data
+                    self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                except OSError:
+                    self.close_connection = True
+
+            def _send(self, code, body):
+                self.send_response(code)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                if body:
+                    try:
+                        self.wfile.write(body)
+                    except OSError:
+                        pass
+
+        class Srv(ThreadingHTTPServer):
+            daemon_threads = True
+            request_queue_size = 256
+
+            def handle_error(self, request, client_address):
+                pass
+
+        self.httpd = Srv(("127.0.0.1", 0), H)
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+
+    def add(self, path, data):
+        self.files[path] = data
+
+    def url(self, host, path, mn=(), client=""):
+        q = []
+        if mn:
+            q.append("mn=" + ",".join(mn))
+        if client:
+            q.append("c=" + client)
+        q.append("sig=TESTSIG")
+        return f"https://{host}:{self.port}{path}?" + "&".join(q)
+
+    def conns_to(self, host):
+        with self.lock:
+            return self.conns.get(host, 0)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *a):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+def install_dns(net_mod):
+    """Mọi *.googlevideo.com → 127.0.0.1 trong DNS cache của ws360_net (chịu được cả DNS.m.clear())."""
+    real = net_mod.DNSCache.resolve
+
+    def resolve(self, host, port):
+        if str(host).endswith(".googlevideo.com"):
+            return socket.getaddrinfo("127.0.0.1", port, 0, socket.SOCK_STREAM), True
+        return real(self, host, port)
+    net_mod.DNSCache.resolve = resolve
+    return lambda: setattr(net_mod.DNSCache, "resolve", real)

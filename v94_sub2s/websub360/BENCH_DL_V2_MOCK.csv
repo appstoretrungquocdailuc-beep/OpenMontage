@@ -1,0 +1,13 @@
+variant,video_id,rep,result,total_ms,resolver_ms,res_new_conn,res_setup_ms,res_server_wait_ms,res_body_parse_ms,media_new_conns,media_setup_ms,media_server_wait_ms,ttfb_ms,transfer_ms,download_ms,ffprobe_ms,rename_ms,mbps,size,client,media_host,tls_resumed,redirect_skip,hedge_win,fallback_client,integrity_ms,range_auto,error
+warm_all,SHORT000001,0,DONE,654.273,150.384,0,0.0,,,2,127.4,302.09,432.285,2.418,436.013,67.39,0.019,26.8,1456129,mock,rr20---sn-bbb.googlevideo.com,False,,,,,,
+v2_ssl,SHORT000001,0,DONE,642.434,150.324,0,0.0,,,2,125.6,302.35,429.692,1.729,431.864,59.887,0.014,27.0,1456129,mock,rr9---sn-bbb.googlevideo.com,False,,,,,,
+v2_redirect,SHORT000001,0,DONE,591.304,150.305,0,0.0,,,1,62.3,302.28,368.533,1.222,370.195,70.283,0.014,31.5,1456129,mock,rr12---sn-bbb.googlevideo.com,False,,,,,,
+v2_hedge,SHORT000001,0,DONE,366.542,150.329,0,0.0,,,0,0.0,151.25,152.537,1.496,154.589,61.252,0.02,75.6,1456129,mock,rr12---sn-bbb.googlevideo.com,,cluster,,,,,
+v2_full,SHORT000001,0,DONE,353.269,150.23,0,0.0,,,0,0.0,151.24,152.765,0.93,154.294,48.328,0.014,75.8,1456129,mock,rr12---sn-bbb.googlevideo.com,,cluster,,,0.06,,
+v2_full_auto,SHORT000001,0,DONE,367.134,150.296,0,0.0,,,0,0.0,151.27,152.747,0.688,154.169,62.32,0.014,75.9,1456129,mock,rr12---sn-bbb.googlevideo.com,,cluster,,,0.054,1,
+warm_all,LONG0000001,0,DONE,2003.234,150.361,0,0.0,,,2,125.6,1651.38,1779.369,4.337,1784.342,68.171,0.014,19.3,4312688,mock,rr8---sn-bbb.googlevideo.com,False,,,,,,
+v2_ssl,LONG0000001,0,DONE,1993.461,150.28,0,0.0,,,2,127.5,1652.04,1781.598,3.505,1785.558,57.226,0.019,19.3,4312688,mock,rr2---sn-bbb.googlevideo.com,False,,,,,,
+v2_redirect,LONG0000001,0,DONE,363.788,150.29,0,0.0,,,0,0.0,151.19,152.188,4.569,157.251,55.632,0.018,220.1,4312688,mock,rr12---sn-bbb.googlevideo.com,,cluster,,,,,
+v2_hedge,LONG0000001,0,DONE,357.603,150.316,0,0.0,,,0,0.0,151.12,152.047,3.397,156.068,50.847,0.015,222.0,4312688,mock,rr12---sn-bbb.googlevideo.com,,cluster,,,,,
+v2_full,LONG0000001,0,DONE,1710.137,150.317,0,0.0,,,0,0.0,1501.24,1505.732,2.801,1509.338,50.008,0.016,22.9,4312688,mock,rr12---sn-bbb.googlevideo.com,,host,,,0.055,,
+v2_full_auto,LONG0000001,0,DONE,647.102,150.272,0,0.0,,,4,67.4,152.88,434.946,8.193,443.684,52.686,0.014,77.9,4312688,mock,rr16---sn-bbb.googlevideo.com,,,,,0.061,2,
