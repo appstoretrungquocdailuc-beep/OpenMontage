@@ -162,3 +162,69 @@ def test_bench_net_cli_dry_run_ab_writes_csv_and_summary(lab, monkeypatch, tmp_p
     assert all(r["net_first_conn_new"] is False for r in meas if r["variant"] == "pre")
     summ = next(tmp_path.glob("tam_bench_net_*_summary.csv")).read_text(encoding="utf-8-sig")
     assert summ.startswith("variant,runs,ok,error_rate_pct,post_ready_ms_median") and "\npre," in summ
+
+
+def test_chrome_semantics_maxPostDataSize_zero_leaks_body_one_does_not(lab):
+    """Kiểm chứng TRÊN CHROMIUM THẬT (lỗi review tìm ra): maxPostDataSize=0 = KHÔNG giới hạn (body bị gửi qua CDP);
+    =1 → body không rời Chrome. Bộ đo dùng 1."""
+    tam, page = lab["tam"], lab["drv"].page
+    page.goto(lab["url"])
+    url = tam._tab_ws_url(lab["drv"])
+    seen = {}
+    for cap in (0, 1):
+        c = tam.CdpWs(url, url.rsplit("/", 1)[-1])
+        c.call("Network.enable", {"maxPostDataSize": cap})
+        page.evaluate("() => fetch('/x', {method: 'POST', body: JSON.stringify({s: 'BODYSECRET-CAP'})}).catch(() => 0)")
+        end = time.time() + 3
+        while time.time() < end and cap not in seen:
+            c.ws.settimeout(0.3)
+            try:
+                m = json.loads(c.ws.recv())
+            except Exception:
+                continue
+            if m.get("method") == "Network.requestWillBeSent" and (m["params"]["request"].get("method") == "POST"):
+                rq = m["params"]["request"]
+                seen[cap] = bool(rq.get("postData") or rq.get("postDataEntries"))
+        c.close()
+    assert seen == {0: True, 1: False}
+
+
+def test_recorder_never_receives_bodies_and_counts_preflight_as_the_new_connection(lab, monkeypatch):
+    tam = lab["tam"]
+    got = []
+    real = tam.NetRecorder._handle
+
+    def spy(self, meth, p, sid):
+        if meth == "Network.requestWillBeSent":
+            rq = p.get("request") or {}
+            got.append(bool(rq.get("postData") or rq.get("postDataEntries")))
+        return real(self, meth, p, sid)
+    monkeypatch.setattr(tam.NetRecorder, "_handle", spy)
+    url0 = lab["url"]
+    lab["url"] = url0 + "&pf=1"                                   # upload có header riêng → trình duyệt gửi preflight OPTIONS trước
+    try:
+        res, fl, logs = run(lab, pre=False, pid="NP")
+    finally:
+        lab["url"] = url0
+    assert res.status.value == "DRY_RUN" and got and not any(got)   # không request nào mang body sang recorder
+    # Chrome báo preflight OPTIONS ~1 ms SAU POST nhưng chính preflight mở kết nối → phải nhận ra 'MỚI' (do OPTIONS)
+    assert fl["net_first_conn_new"] is True and fl["net_first_conn_by"] == "OPTIONS"
+    assert "BODYSECRET" not in json.dumps(fl, ensure_ascii=False) + "\n".join(logs)
+
+
+def test_summary_unknowns_instead_of_guesses(lab):
+    tam = lab["tam"]
+    rec = tam.NetRecorder("ws://x/devtools/page/T")
+    rec.marks["attach"] = 1000.0
+    base = {"wall": 1000.1, "ts": 50.1, "post": True, "w": False, "host": "up.example.com", "u": "up.example.com/upload"}
+    rec.reqs[(None, "1")] = dict(base, m="POST", hint=True)                                # chưa có phản hồi, chưa có timing
+    rec.reqs[(None, "2")] = dict(base, m="POST", hint=False, u="mon.example.com/collect", host="mon.example.com",
+                                 wall=1002.0, ts=52.0, resp_ts=52.1)                       # beacon sau click: KHÔNG phải API đăng
+    sm = rec.summary(1001.0, 1001.9, 1002.5)
+    assert sm["net_first_conn_new"] is None                    # không có timing → UNKNOWN (trước đây báo 'dùng lại')
+    assert sm["net_upload_span_ms"] is None                    # request upload chưa xong → UNKNOWN
+    assert sm["net_click_to_publish_resp_ms"] is None          # beacon không khớp TAM_PUBLISH_URL_RE → UNKNOWN
+    rec.reqs[(None, "1")].update(end_ts=50.6, timing={"connectStart": 0, "connectEnd": 120, "sslStart": 40, "sslEnd": 120})
+    sm = rec.summary(1001.0, 1001.9, 1002.5)
+    assert sm["net_first_conn_new"] is True and sm["net_new_conns"] == 1 and sm["net_first_connect_ms"] == 120
+    assert sm["net_upload_span_ms"] == 500.0 and sm["net_body_sent"] == "UNKNOWN"

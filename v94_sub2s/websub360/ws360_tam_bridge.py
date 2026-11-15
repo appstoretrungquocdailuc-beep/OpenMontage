@@ -326,10 +326,15 @@ class TikTokBridge:
         if fn is None or not self.accepting:
             return 0
         n = 0
+        last = self.__dict__.setdefault("_prewarm_at", {})
         for pid in list(self.targets.get(ch) or []):
             drv = self._driver(pid)
             if drv is None:
                 continue
+            now = time.monotonic()
+            if now - last.get(pid, -1e9) < 2.0:                # gộp: nhiều video/nguồn cùng lúc → 1 lần mở sẵn mỗi profile / 2 s
+                continue
+            last[pid] = now
             n += 1
 
             def run(pid=pid, drv=drv):

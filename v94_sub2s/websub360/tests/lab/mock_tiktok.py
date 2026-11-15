@@ -37,7 +37,7 @@ body{font-family:sans-serif;margin:0} #panel div{padding:2px;border-bottom:1px s
 <script>
 const Q = new URLSearchParams(location.search);
 const CFG = {nodes: +(Q.get('nodes') || 60), rerenderBtn: Q.get('rbtn') === '1', cover: Q.get('cover') === '1', chunk: 512 * 1024,
-             coverHold: +(Q.get('coverhold') || 0), up: Q.get('up') || ''};      // up = origin máy chủ upload khác (vd qua proxy trễ)
+             coverHold: +(Q.get('coverhold') || 0), up: Q.get('up') || '', pf: Q.get('pf') === '1'};      // up = origin máy chủ upload khác (vd qua proxy trễ)
 const M = window.__mock = {marks: {}, long: [], chunks: 0, renders: 0, id: null};
 const E = () => performance.timeOrigin + performance.now();
 try { new PerformanceObserver(l => l.getEntries().forEach(e => M.long.push([performance.timeOrigin + e.startTime, e.duration]))).observe({type: 'longtask'}); } catch (e) {}
@@ -70,10 +70,11 @@ async function upload(file) {
   phase = 'uploading';
   if (CFG.cover) document.getElementById('cover').style.display = 'block';
   renderTimer = setInterval(render, 16);
+  fetch('/init?id=' + M.id, {method: 'POST', body: JSON.stringify({secret: 'BODYSECRET' + M.id})}).catch(() => {});
   const n = Math.ceil(file.size / CFG.chunk);
   for (let i = 0; i < n; i++) {
     const b = file.slice(i * CFG.chunk, Math.min(file.size, (i + 1) * CFG.chunk));
-    const r = await fetch(CFG.up + '/chunk?id=' + M.id + '&i=' + i + '&n=' + n + '&X-Sig=SECRETSIG' + M.id, {method: 'POST', body: b});
+    const r = await fetch(CFG.up + '/chunk?id=' + M.id + '&i=' + i + '&n=' + n + '&X-Sig=SECRETSIG' + M.id, {method: 'POST', body: b, headers: CFG.pf ? {'X-Upload-Part': '1'} : {}});
     await r.text();
     M.chunks++; progress = (i + 1) / n;
   }
@@ -131,6 +132,14 @@ class H(BaseHTTPRequestHandler):
         if u.path.startswith("/tiktokstudio/content"):
             return self._send(200, b"<html><body>Video published</body></html>", "text/html")
         self._send(404)
+
+    def do_OPTIONS(self):                                      # preflight CORS (khi trang gửi header riêng)
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "X-Upload-Part")
+        self.send_header("Access-Control-Allow-Methods", "POST")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def do_POST(self):
         u = urlparse(self.path)
