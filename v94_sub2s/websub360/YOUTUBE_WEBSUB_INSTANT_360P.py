@@ -172,6 +172,11 @@ DEFAULT_CONFIG = {
     "dl_alt_url_on_403": True,         # #5 link client thắng bị 403/410 → dùng ngay link của client resolver khác (cùng itag, cùng dung lượng)
     "dl_quick_integrity": True,        # #7 kiểm cấu trúc MP4 (ftyp/moov/mdat, tổng box = dung lượng) TRƯỚC ffprobe (ffprobe vẫn chạy)
     "dl_hotpath_v2": True,             # #8 khúc đọc 1 MiB + ghi thẳng (buffering=0); DASH: 1 lần ghi VERIFYING thay vì 2
+    # THỬ NGHIỆM — Aria2 RPC (daemon aria2c dùng chung, như 360pok): "http" = downloader WS360 hiện tại (MẶC ĐỊNH, không đổi);
+    # "aria2_rpc" = itag 18 tải bằng aria2 N kết nối, lỗi không phải HTTP → quay về downloader hiện tại; 403/404/410/429 → không tải lại.
+    # Chỉ đổi sang "aria2_rpc" khi BENCH_ARIA2_360.bat trên máy bạn chứng minh nhanh hơn VÀ mọi file hợp lệ.
+    "dl_engine": "http",
+    "aria2_connections": "auto",       # 1 / 4 / 8 / 12 / 16 hoặc "auto" (= 360pok: ≤5 MiB 8, ≤15 MiB 12, lớn hơn 16)
     # ---- TÊN FILE ----
     "filename_mode": "TITLE",          # TITLE: '<tiêu đề gốc>.mp4' | TITLE_ID: '<tiêu đề>_<ID>.mp4' | ID_360P: '<ID>_360p.mp4'
     "filename_title_max": 0,           # 0 = không tự cắt (chỉ cắt khi vượt giới hạn đường dẫn Windows)
@@ -764,6 +769,10 @@ try:
     import ws360_net as NET
 except Exception:  # pragma: no cover
     NET = None
+try:
+    import ws360_aria2 as A2
+except Exception:  # pragma: no cover
+    A2 = None
 
 
 class _NoTrace:
@@ -1434,6 +1443,10 @@ def _v2_net_note(m):
         xs.append(f"range auto {m['range_auto']} kết nối")
     if m.get("saw_block"):
         xs.append(f"gặp HTTP {m['saw_block']}")
+    if m.get("engine") == "aria2_rpc":
+        xs.append(f"aria2 RPC {m.get('aria2_conns_req')} kết nối yêu cầu / {m.get('connections')} thực tế")
+    if m.get("aria2_fallback"):
+        xs.append(f"aria2 lỗi → downloader WS360 ({m['aria2_fallback']})")
     return (" | v2: " + "; ".join(xs)) if xs else ""
 
 
@@ -1672,6 +1685,23 @@ def download_aria2(url: str, dest: Path, n: int, info: dict) -> int:
     total = dest.stat().st_size
     info.update(bytes=total, elapsed_ms=ms(t0, time.perf_counter_ns()), connections=n)
     return total
+
+
+def aria2_conns(cfg_val, size) -> int:
+    v = str(cfg_val if cfg_val is not None else "auto").strip().lower()
+    if v in ("", "auto") and A2 is not None:
+        return A2.tuned_split(size)
+    try:
+        return max(1, min(16, int(v)))
+    except ValueError:
+        return A2.tuned_split(size) if A2 is not None else 8
+
+
+def download_aria2_rpc(url: str, dest: Path, size: int, n: int, info: dict, cancel=None) -> int:
+    """THỬ NGHIỆM — tải bằng daemon aria2 RPC (ws360_aria2). Đúng dung lượng clen bắt buộc; lỗi HTTP → HttpStatus(code)."""
+    if A2 is None or not ARIA2C:
+        raise RuntimeError("không có aria2c")
+    return A2.daemon(ARIA2C).download(url, dest, n, info, expected=size, cancel=cancel, http_exc=HttpStatus)
 
 
 def mp4_quick_check(path) -> tuple:
@@ -1973,8 +2003,18 @@ class Engine:
                  f"mở sẵn mn= {yn('net_mn_preconnect')} | hedge {yn('dl_hedge')}"
                  + (f" ({o_.get('dl_hedge_delay_ms')} ms)" if o_.get("dl_hedge") else "")
                  + f" | link client khác khi 403 {yn('dl_alt_url_on_403')} | kiểm nhanh MP4 {yn('dl_quick_integrity')} | "
-                 f"đường nóng {yn('dl_hotpath_v2')} | range_connections {self.cfg.get('range_connections', 1)}"
+                 f"đường nóng {yn('dl_hotpath_v2')} | range_connections {self.cfg.get('range_connections', 1)} | "
+                 f"downloader {self.cfg.get('dl_engine') or 'http'}"
+                 + (f" (THỬ NGHIỆM, aria2c {'có' if ARIA2C else 'KHÔNG THẤY'}, kết nối {self.cfg.get('aria2_connections')})"
+                    if str(self.cfg.get('dl_engine') or '').lower() == 'aria2_rpc' else "")
                  + (" | ⏸ đang tạm dừng suy đoán (429)" if spec_paused() else ""))
+        if str(self.cfg.get("dl_engine") or "").lower() == "aria2_rpc" and A2 is not None and ARIA2C:
+            def _a2_warm():                                     # như 360pok: khởi động sẵn daemon (không tốn spawn khi có video)
+                d = A2.daemon(ARIA2C)
+                ok = d.start()
+                self.log(f"⚡ aria2 RPC daemon {'SẴN SÀNG' if ok else 'KHÔNG khởi động được → dùng downloader WS360'}"
+                         + (f" ({d.started_ms} ms)" if ok and d.started_ms else ""))
+            threading.Thread(target=_a2_warm, daemon=True, name="ARIA2-WARM").start()
 
     def _acquire_instance_lock(self):
         self._lockfh = open(self.base / self.lock_name, "a+")
@@ -2420,6 +2460,7 @@ class Engine:
             out_tmp = (tmpdir / f".{vid}.part.mp4") if atomic else final        # uploader KHÔNG BAO GIỜ nhận .part
             parts.append(out_tmp)
             if pick["kind"] == "progressive":
+                info_v["aria2_ok"] = True                                 # chỉ itag 18 (1 file) mới được thử aria2 RPC
                 self._fetch(pick["video"], out_tmp, info_v, n, cancel, alts=plan.get("alt_futs"))
                 if exp_size and out_tmp.stat().st_size != exp_size:
                     raise IOError(f"dung lượng {out_tmp.stat().st_size} ≠ {exp_size} byte YouTube báo")
@@ -2530,7 +2571,8 @@ class Engine:
                                                             "headers_ms", "first_byte_after_hdr_ms", "ttfb_ms", "transfer_ms",
                                                             "tls_resumed", "redirect_skip", "redirect_skip_fail", "mn_preconnect",
                                                             "hedge_sent", "hedge_win", "fallback_client", "range_auto",
-                                                            "redirect_unconfirmed", "saw_block", "rdr_blocked", "hedge_blocked")},
+                                                            "redirect_unconfirmed", "saw_block", "rdr_blocked", "hedge_blocked",
+                                                            "engine", "connections", "aria2_conns_req", "aria2_fallback", "aria2_error")},
                        "integrity_ms": integrity_ms,
                        "ffprobe_ms": verify_ms, "net_mode": _NET_MODE}
                 self.db.upd(vid, net=json.dumps(net, ensure_ascii=False))
@@ -2683,6 +2725,22 @@ class Engine:
     def _fetch_one(self, fmt, dest, info, n, cancel=None):
         size = int(fmt.get("clen") or 0)
         cancel = cancel or self.stop_ev
+        cfg_ = getattr(self, "cfg", None) or {}
+        if (str(cfg_.get("dl_engine") or "http").strip().lower() == "aria2_rpc" and info.get("aria2_ok") and size > 0
+                and A2 is not None and ARIA2C and not info.get("no_spec") and not info.get("saw_block") and not spec_paused()):
+            na = aria2_conns(cfg_.get("aria2_connections"), size)
+            try:
+                return download_aria2_rpc(fmt["url"], dest, size, na, info, _AnyEvent(cancel, self.stop_ev))
+            except InterruptedError:
+                raise
+            except HttpStatus as e:
+                if _v2_spec_flags():
+                    mark_block(info, e)
+                raise                                         # 403/404/410/429: KHÔNG tải lại bằng đường khác (không dồn request)
+            except Exception as e:  # noqa: BLE001 — lỗi aria2 không phải HTTP → downloader hiện tại, 1 GET thường
+                info.update(aria2_fallback=f"{type(e).__name__}: {redact(str(e))[:80]}", no_spec=True, no_preconnect=True)
+                self.log(f"   ↩️ aria2 RPC lỗi ({info['aria2_fallback']}) → downloader WS360")
+                n = 1
         if n > 1 and size <= 0:
             try:
                 size = probe_size(fmt["url"])                 # yt-dlp hay không báo dung lượng → dò bằng 1 byte đầu
@@ -4170,6 +4228,228 @@ def _dlb_aria2(eng, vid, dest_dir, n):
     raise IOError(f"aria2c lỗi sau 2 link mới: {type(last).__name__}: {redact(str(last))[:120]}")
 
 
+A2B_COLS = ["ttfb_ms", "connections", "download_ms", "integrity_ms", "ffprobe_ms", "total_ms"]
+
+
+def _file_sha256(path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def _boot_paired(diffs, p=50, reps=2000, seed=777):
+    """KTC 90% (bootstrap, hạt giống cố định) của phân vị p của các chênh lệch THEO CẶP (cùng URL)."""
+    rnd = random.Random(seed)
+    n = len(diffs)
+    xs = sorted(pct([diffs[rnd.randrange(n)] for _ in range(n)], p) for _ in range(reps))
+    return pct(xs, 5), pct(xs, 95)
+
+
+def bench_aria2(cfg, base, ids, reps=None, conns=(1, 4, 8, 12), resolve=None):
+    """ARIA2 RPC vs downloader WS360 — CÙNG URL, CÙNG MÁY, CÙNG DUNG LƯỢNG.
+    Mỗi vòng: resolver WS360 lấy 1 link MỚI (itag 18) → tải CHÍNH link đó bằng: 'ws360' (downloader hiện tại, đúng cấu hình
+    config.json) và 'aria2_N' (daemon aria2 RPC, N kết nối), thứ tự xoay vòng mỗi vòng (cache CDN chia đều; có cột 'vị trí' và bảng
+    riêng 'chỉ lượt đầu vòng'). Mỗi file: đúng clen + kiểm MP4 + ffprobe + SHA-256 phải TRÙNG giữa mọi phương án của vòng.
+    429 → dừng bench ngay (không dồn request); 403/404/410 → bỏ phần còn lại của vòng, vòng sau lấy link mới.
+    KHÔNG quét API/WebSub, KHÔNG ghi Excel, KHÔNG TikTok, database + thư mục tải riêng (xoá sau khi đo)."""
+    log = Log(base / "logs")
+    bcfg = dict(cfg, download_dir="DOWNLOADS_A2BENCH", excel_enabled=False, tiktok_enabled=False, detection_mode="WEBSUB_ONLY")
+    eng = Engine(bcfg, base, log, db_name="database_A2BENCH.sqlite", lock_name="ws360_a2bench.lock")
+    resolve = resolve or eng.resolver.resolve
+    variants = ["ws360"] + [f"aria2_{int(n)}" for n in conns]
+    reps = reps or max(1, -(-20 // max(1, len(ids))))
+    host = os.environ.get("COMPUTERNAME") or (os.uname().nodename if hasattr(os, "uname") else "?")
+    rows, stop_all = [], False
+    d = A2.daemon(ARIA2C) if (A2 is not None and ARIA2C) else None
+    if d is None or not d.start():
+        variants = ["ws360"]
+        log("⚠️ BENCH-ARIA2: không thấy/không chạy được aria2c (cạnh tool, bin\\ hoặc PATH) → chỉ đo downloader WS360")
+    if FFPROBE:
+        subprocess.run([FFPROBE, "-version"], capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    n_ws = int(cfg.get("range_connections") or 1) if str(cfg.get("range_connections")).strip().lower() != "auto" else 1
+    work = eng.dl_dir / "A2BENCH"
+    log(f"⬇️ BENCH-ARIA2 | máy {host} | {len(ids)} video × {reps} vòng × {'/'.join(variants)} | CÙNG URL mỗi vòng | "
+        f"daemon aria2 {'sẵn sàng' if d is not None and d.alive() else 'KHÔNG'}")
+    try:
+        for k in range(reps):
+            for vid in ids:
+                if stop_all:
+                    break
+                try:
+                    plan = resolve(vid)
+                except Exception as e:  # noqa: BLE001
+                    rows.append({"variant": "-", "video_id": vid, "round": k, "result": "RESOLVE_FAILED",
+                                 "error": f"{type(e).__name__}: {redact(str(e))[:120]}"})
+                    continue
+                pick = plan.get("pick") or {}
+                fmt = pick.get("video") or {}
+                if pick.get("kind") != "progressive" or not fmt.get("url"):
+                    rows.append({"variant": "-", "video_id": vid, "round": k, "result": "SKIP", "error": "không có itag 18"})
+                    continue
+                clen = int(fmt.get("clen") or 0)
+                order = variants[k % len(variants):] + variants[:k % len(variants)]
+                ref_sha = None
+                for pos, var in enumerate(order):
+                    work.mkdir(parents=True, exist_ok=True)
+                    dest = work / f".{vid}.{var}.part.mp4"
+                    dest.unlink(missing_ok=True)
+                    info = {}
+                    row = {"variant": var, "video_id": vid, "round": k, "pos": pos, "size_expected": clen}
+                    t0 = time.perf_counter_ns()
+                    try:
+                        if var == "ws360":
+                            eng._fetch_one(fmt, dest, info, n_ws)
+                        else:
+                            if not clen:
+                                raise Fatal("aria2: thiếu clen")
+                            download_aria2_rpc(fmt["url"], dest, clen, int(var.split("_")[1]), info)
+                        t1 = time.perf_counter_ns()
+                        okq, why = mp4_quick_check(dest)
+                        t2 = time.perf_counter_ns()
+                        v = ffprobe_info(dest)
+                        t3 = time.perf_counter_ns()
+                        size = dest.stat().st_size
+                        sha = _file_sha256(dest)
+                        if ref_sha is None and okq and v.get("ok") and (not clen or size == clen):
+                            ref_sha = sha
+                        valid = bool(okq and v.get("ok") and (not clen or size == clen) and (ref_sha is None or sha == ref_sha))
+                        row.update(result="DONE" if valid else "INVALID", size=size, sha256=sha[:16], sha_match=(sha == ref_sha),
+                                   ttfb_ms=info.get("ttfb_ms"),
+                                   connections=(info.get("connections") if var != "ws360" else (info.get("connections") or 1)),
+                                   new_conns=info.get("new_conns"), hops=info.get("hops"), download_ms=ms(t0, t1),
+                                   integrity_ms=ms(t1, t2), ffprobe_ms=ms(t2, t3), total_ms=ms(t0, t3),
+                                   error="" if valid else f"không hợp lệ: MP4 {why} | ffprobe {v.get('ok')} | {size}/{clen} | SHA "
+                                                          f"{'khớp' if sha == ref_sha else 'KHÁC'}")
+                    except HttpStatus as e:
+                        row.update(result="FAILED", error=f"HTTP {e.code}", total_ms=ms(t0, time.perf_counter_ns()))
+                        rows.append(row)
+                        log(f"⬇️ BENCH-ARIA2 {var:9} {vid} vòng {k + 1}: HTTP {e.code} → "
+                            + ("DỪNG bench (429: không dồn request)" if e.code == 429 else "bỏ phần còn lại của vòng"))
+                        if e.code == 429:
+                            note_429()
+                            stop_all = True
+                        dest.unlink(missing_ok=True)
+                        break
+                    except Exception as e:  # noqa: BLE001
+                        row.update(result="FAILED", error=f"{type(e).__name__}: {redact(str(e))[:120]}", total_ms=ms(t0, time.perf_counter_ns()))
+                    dest.unlink(missing_ok=True)
+                    rows.append(row)
+                    log(f"⬇️ BENCH-ARIA2 {var:9} {vid} vòng {k + 1} vị trí {pos + 1}: {row['result']} | TTFB {row.get('ttfb_ms')} | "
+                        f"kết nối {row.get('connections')} | tải {row.get('download_ms')} | kiểm MP4 {row.get('integrity_ms')} | "
+                        f"ffprobe {row.get('ffprobe_ms')} | TỔNG {row.get('total_ms')} ms" + (f" | {row['error']}" if row.get("error") else ""))
+                    time.sleep(0.5)
+            if stop_all:
+                break
+    finally:
+        shutil.rmtree(eng.dl_dir, ignore_errors=True)
+        try:
+            eng.db.con.close()
+        except Exception:  # noqa: BLE001
+            pass
+    concl = bench_aria2_report(base, rows, variants, host, stopped_429=stop_all)
+    return {"rows": rows, "conclusion": concl}
+
+
+def bench_aria2_report(base, rows, variants, host="?", stopped_429=False) -> dict:
+    """BENCH_ARIA2.csv / BENCH_ARIA2.md / BENCH_ARIA2_SUMMARY.md. Chọn aria2_N CHỈ KHI: 0 lỗi, 0 file sai (SHA/ffprobe/MP4/dung
+    lượng), và nhanh hơn 'ws360' trên CÙNG URL: KTC 90% (bootstrap theo cặp) của mức giảm TỔNG ở median > 0 VÀ ở P90 > 0."""
+    keys = list(dict.fromkeys(k for r in rows for k in r)) or ["variant"]
+    with open(base / "BENCH_ARIA2.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=keys)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+    by = lambda v: [r for r in rows if r["variant"] == v]
+    pair = {(r["video_id"], r["round"]): r for r in rows if r["variant"] == "ws360" and r.get("result") == "DONE"}
+    f_ = lambda t: "-" if t is None else f"{t:.0f}"
+    md = [f"# BENCH ARIA2 RPC vs downloader WS360 — {iso()} — máy {host}", "",
+          "CÙNG URL mỗi vòng (resolver WS360, link MỚI mỗi vòng), cùng máy, cùng dung lượng; thứ tự xoay vòng. TỔNG = tải + kiểm MP4 + "
+          "ffprobe (không gồm resolver — giống nhau cho mọi phương án). TTFB aria2 = gửi addUri → byte đầu (đo mỗi 5 ms). 'kết nối' aria2 = "
+          "số kết nối THỰC TẾ lớn nhất aria2 báo; ws360 = số kết nối tải (1 = 1 GET).", ""]
+    if stopped_429:
+        md += ["**⛔ Bench dừng sớm vì HTTP 429 (không dồn request). Số dưới đây chưa đủ để kết luận.**", ""]
+    md += ["| Phương án | lượt | lỗi | file SAI | TỔNG med / P90 | tải med / P90 | TTFB med | kết nối thực tế med | ffprobe med | "
+           "8–10 MB dưới 1,5 s | chỉ lượt đầu vòng: TỔNG med |", "|---|---|---|---|---|---|---|---|---|---|---|"]
+    out = {}
+    for v in variants:
+        rs = by(v)
+        ok = [r for r in rs if r.get("result") == "DONE"]
+        bad = [r for r in rs if r.get("result") == "INVALID"]
+        err = [r for r in rs if r.get("result") == "FAILED"]
+        q = lambda c, p_: pct([r[c] for r in ok if r.get(c) is not None], p_)
+        tgt = [r for r in ok if 8 * 2 ** 20 <= (r.get("size") or 0) <= 10.5 * 2 ** 20]
+        first = [r["total_ms"] for r in ok if r.get("pos") == 0]
+        out[v] = {"n": len(rs), "ok": len(ok), "invalid": len(bad), "errors": len(err), "total_med": q("total_ms", 50),
+                  "total_p90": q("total_ms", 90), "target_hits": sum(1 for r in tgt if r["total_ms"] < 1500), "target_n": len(tgt)}
+        md.append(f"| {v} | {len(rs)} | {len(err)} | {len(bad)} | {f_(q('total_ms', 50))} / {f_(q('total_ms', 90))} | "
+                  f"{f_(q('download_ms', 50))} / {f_(q('download_ms', 90))} | {f_(q('ttfb_ms', 50))} | {f_(q('connections', 50))} | "
+                  f"{f_(q('ffprobe_ms', 50))} | {out[v]['target_hits']}/{len(tgt)} | {f_(pct(first, 50))} ({len(first)}) |")
+    ws = out.get("ws360") or {}
+    lines = [f"# BENCH_ARIA2_SUMMARY — {iso()} — máy {host}", "",
+             "Quy tắc chọn: aria2_N chỉ được chọn khi **0 lỗi, 0 file sai** (SHA-256 trùng downloader WS360, đúng dung lượng, kiểm MP4 + "
+             "ffprobe OK) VÀ nhanh hơn 'ws360' trên CÙNG URL: khoảng tin cậy 90% (bootstrap theo cặp) của mức giảm TỔNG > 0 ở CẢ median "
+             "lẫn P90. Mục tiêu tham khảo: video 8–10 MB tải + xác minh < 1500 ms.", ""]
+    if stopped_429:
+        lines += ["**⛔ Dừng sớm vì HTTP 429 → KHÔNG kết luận. Chờ ≥ 10 phút rồi chạy lại.**", ""]
+    lines += ["| Phương án | TỔNG med / P90 | giảm so với ws360 theo cặp: med [KTC 90%] | P90 [KTC 90%] | lỗi | file sai | 8–10 MB < 1,5 s | Kết luận |",
+              "|---|---|---|---|---|---|---|---|"]
+    best = None
+    for v in variants:
+        if v == "ws360":
+            lines.append(f"| ws360 (hiện tại) | {f_(ws.get('total_med'))} / {f_(ws.get('total_p90'))} | mốc | mốc | {ws.get('errors')} | "
+                         f"{ws.get('invalid')} | {ws.get('target_hits')}/{ws.get('target_n')} | mốc |")
+            continue
+        x = out[v]
+        prs = [(pair[(r["video_id"], r["round"])]["total_ms"], r["total_ms"]) for r in by(v)
+               if r.get("result") == "DONE" and (r["video_id"], r["round"]) in pair]
+        diffs = [a - b for a, b in prs]
+        a_, b_ = [a for a, _ in prs], [b for _, b in prs]
+        dm = pct(diffs, 50) if diffs else None
+        d9 = (pct(a_, 90) - pct(b_, 90)) if prs else None
+        cim = _boot_paired(diffs, 50) if len(diffs) >= 5 else None
+        ci9 = _boot_ci(a_, b_, 90) if len(prs) >= 5 else None
+        err_up = (x["errors"] / max(1, x["n"])) > ((ws.get("errors") or 0) / max(1, ws.get("n") or 1))
+        if stopped_429:
+            dec = "inconclusive"
+        elif x["invalid"] or x["errors"] or err_up:
+            dec = "off"
+        elif cim is None or ci9 is None:
+            dec = "inconclusive"
+        elif cim[0] > 0 and ci9[0] > 0:
+            dec = "on"
+        elif cim[1] < 0:
+            dec = "off"
+        else:
+            dec = "inconclusive"
+        x.update(decision=dec, gain_median_ms=dm, gain_p90_ms=d9, ci_median=cim, ci_p90=ci9, pairs=len(prs))
+        if dec == "on" and (best is None or (x["total_med"] or 1e9) < (out[best]["total_med"] or 1e9)):
+            best = v
+        why = ("có file sai" if x["invalid"] else "có lỗi" if x["errors"] or err_up else "")
+        lines.append(f"| {v} | {f_(x['total_med'])} / {f_(x['total_p90'])} | "
+                     + (f"{dm:+.0f} [{cim[0]:+.0f}…{cim[1]:+.0f}]" if cim else (f"{dm:+.0f}" if dm is not None else "-")) + " | "
+                     + (f"{d9:+.0f} [{ci9[0]:+.0f}…{ci9[1]:+.0f}]" if ci9 else (f"{d9:+.0f}" if d9 is not None else "-"))
+                     + f" | {x['errors']} | {x['invalid']} | {x['target_hits']}/{x['target_n']} | "
+                     + {"on": "✅ nhanh hơn chắc chắn, file hợp lệ", "off": f"⏸ KHÔNG chọn{(' (' + why + ')') if why else ''}",
+                        "inconclusive": "❔ chưa kết luận (chạy thêm vòng)"}[dec] + " |")
+    out["best"] = best
+    if best:
+        n_ = best.split("_")[1]
+        lines += ["", f"**Đề xuất:** `{best}` (median TỔNG {f_(out[best]['total_med'])} ms). Bật THỬ trong config.json: "
+                  f'`"dl_engine": "aria2_rpc", "aria2_connections": {n_}` — quay về: `"dl_engine": "http"`.']
+    else:
+        lines += ["", "**Đề xuất:** giữ downloader WS360 hiện tại (`\"dl_engine\": \"http\"`) — chưa có phương án aria2 nào chứng minh nhanh "
+                  "hơn với file hoàn toàn hợp lệ."]
+    lines += ["", "Lưu ý: cùng URL tải nhiều lần → các lượt sau có thể được cache CDN của Google phục vụ nhanh hơn; thứ tự xoay vòng chia "
+              "đều ảnh hưởng này, cột 'chỉ lượt đầu vòng' trong BENCH_ARIA2.md cho số khi phương án là người tải ĐẦU TIÊN của URL."]
+    md += [""] + lines[2:]
+    (base / "BENCH_ARIA2.md").write_text("\n".join(md) + "\n", encoding="utf-8")
+    (base / "BENCH_ARIA2_SUMMARY.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print("\n".join(lines))
+    return out
+
+
 def download_bench_only(cfg, base, ids, reps=5, variants=("http_cold", "http_warm", "aria2c"), aria2_conns=4):
     """DOWNLOAD BENCHMARK ONLY — ĐÚNG thuật toán WS360: resolver Android Innertube race (android_vr / android / web_embedded,
     yt-dlp chỉ là dự phòng khi cả 3 hỏng) → itag 18 → tải → ffprobe + đúng dung lượng.
@@ -5324,6 +5604,8 @@ def main(argv=None):
     ap.add_argument("--video", default="")
     ap.add_argument("--bench", nargs="*")
     ap.add_argument("--reps", type=int, default=3)
+    ap.add_argument("--bench-aria2", nargs="*", help="ARIA2 RPC vs downloader WS360 trên CÙNG URL (1/4/8/12 kết nối) → BENCH_ARIA2*.md/.csv")
+    ap.add_argument("--conns", default="1,4,8,12", help="--bench-aria2: số kết nối aria2, cách nhau dấu phẩy")
     ap.add_argument("--config", default="config.json")
     ap.add_argument("--diag", action="store_true", help="chẩn đoán từng kênh WebSub → DIAG_REPORT.md")
     ap.add_argument("--resubscribe", action="store_true", help="dùng với --diag: đăng ký lại cả danh sách rồi chờ hub xác minh")
@@ -5368,6 +5650,14 @@ def main(argv=None):
         return 0 if all(s != "FAIL" for _, s, _ in r) else 1
     if a.bench360 is not None:
         bench360(cfg, base, [v for v in (extract_vid(x) for x in a.bench360) if v], max(1, a.reps if a.reps != 3 else 10))
+        return 0
+    if a.bench_aria2 is not None:
+        ids = [v for v in (extract_vid(x) for x in a.bench_aria2) if v]
+        if not ids:
+            print("Cần ít nhất 1 ID/link video. Ví dụ: --bench-aria2 ID1 ID2 ID3")
+            return 2
+        bench_aria2(cfg, base, ids, a.reps if a.reps != 3 else None,
+                    tuple(int(x) for x in a.conns.split(",") if x.strip().isdigit()) or (1, 4, 8, 12))
         return 0
     if a.download_bench is not None:
         ids = [v for v in (extract_vid(x) for x in (a.download_bench or ["pk7HiB167VY"])) if v]

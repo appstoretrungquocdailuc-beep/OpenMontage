@@ -100,6 +100,8 @@
   "dl_alt_url_on_403": true,
   "dl_quick_integrity": true,
   "dl_hotpath_v2": true,
+  "dl_engine": "http",
+  "aria2_connections": "auto",
   "filename_mode": "TITLE",
   "filename_title_max": 0,
   "filename_max_path": 240
