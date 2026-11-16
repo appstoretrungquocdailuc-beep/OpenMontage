@@ -292,6 +292,49 @@ V97_CURL_PATH = str(os.environ.get("V97_CURL_PATH", "") or "")
 # ffprobe kiểm file 360p chạy nền SAU khi đã DONE (chỉ cảnh báo). 0 = không kiểm.
 V95_360P_BG_PROBE = (str(os.environ.get("V95_360P_BG_PROBE", "1")).strip().lower() in ("1", "true", "yes", "on"))
 
+# ---------------------------------------------------------------------------------------------
+# V9.8 — tối ưu tải 480p (RANGE-TURBO video 244 + audio JA). Mọi cờ V98_* ghi đè được bằng biến môi trường
+# V98_<TÊN>. Đặt cờ về giá trị ghi trong (ngoặc) = đúng hành vi V9.7.1. Chỉ bật mặc định cờ nào đã đo A/B tốt hơn
+# (bench_v98.py) — xem BAO_CAO_V98.md.
+# ---------------------------------------------------------------------------------------------
+def _v98_env(name, default):
+    raw = os.environ.get(f"V98_{name}")
+    if raw is None or str(raw).strip() == "":
+        return default
+    raw = str(raw).strip()
+    if isinstance(default, bool):
+        return raw.lower() in ("1", "true", "yes", "on")
+    try:
+        return type(default)(raw)
+    except Exception:
+        return default
+
+
+# Preallocation (Windows: _chsize ghi số 0, log thật 96ms/49MiB) chạy SONG SONG với đợt GET đầu (TTFB ~400ms) thay vì
+# trước nó; lần ghi đầu tiên chờ preallocation xong. (False = V9.7.1: truncate xong mới gửi GET)
+V98_PREALLOC_ASYNC = _v98_env("PREALLOC_ASYNC", False)
+# FIRST-WAVE-RACE: "fixed" = V9.7.1 (theo V94_FIRST_WAVE_RACE_MAX); "adaptive" = chỉ V98_RACE_PROBES đoạn đầu bắn kép
+# (thăm dò replica); các đoạn đợt đầu còn lại đi host chính và CHỈ hedge sang replica khi replica đã thắng thăm dò
+# (nhanh hơn thật) hoặc host chính chưa trả header sau V98_FIRST_HEDGE_SEC. File nhỏ (<= V94_RACE_ALL_IF_WORKERS_LE
+# đoạn) vẫn race hết như cũ. ("fixed")
+V98_RACE_MODE = str(os.environ.get("V98_RACE_MODE", "fixed") or "fixed").strip().lower()
+V98_RACE_PROBES = _v98_env("RACE_PROBES", 2)
+V98_FIRST_HEDGE_SEC = _v98_env("FIRST_HEDGE_SEC", 0.9)
+# Ghi file: "lock" = V9.7.1 (seek+write dưới khoá chung với bộ lập lịch); "split" = khoá ghi riêng (bộ lập lịch không
+# chờ đĩa); "pwrite" = không khoá ghi (POSIX os.pwrite / Windows mỗi luồng 1 handle riêng). Đúng offset, không trùng byte.
+V98_WRITE_MODE = str(os.environ.get("V98_WRITE_MODE", "lock") or "lock").strip().lower()
+# Tự tăng worker khi đo thấy giới hạn THEO KẾT NỐI (tổng Mbps tăng khi thêm kết nối); dừng khi thêm mà không nhanh hơn
+# (đã chạm giới hạn đường truyền). (False)
+V98_SCALE_UP = _v98_env("SCALE_UP", False)
+V98_SCALE_MAX = _v98_env("SCALE_MAX", 32)
+V98_SCALE_AFTER_SEC = _v98_env("SCALE_AFTER_SEC", 0.25)    # sau byte đầu bao lâu thì đo tốc độ để quyết định
+V98_SCALE_MIN_LEFT_SEC = _v98_env("SCALE_MIN_LEFT_SEC", 0.6)  # chỉ thêm khi phần còn lại cần > N giây
+# Kích thước Range đợt đầu tối đa (MiB); 0 = V9.7.1 (chia đều tổng / số worker).
+V98_PART_MIB = _v98_env("PART_MIB", 0.0)
+# aria2 RPC: số kết nối (0 = _aria2_tuned_split như V9.7.1) và max-tries (2 = V9.7.1; 1 = không tự thử lại khi 403/429).
+V98_ARIA2_SPLIT = _v98_env("ARIA2_SPLIT", 0)
+V98_ARIA2_MAX_TRIES = _v98_env("ARIA2_MAX_TRIES", 2)
+
 # V9.4.1: A/B số worker video nhỏ theo job ("6,11" → job lẻ 6, job chẵn 11) + mốc phát hiện gần nhất.
 _V94_AB_LOCK = threading.Lock()
 _V94_AB_COUNTER = [0]
@@ -3901,6 +3944,8 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
         # size thật nhận 416 "*/N" hoặc bị cắt theo Content-Range → vô hại), header đầu → fan-out phần còn lại.
         workers = max(1, min(int(V94_UNKNOWN_FIRST_WORKERS), max(1, total0 // min_part_bytes)))
     part = (total0 + workers - 1) // workers
+    if size_known and float(V98_PART_MIB or 0) > 0:          # V9.8: trần kích thước đoạn đợt đầu (đoạn còn lại xếp hàng)
+        part = max(min_part_bytes, min(part, int(float(V98_PART_MIB) * 1048576)))
     max_workers_cap = max(workers, int(V94_RANGE_MAX_WORKERS))
 
     segs = []
@@ -3908,19 +3953,40 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
     while s_ < total0:
         e_ = min(total0 - 1, s_ + part - 1)
         segs.append(_RangeSeg(s_, e_))
-        segs[-1].first = True
+        segs[-1].first = len(segs) <= workers
         s_ = e_ + 1
-    workers = len(segs)
+    workers = min(workers, len(segs))
 
     _t_pa = time.perf_counter()
     try:
         fh = open(temp_file, "w+b")
-        fh.truncate(total0)
+        if not V98_PREALLOC_ASYNC:
+            fh.truncate(total0)
     except OSError as e:
         logger(f"    [RANGE-TURBO] ⚠️ create file: {e}")
         info["fail_reason"] = "create_file"
         return False
     prealloc_ms = round((time.perf_counter() - _t_pa) * 1000.0, 2)   # Windows: _chsize ghi 0 trước GET đầu
+    # V9.8: preallocation chạy SONG SONG với đợt GET đầu; mọi lần ghi / co-giãn / đóng file chờ nó xong.
+    prealloc_ev = threading.Event()
+    _pa = {"ms": None, "err": None}
+    if V98_PREALLOC_ASYNC:
+        def _prealloc_bg():
+            _tpa = time.perf_counter()
+            try:
+                fh.truncate(total0)
+            except Exception as e_pa:  # noqa: BLE001
+                _pa["err"] = e_pa
+            finally:
+                _pa["ms"] = round((time.perf_counter() - _tpa) * 1000.0, 2)
+                prealloc_ev.set()
+        threading.Thread(target=_prealloc_bg, daemon=True, name="V98Prealloc").start()
+    else:
+        prealloc_ev.set()
+    wmode = V98_WRITE_MODE if V98_WRITE_MODE in ("lock", "split", "pwrite") else "lock"
+    wlock = threading.Lock()
+    _wtl = threading.local()
+    _whandles = []
 
     lock = threading.Lock()
     pending = list(segs)
@@ -3934,12 +4000,17 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
              "workers_peak": 0, "first_byte": None, "bad_cr": 0,
              # V9.4.1 telemetry
              "splits": 0, "takeovers": 0, "losers": [], "loser_pending": 0, "inflight": 0, "conc_peak": 0,
-             "conn_ids": set(), "req_seq": 0, "late_ttfb": [], "body_rates": [], "bans": 0}
+             "conn_ids": set(), "req_seq": 0, "late_ttfb": [], "body_rates": [], "bans": 0,
+             # V9.8 telemetry
+             "lock_hold_ns": 0, "write_ns": 0, "w_inflight": 0, "scale_added": 0, "scale_steps": []}
     # V9.4.1: file nhỏ (<= V94_RACE_ALL_IF_WORKERS_LE segment đợt đầu) race TẤT CẢ như V9.3; file lớn giữ trần.
     # Log live: video 6 worker chỉ race 4 → 2 segment còn lại phải chờ host chính + 302 (+~150ms trong mock).
     _rm = int(V94_FIRST_WAVE_RACE_MAX)
     _le = int(V94_RACE_ALL_IF_WORKERS_LE or 0)
     race_max = -1 if (_rm != 0 and _le > 0 and workers <= _le) else _rm
+    adaptive = (V98_RACE_MODE == "adaptive" and not (_le > 0 and workers <= _le))
+    if adaptive:                                    # V9.8: chỉ vài đoạn đầu thăm dò replica
+        race_max = max(0, int(V98_RACE_PROBES))
     if (RANGE_MN_RACE and (workers >= 4 or not size_known) and time.time() >= _MN_RACE_BAD_UNTIL[0]):
         state["alt"] = _gvs_alt_url(url)
     finished = threading.Event()
@@ -3981,6 +4052,7 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
             # Hành vi V9.3: báo size thật cho wrapper và tải lại từ đầu.
             info["pending_real_total"] = rt
             raise OSError(f"size_mismatch_{rt}")
+        prealloc_ev.wait(10.0)                      # V9.8: không truncate song song với preallocation nền
         state["resized"] = (old, rt)
         state["size_known"] = True
         state["total"] = rt
@@ -4146,7 +4218,20 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
         t_sub = time.perf_counter()
         f_first = _HEDGE_EXEC.submit(_req, urls[first_h], start, end, traces[first_h])
         futs = {f_first: first_h}
-        done, _ = wait([f_first], timeout=delay) if delay > 0 else (set(), None)
+        if adaptive and seg.first and not race_now and seg.retries == 0:
+            # V9.8: đoạn đợt đầu (không thăm dò) chờ host chính; chỉ hedge khi replica đã THẮNG thăm dò
+            # hoặc host chính quá V98_FIRST_HEDGE_SEC chưa có header.
+            _dl = t_sub + max(0.0, float(V98_FIRST_HEDGE_SEC))
+            while True:
+                done, _ = wait([f_first], timeout=0.02)
+                if done or finished.is_set():
+                    break
+                with lock:
+                    _proven = state["alt_wins"] > 0 and state["alt_ok"] is True
+                if _proven or time.perf_counter() >= _dl:
+                    break
+        else:
+            done, _ = wait([f_first], timeout=delay) if delay > 0 else (set(), None)
         if done and f_first.exception() is None:
             seg.h = first_h
             return (*f_first.result(), urls[first_h], traces[first_h])
@@ -4251,6 +4336,45 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
             return f"bad_content_range_{c_start}-{c_end}_want_{start}-{exp_end}"
         return None
 
+    def _drain_writes(limit_s=5.0):
+        """V9.8 split/pwrite: lần ghi đã giữ chỗ (ngoài khoá) phải XONG trước khi đóng file — không thì fd/handle đã đóng
+        có thể bị hệ điều hành cấp lại cho file khác và lần ghi trễ rơi vào file đó. closed=True đã chặn giữ chỗ mới."""
+        end_ = time.perf_counter() + limit_s
+        while time.perf_counter() < end_:
+            with lock:
+                if state["w_inflight"] <= 0:
+                    return True
+            time.sleep(0.001)
+        return False
+
+    def _write_at(off, data):
+        """V9.8: ghi đúng offset. split = khoá ghi riêng + seek/write; pwrite = POSIX os.pwrite / Windows handle riêng mỗi luồng."""
+        mv = memoryview(data)
+        if wmode == "split":
+            with wlock:
+                fh.seek(off)
+                fh.write(mv)
+            return
+        if os.name != "nt" and hasattr(os, "pwrite"):
+            fd = fh.fileno()
+            while len(mv):
+                n_ = os.pwrite(fd, mv, off)
+                off += n_
+                mv = mv[n_:]
+            return
+        h_ = getattr(_wtl, "h", None)
+        if h_ is None:
+            h_ = open(temp_file, "r+b", buffering=0)
+            _wtl.h = h_
+            with lock:
+                _whandles.append(h_)
+        h_.seek(off)
+        while len(mv):
+            n_ = h_.write(mv)
+            if not n_:
+                raise OSError("short_write")
+            mv = mv[n_:]
+
     def _run_seg(seg: _RangeSeg):
         resp = None
         _rq = {"t_issue": seg.t_start, "t_hdr": None, "trace": {}, "outcome": "done", "reused": None,
@@ -4305,26 +4429,74 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
                 chunk = resp.read(min(RANGE_STEAL_READ_CHUNK, want))
                 if not chunk:
                     raise OSError("short_range")
+                if not prealloc_ev.is_set():
+                    prealloc_ev.wait(10.0)
+                if _pa["err"] is not None:              # ổ đầy / không ghi được: lỗi cứng, không retry
+                    with lock:
+                        if state["error"] is None:
+                            state["error"] = OSError("prealloc_failed")
+                    raise OSError("prealloc_failed")
                 _tw = time.perf_counter_ns()
-                with lock:
-                    state["lock_wait_ns"] += time.perf_counter_ns() - _tw
-                    if state["closed"]:
-                        break
-                    allowed = min(len(chunk), seg.end - seg.pos + 1)
-                    if allowed <= 0:
-                        break
-                    fh.seek(seg.pos)
-                    fh.write(chunk[:allowed] if allowed < len(chunk) else chunk)
-                    if state["first_byte"] is None:
-                        state["first_byte"] = time.perf_counter() - t0
-                        TELEM.span(job, f"{media_kind}_first_byte",
-                                   ms=round(state["first_byte"] * 1000.0, 2))
-                    seg.pos += allowed
-                    seg.got += allowed
-                    seg.last_t = time.perf_counter()
-                    state["done"] += allowed
-                    state["writes"] += 1
-                    _range_progress_add(temp_file, allowed)
+                if wmode == "lock":
+                    with lock:
+                        _ta = time.perf_counter_ns()
+                        state["lock_wait_ns"] += _ta - _tw
+                        if state["closed"]:
+                            break
+                        allowed = min(len(chunk), seg.end - seg.pos + 1)
+                        if allowed <= 0:
+                            break
+                        fh.seek(seg.pos)
+                        fh.write(chunk[:allowed] if allowed < len(chunk) else chunk)
+                        state["write_ns"] += time.perf_counter_ns() - _ta
+                        if state["first_byte"] is None:
+                            state["first_byte"] = time.perf_counter() - t0
+                            TELEM.span(job, f"{media_kind}_first_byte",
+                                       ms=round(state["first_byte"] * 1000.0, 2))
+                        seg.pos += allowed
+                        seg.got += allowed
+                        seg.last_t = time.perf_counter()
+                        state["done"] += allowed
+                        state["writes"] += 1
+                        _range_progress_add(temp_file, allowed)
+                        state["lock_hold_ns"] += time.perf_counter_ns() - _ta
+                else:
+                    # V9.8: giữ chỗ [off, off+allowed) dưới khoá lập lịch (nhanh), ghi đĩa NGOÀI khoá đó.
+                    with lock:
+                        _ta = time.perf_counter_ns()
+                        state["lock_wait_ns"] += _ta - _tw
+                        if state["closed"]:
+                            break
+                        allowed = min(len(chunk), seg.end - seg.pos + 1)
+                        if allowed <= 0:
+                            break
+                        off = seg.pos
+                        seg.pos += allowed
+                        seg.got += allowed
+                        seg.last_t = time.perf_counter()
+                        state["w_inflight"] += 1
+                        state["lock_hold_ns"] += time.perf_counter_ns() - _ta
+                    data = chunk[:allowed] if allowed < len(chunk) else chunk
+                    _tws = time.perf_counter_ns()
+                    try:
+                        _write_at(off, data)
+                    except Exception:
+                        with lock:
+                            state["w_inflight"] -= 1
+                            if state["error"] is None:
+                                state["error"] = OSError("write_failed")
+                        raise
+                    _twe = time.perf_counter_ns()
+                    with lock:
+                        state["w_inflight"] -= 1
+                        state["write_ns"] += _twe - _tws
+                        if state["first_byte"] is None:
+                            state["first_byte"] = time.perf_counter() - t0
+                            TELEM.span(job, f"{media_kind}_first_byte",
+                                       ms=round(state["first_byte"] * 1000.0, 2))
+                        state["done"] += allowed
+                        state["writes"] += 1
+                        _range_progress_add(temp_file, allowed)
             with lock:
                 clean = seg.pos == req_end + 1
                 open_resps.discard(resp)
@@ -4435,11 +4607,52 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
     last_log = time.perf_counter()
     ok = False
     err = None
+    _sc = {"next": None, "done": 0, "t": 0.0, "base_rate": None, "base_live": 0, "stop": not V98_SCALE_UP}
+
+    def _maybe_scale(now):
+        """V9.8 SCALE-UP: đo tổng tốc độ theo cửa sổ; nếu phần còn lại còn lâu thì thêm worker (worker mới tự chẻ đoạn
+        dài nhất). Bước sau: tổng tốc độ phải TĂNG tương xứng, không thì dừng hẳn (đã chạm giới hạn đường truyền)."""
+        with lock:
+            fb = state["first_byte"]
+            if fb is None or not state["size_known"]:
+                return
+            done_, live, total_ = state["done"], state["workers_live"], state["total"]
+            ttfb_ = state["ttfb_ema"] or 0.3
+        if _sc["next"] is None:
+            _sc.update(next=now + float(V98_SCALE_AFTER_SEC), done=done_, t=now)
+            return
+        if now < _sc["next"]:
+            return
+        rate = (done_ - _sc["done"]) / max(1e-3, now - _sc["t"])
+        _sc.update(done=done_, t=now)
+        if _sc["base_rate"] is not None:                      # bước trước đã thêm worker: có nhanh hơn không?
+            gain = rate / max(1.0, _sc["base_rate"]) - 1.0
+            want = 0.35 * (live - _sc["base_live"]) / max(1, _sc["base_live"])
+            with lock:
+                state["scale_steps"].append({"live": live, "rate_mbps": round(rate * 8 / 1e6, 1), "gain": round(gain, 3)})
+            if gain < want:
+                _sc["stop"] = True
+                return
+        rem = total_ - done_
+        if rate <= 0 or rem / rate < float(V98_SCALE_MIN_LEFT_SEC) or live >= int(V98_SCALE_MAX):
+            _sc["stop"] = True
+            return
+        k = max(2, min(int(V98_SCALE_MAX) - live, live // 2))
+        with lock:
+            _spawn_workers_locked(k)
+            state["scale_added"] += k
+        _sc.update(base_rate=rate, base_live=live, next=now + ttfb_ + 0.30)
+
     try:
         with lock:
             _spawn_workers_locked(workers)
         while not finished.wait(0.05):
             now = time.perf_counter()
+            if not _sc["stop"]:
+                try:
+                    _maybe_scale(now)
+                except Exception:  # noqa: BLE001 — đo đạc không bao giờ làm hỏng việc tải
+                    _sc["stop"] = True
             if cancel_ev is not None and cancel_ev.is_set():
                 with lock:
                     state["error"] = RuntimeError("cancelled")
@@ -4466,10 +4679,17 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
             open_resps.clear()
         for r in to_close:      # thread đang read() sẽ nhận lỗi và thoát ngay, không treo tới timeout
             _range_close_resp(r, drain=False)
-        try:
-            fh.close()
-        except OSError:
-            pass
+        prealloc_ev.wait(10.0)
+        if _drain_writes():         # ghi kẹt > 5 s (đĩa treo): KHÔNG đóng — thà rò 1 handle còn hơn ghi nhầm file khác
+            for h_ in list(_whandles):
+                try:
+                    h_.close()
+                except OSError:
+                    pass
+            try:
+                fh.close()
+            except OSError:
+                pass
         if err is not None:
             logger(f"    [RANGE-TURBO] ⚠️ {type(err).__name__}: {err} → fallback")
             return False
@@ -4506,7 +4726,11 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
                  + (f" ttfb_late={_ltp50:.2f}/{_ltp90:.2f}s" if _lt else "")
                  + f" hedge_real={state['hedges'] - state['races']} gets={state['host_req'][0] + state['host_req'][1]}"
                  + f" conc_peak={state['conc_peak']} splits={state['splits']} takeovers={state['takeovers']}"
-                 + f" prealloc={prealloc_ms:.0f}ms" + (f" ab={svw}" if svw and total <= 4 * 1048576 else ""))
+                 + f" prealloc={prealloc_ms:.0f}ms" + (f" ab={svw}" if svw and total <= 4 * 1048576 else "")
+                 + (f" prealloc_bg={_pa['ms']:.0f}ms" if V98_PREALLOC_ASYNC and _pa["ms"] is not None else "")
+                 + (" race=adaptive" if adaptive else "") + (f" scale+{state['scale_added']}" if state["scale_added"] else "")
+                 + f" lock_wait={state['lock_wait_ns'] / 1e6:.0f}ms lock_hold={state['lock_hold_ns'] / 1e6:.0f}ms"
+                 + f" write={state['write_ns'] / 1e6:.0f}ms/{state['writes']}x({wmode})")
         logger(
             f"    [RANGE-TURBO] ✅ HOÀN TẤT {media_kind.upper()} | {total/1048576:.2f}MB | "
             f"{elapsed:.3f}s | ≈{total*8.0/1e6/elapsed:.0f}Mbps | workers={workers}→{state['workers_peak']} | "
@@ -4524,10 +4748,17 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
         for r in to_close:
             _range_close_resp(r, drain=False)
         finished.set()
-        try:
-            fh.close()
-        except OSError:
-            pass
+        prealloc_ev.wait(10.0)
+        if _drain_writes():         # ghi kẹt > 5 s (đĩa treo): KHÔNG đóng — thà rò 1 handle còn hơn ghi nhầm file khác
+            for h_ in list(_whandles):
+                try:
+                    h_.close()
+                except OSError:
+                    pass
+            try:
+                fh.close()
+            except OSError:
+                pass
         ex.shutdown(wait=False, cancel_futures=True)
         _range_progress_end(temp_file)
         if not ok:
@@ -4567,6 +4798,12 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
                           if state["first_byte"] else None),
             "conn_p50_mbps": (lambda a: round(a[len(a) // 2], 2) if a else None)(sorted(list(state["body_rates"]))),
             "ttfb_late_p50_ms": (lambda a: round(a[len(a) // 2] * 1000.0, 1) if a else None)(sorted(list(state["late_ttfb"]))),
+            # V9.8
+            "prealloc_async": bool(V98_PREALLOC_ASYNC), "prealloc_bg_ms": _pa["ms"],
+            "first_get_ms": (round((info["first_get_ns"] - t0_ns) / 1e6, 2) if info.get("first_get_ns") else None),
+            "lock_hold_ms": round(state["lock_hold_ns"] / 1e6, 3), "write_ms": round(state["write_ns"] / 1e6, 3),
+            "write_mode": wmode, "race_mode": ("adaptive" if adaptive else "fixed"), "scale_added": state["scale_added"],
+            "scale_steps": list(state["scale_steps"]), "part_bytes": int(part), "segments_initial": len(segs),
         })
         TELEM.span(job, f"{media_kind}_download_complete", **{k: v for k, v in info.items()
                                                                 if k not in ("job", "cancel", "pool")})
@@ -5556,7 +5793,10 @@ def _aria2_tuned_split(expected_bytes: int):
     return 24
 
 
-def _download_aria2c_rpc(url: str, temp_dir: Path, filename: str, logger, min_bytes: int, expected_bytes: int = 0) -> bool:
+def _download_aria2c_rpc(url: str, temp_dir: Path, filename: str, logger, min_bytes: int, expected_bytes: int = 0,
+                         info=None) -> bool:
+    """info (V9.8, tuỳ chọn — chỉ bench dùng): ttfb_ms, elapsed_ms, connections (thực tế, lớn nhất theo tellStatus), split,
+    aria2_error. V98_ARIA2_SPLIT>0 ép số kết nối; V98_ARIA2_MAX_TRIES (mặc định 2 = như cũ)."""
     if not _start_aria2_rpc_daemon():
         return False
     temp_file = temp_dir / filename
@@ -5566,7 +5806,7 @@ def _download_aria2c_rpc(url: str, temp_dir: Path, filename: str, logger, min_by
         except Exception:
             pass
 
-    split = _aria2_tuned_split(expected_bytes)
+    split = int(V98_ARIA2_SPLIT) if int(V98_ARIA2_SPLIT or 0) > 0 else _aria2_tuned_split(expected_bytes)
     logger(f"    [ARIA2-RPC] ⚡ Turbo daemon | split<={split} | {filename}")
     opts = {
         "dir": str(temp_dir),
@@ -5577,7 +5817,7 @@ def _download_aria2c_rpc(url: str, temp_dir: Path, filename: str, logger, min_by
         "file-allocation": "none",
         "allow-overwrite": "true",
         "auto-file-renaming": "false",
-        "max-tries": "2",
+        "max-tries": str(max(1, int(V98_ARIA2_MAX_TRIES or 2))),
         "retry-wait": "0",
         "connect-timeout": "2",
         "timeout": "4",
@@ -5585,25 +5825,41 @@ def _download_aria2c_rpc(url: str, temp_dir: Path, filename: str, logger, min_by
         "stream-piece-selector": "default",
         "reuse-uri": "true",
     }
+    _t0 = time.perf_counter_ns()
     gid = _aria2_rpc_call("aria2.addUri", [[url], opts], timeout=0.25)
     if not gid:
         return False
 
     deadline = time.perf_counter() + 180.0
     status = None
+    _first = None
+    _maxc = 0
     try:
         while time.perf_counter() < deadline:
             status = _aria2_rpc_call(
-                "aria2.tellStatus", [gid, ["status", "completedLength", "totalLength", "errorCode", "errorMessage"]],
+                "aria2.tellStatus", [gid, ["status", "completedLength", "totalLength", "errorCode", "errorMessage",
+                                           "connections"]],
                 timeout=0.20
             )
             if isinstance(status, dict):
                 st = status.get("status")
+                if info is not None:
+                    _maxc = max(_maxc, int(status.get("connections") or 0))
+                    if _first is None and int(status.get("completedLength") or 0) > 0:
+                        _first = time.perf_counter_ns()
                 if st == "complete":
                     break
                 if st in ("error", "removed"):
+                    if info is not None:
+                        info["aria2_error"] = f"errorCode {status.get('errorCode')}"
+                        _m = re.search(r"status=(\d{3})", str(status.get("errorMessage") or ""))
+                        info["fail_reason"] = f"HTTP_{_m.group(1)}" if _m else "aria2_" + str(status.get("errorCode"))
                     return False
-            time.sleep(0.015)
+            time.sleep(0.005 if info is not None else 0.015)
+        if info is not None:
+            _te = time.perf_counter_ns()
+            info.update(engine="aria2_rpc", split=split, connections=_maxc,
+                        ttfb_ms=round(((_first or _te) - _t0) / 1e6, 2), elapsed_ms=round((_te - _t0) / 1e6, 2))
 
         if not isinstance(status, dict) or status.get("status") != "complete":
             return False
@@ -7469,6 +7725,13 @@ class PremiumDownloaderApp(QWidget):
         )
         self.logger_qt.log(
             "🛡️ 403-GUARD: android/android_vr cannot win raw adaptive URL | SAFE-REFRESH=1x robust"
+        )
+        self.logger_qt.log(
+            f"⚙️ V9.8 RANGE: prealloc={'NỀN' if V98_PREALLOC_ASYNC else 'trước GET'} | ghi={V98_WRITE_MODE} | "
+            f"race={V98_RACE_MODE}" + (f"({V98_RACE_PROBES} thăm dò)" if V98_RACE_MODE == "adaptive" else "")
+            + f" | scale-up={'BẬT ≤' + str(V98_SCALE_MAX) if V98_SCALE_UP else 'tắt'}"
+            + (f" | đoạn đầu ≤{V98_PART_MIB}MiB" if float(V98_PART_MIB or 0) > 0 else "")
+            + " | rollback: đặt biến môi trường V98_* (xem BAO_CAO_V98.md)"
         )
         self.logger_qt.log(
             "🎯 V8 profile: video 64-80MB=24 ranges | 80-150MB=32 ranges | JA audio >=64KiB RANGE-FIRST | "

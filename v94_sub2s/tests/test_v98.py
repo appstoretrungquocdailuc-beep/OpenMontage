@@ -1,0 +1,303 @@
+# -*- coding: utf-8 -*-
+"""V9.8: cờ tối ưu RANGE-TURBO (prealloc nền, ghi ngoài khoá, race thích ứng, scale-up, đoạn đầu) + aria2 info.
+Mọi biến thể phải: đúng từng byte (SHA-256), đúng offset, 403/416/Content-Range sai vẫn an toàn, không để file dở."""
+import os
+import shutil
+import threading
+import time
+
+import pytest
+
+from mock_gvs import make_payload, sha256
+
+MB = 1024 * 1024
+WRITE_MODES = ["lock", "split", "pwrite", "pwrite_handles"]
+
+
+def _dl(mod, url, tmp_path, name, expected, kind="video", info=None):
+    info = {} if info is None else info
+    ok = mod._download_http_range_turbo(url, tmp_path, name, lambda m: None, 64 * 1024, expected, media_kind=kind, info=info)
+    return ok, info
+
+
+@pytest.fixture()
+def wmode(v94, monkeypatch, request):
+    m = request.param
+    if m == "pwrite_handles":               # nhánh Windows: mỗi luồng 1 handle riêng (không có os.pwrite)
+        monkeypatch.delattr(os, "pwrite", raising=False)
+        m = "pwrite"
+    monkeypatch.setattr(v94, "V98_WRITE_MODE", m)
+    return m
+
+
+def test_defaults_are_v971_behaviour(v94):
+    """Rollback: tắt hết cờ V9.8 = đúng V9.7.1. Giá trị mặc định ghi trong BAO_CAO_V98.md."""
+    assert v94.V98_WRITE_MODE in ("lock", "split", "pwrite")
+    assert v94.V98_RACE_MODE in ("fixed", "adaptive")
+    assert float(v94.V98_PART_MIB) == 0.0
+    assert int(v94.V98_ARIA2_SPLIT) == 0 and int(v94.V98_ARIA2_MAX_TRIES) == 2
+
+
+@pytest.mark.parametrize("wmode", WRITE_MODES, indirect=True)
+@pytest.mark.parametrize("size,kind", [(3 * MB + 17, "video"), (11 * MB + 3, "audio"), (24 * MB + 1, "video")])
+def test_write_modes_exact_bytes(v94, gvs, tmp_path, wmode, size, kind):
+    data = make_payload(size, seed=size)
+    url = gvs.add("/w", data)
+    ok, info = _dl(v94, url, tmp_path, "w.bin", size, kind)
+    assert ok, info
+    assert sha256((tmp_path / "w.bin").read_bytes()) == sha256(data)
+    assert info["write_mode"] == wmode and info["bytes"] == size
+    assert info["write_ms"] >= 0 and info["lock_hold_ms"] >= 0
+
+
+@pytest.mark.parametrize("wmode", WRITE_MODES, indirect=True)
+def test_write_modes_steal_drop_resize(v94, gvs, tmp_path, wmode):
+    """Đoạn bị chẻ (steal/split), mất kết nối giữa chừng, size ước tính sai — vẫn đúng từng byte."""
+    data = make_payload(9 * MB + 77, seed=5)
+    u1 = gvs.add("/tail", data, slow_first_n=2, slow_rate=256 * 1024)
+    ok, info = _dl(v94, u1, tmp_path, "t.bin", len(data))
+    assert ok, info
+    assert sha256((tmp_path / "t.bin").read_bytes()) == sha256(data) and info["steals"] >= 1
+    u2 = gvs.add("/drop", data, mode="drop_once", drop_at=3 * MB + 12345)
+    ok, info = _dl(v94, u2, tmp_path, "d.bin", len(data))
+    assert ok, info
+    assert sha256((tmp_path / "d.bin").read_bytes()) == sha256(data)
+    for exp in (7 * MB, 12 * MB):
+        u3 = gvs.add(f"/rs{exp}", data)
+        ok, info = _dl(v94, u3, tmp_path, f"r{exp}.bin", exp)
+        assert ok, info
+        assert sha256((tmp_path / f"r{exp}.bin").read_bytes()) == sha256(data)
+
+
+@pytest.mark.parametrize("wmode", ["split", "pwrite", "pwrite_handles"], indirect=True)
+def test_write_modes_bad_cr_and_403_safe(v94, gvs, tmp_path, wmode):
+    data = make_payload(3 * MB)
+    ok, info = _dl(v94, gvs.add("/bad", data, mode="badcr", shift=1), tmp_path, "b.bin", len(data))
+    assert not ok and info["fail_reason"].startswith("bad_content_range")
+    assert not (tmp_path / "b.bin").exists()
+    ok, info = _dl(v94, gvs.add("/deny", mode="status", code=403), tmp_path, "d.bin", 4 * MB)
+    assert not ok and info["fail_reason"] == "HTTP_403"
+    assert len(gvs.requests_for("/deny")) <= info["workers_initial"]
+    assert not (tmp_path / "d.bin").exists()
+
+
+@pytest.mark.parametrize("wmode", ["pwrite_handles"], indirect=True)
+def test_per_thread_handles_closed(v94, gvs, tmp_path, wmode):
+    """Windows: handle riêng của mỗi luồng phải được đóng (không thì không xoá/đổi tên file được)."""
+    data = make_payload(6 * MB, seed=2)
+    ok, info = _dl(v94, gvs.add("/h", data), tmp_path, "h.bin", len(data))
+    assert ok, info
+    os.replace(tmp_path / "h.bin", tmp_path / "h2.bin")
+    (tmp_path / "h2.bin").unlink()
+
+
+@pytest.mark.parametrize("wmode", ["split", "pwrite"], indirect=True)
+def test_write_modes_416_and_cancel(v94, gvs, tmp_path, wmode):
+    data = make_payload(300 * 1024)
+    ok, info = _dl(v94, gvs.add("/s416", data), tmp_path, "z.bin", 4 * MB, "audio")
+    assert ok, info
+    assert sha256((tmp_path / "z.bin").read_bytes()) == sha256(data)
+    big = make_payload(8 * MB)
+    ev = threading.Event()
+    threading.Timer(0.4, ev.set).start()
+    ok, info = _dl(v94, gvs.add("/slow", big, rate=512 * 1024), tmp_path, "cx.bin", len(big), info={"cancel": ev})
+    assert not ok and info["fail_reason"] == "cancelled"
+    assert not (tmp_path / "cx.bin").exists()
+
+
+class _SlowTrunc:
+    def __init__(self, f, delay, fail=False):
+        self._f, self._d, self._fail = f, delay, fail
+
+    def truncate(self, size=None):
+        time.sleep(self._d)
+        if self._fail:
+            raise OSError("disk full (giả lập)")
+        return self._f.truncate(size)
+
+    def __getattr__(self, k):
+        return getattr(self._f, k)
+
+
+def _patch_slow_open(v94, monkeypatch, delay, fail=False):
+    import builtins
+    real = builtins.open
+
+    def op(file, mode="r", *a, **k):
+        f = real(file, mode, *a, **k)
+        return _SlowTrunc(f, delay, fail) if mode == "w+b" else f
+    monkeypatch.setattr(v94, "open", op, raising=False)
+
+
+def test_prealloc_async_overlaps_first_get(v94, gvs, tmp_path, monkeypatch):
+    """Preallocation chạy nền: GET đầu được gửi NGAY (không chờ 300 ms truncate), file vẫn đúng."""
+    _patch_slow_open(v94, monkeypatch, 0.3)
+    data = make_payload(8 * MB + 5, seed=8)
+    url = gvs.add("/pa", data, hdr_delay=0.35)
+    monkeypatch.setattr(v94, "V98_PREALLOC_ASYNC", False)
+    ok, info0 = _dl(v94, url, tmp_path, "p0.bin", len(data))
+    assert ok and info0["first_get_ms"] >= 280
+    monkeypatch.setattr(v94, "V98_PREALLOC_ASYNC", True)
+    for wm in ("lock", "pwrite"):
+        monkeypatch.setattr(v94, "V98_WRITE_MODE", wm)
+        ok, info = _dl(v94, url, tmp_path, f"p_{wm}.bin", len(data))
+        assert ok, info
+        assert sha256((tmp_path / f"p_{wm}.bin").read_bytes()) == sha256(data)
+        assert info["prealloc_async"] and info["prealloc_bg_ms"] >= 280
+        assert info["first_get_ms"] < 100, info["first_get_ms"]
+        assert info["elapsed_ms"] < info0["elapsed_ms"] - 150
+
+
+def test_prealloc_async_resize_waits(v94, gvs, tmp_path, monkeypatch):
+    """Size thật khác ước tính: co/giãn file phải CHỜ preallocation nền xong (không truncate chồng nhau)."""
+    _patch_slow_open(v94, monkeypatch, 0.25)
+    monkeypatch.setattr(v94, "V98_PREALLOC_ASYNC", True)
+    data = make_payload(6 * MB + 5, seed=6)
+    for exp in (5 * MB, 8 * MB):
+        ok, info = _dl(v94, gvs.add(f"/r{exp}", data), tmp_path, f"r{exp}.bin", exp)
+        assert ok, info
+        assert sha256((tmp_path / f"r{exp}.bin").read_bytes()) == sha256(data)
+        assert info["resized"] == [exp, len(data)]
+
+
+def test_prealloc_async_failure_is_clean(v94, gvs, tmp_path, monkeypatch):
+    _patch_slow_open(v94, monkeypatch, 0.05, fail=True)
+    monkeypatch.setattr(v94, "V98_PREALLOC_ASYNC", True)
+    data = make_payload(4 * MB)
+    ok, info = _dl(v94, gvs.add("/pf", data), tmp_path, "pf.bin", len(data))
+    assert not ok
+    assert not (tmp_path / "pf.bin").exists()
+
+
+def _two_host(v94, gvs, monkeypatch, data, main_delay, alt_delay, tag):
+    real = gvs.add(f"/{tag}/real", data, hdr_delay=main_delay)
+    main = gvs.add(f"/{tag}/main", mode="redirect", to=real)
+    alt = gvs.add(f"/{tag}/alt", data, hdr_delay=alt_delay)
+    monkeypatch.setattr(v94, "_gvs_alt_url", lambda u: alt if str(u) == main else "")
+    v94._MN_RACE_BAD_UNTIL[0] = 0.0
+    return main
+
+
+def test_adaptive_race_fewer_requests_when_main_fast(v94, gvs, tmp_path, monkeypatch):
+    data = make_payload(24 * MB, seed=24)
+    monkeypatch.setattr(v94, "V94_RANGE_WORKERS_VIDEO", 16)
+    res = {}
+    for mode in ("fixed", "adaptive"):
+        monkeypatch.setattr(v94, "V98_RACE_MODE", mode)
+        main = _two_host(v94, gvs, monkeypatch, data, 0.05, 0.4, mode)
+        ok, info = _dl(v94, main, tmp_path, f"{mode}.bin", len(data))
+        assert ok, info
+        assert sha256((tmp_path / f"{mode}.bin").read_bytes()) == sha256(data)
+        time.sleep(0.6)                                  # request thua cuộc về hết rồi mới đếm
+        res[mode] = (info, len(gvs.requests_for(f"/{mode}/alt")))
+    assert res["fixed"][0]["races"] == 16 and res["adaptive"][0]["races"] == int(v94.V98_RACE_PROBES)
+    assert res["adaptive"][1] <= int(v94.V98_RACE_PROBES) + 1 < res["fixed"][1]
+    assert res["adaptive"][0]["race_mode"] == "adaptive"
+
+
+def test_adaptive_race_uses_replica_when_main_slow(v94, gvs, tmp_path, monkeypatch):
+    """CDN chính chậm (900 ms), replica nhanh: thăm dò thắng → các đoạn khác hedge ngay, không chờ 900 ms."""
+    data = make_payload(16 * MB, seed=16)
+    monkeypatch.setattr(v94, "V94_RANGE_WORKERS_VIDEO", 12)
+    monkeypatch.setattr(v94, "V98_RACE_MODE", "adaptive")
+    main = _two_host(v94, gvs, monkeypatch, data, 0.9, 0.05, "slowmain")
+    ok, info = _dl(v94, main, tmp_path, "sm.bin", len(data))
+    assert ok, info
+    assert sha256((tmp_path / "sm.bin").read_bytes()) == sha256(data)
+    assert info["alt_wins"] >= 2
+    assert info["elapsed_ms"] < 850, info["elapsed_ms"]
+
+
+def test_adaptive_race_alt_403_safe(v94, gvs, tmp_path, monkeypatch):
+    data = make_payload(8 * MB, seed=3)
+    monkeypatch.setattr(v94, "V98_RACE_MODE", "adaptive")
+    real = gvs.add("/a403/real", data, hdr_delay=0.05)
+    main = gvs.add("/a403/main", mode="redirect", to=real)
+    alt = gvs.add("/a403/alt", mode="status", code=403)
+    monkeypatch.setattr(v94, "_gvs_alt_url", lambda u: alt if str(u) == main else "")
+    v94._MN_RACE_BAD_UNTIL[0] = 0.0
+    ok, info = _dl(v94, main, tmp_path, "a.bin", len(data))
+    assert ok, info
+    assert sha256((tmp_path / "a.bin").read_bytes()) == sha256(data)
+    assert len(gvs.requests_for("/a403/alt")) <= int(v94.V98_RACE_PROBES) + 1
+
+
+def test_scale_up_adds_workers_when_per_connection_limited(v94, gvs, tmp_path, monkeypatch):
+    data = make_payload(24 * MB, seed=31)
+    monkeypatch.setattr(v94, "V98_SCALE_UP", True)
+    monkeypatch.setattr(v94, "V94_RANGE_WORKERS_VIDEO", 8)
+    url = gvs.add("/pc", data, rate=2 * MB)                 # mỗi kết nối 2 MiB/s
+    ok, info = _dl(v94, url, tmp_path, "pc.bin", len(data))
+    assert ok, info
+    assert sha256((tmp_path / "pc.bin").read_bytes()) == sha256(data)
+    assert info["scale_added"] >= 2 and info["workers_peak"] > 8
+
+
+def test_scale_up_stops_when_link_capped(v94, tmp_path, monkeypatch):
+    from mock_gvs import MockGVS
+    data = make_payload(24 * MB, seed=32)
+    monkeypatch.setattr(v94, "V98_SCALE_UP", True)
+    monkeypatch.setattr(v94, "V94_RANGE_WORKERS_VIDEO", 8)
+    with MockGVS(link_bytes_per_sec=12 * MB) as g:          # đường truyền chung 12 MiB/s, mỗi kết nối không giới hạn
+        ok, info = _dl(v94, g.add("/lc", data), tmp_path, "lc.bin", len(data))
+    assert ok, info
+    assert sha256((tmp_path / "lc.bin").read_bytes()) == sha256(data)
+    assert info["scale_added"] <= 4                          # tối đa 1 bước, rồi dừng vì không nhanh hơn
+    if info["scale_steps"]:
+        assert info["scale_steps"][-1]["gain"] < 0.35
+
+
+@pytest.mark.parametrize("pm", [0.5, 2.0])
+def test_part_mib_cap_exact(v94, gvs, tmp_path, monkeypatch, pm):
+    monkeypatch.setattr(v94, "V98_PART_MIB", pm)
+    data = make_payload(13 * MB + 9, seed=13)
+    ok, info = _dl(v94, gvs.add("/pm", data), tmp_path, "pm.bin", len(data))
+    assert ok, info
+    assert sha256((tmp_path / "pm.bin").read_bytes()) == sha256(data)
+    assert info["part_bytes"] <= max(pm * MB, v94.RANGE_MIN_PART_BYTES)
+
+
+def test_all_flags_together_concurrent_jobs(v94, gvs, tmp_path, monkeypatch):
+    for k, v in dict(V98_PREALLOC_ASYNC=True, V98_WRITE_MODE="pwrite", V98_RACE_MODE="adaptive", V98_SCALE_UP=True).items():
+        monkeypatch.setattr(v94, k, v)
+    datas = [make_payload(5 * MB + i * 1000, seed=i) for i in range(3)]
+    urls = [gvs.add(f"/c{i}", d, rate=4 * MB) for i, d in enumerate(datas)]
+    res = [None] * 6
+
+    def run(i):
+        res[i] = _dl(v94, urls[i // 2], tmp_path, f"c{i}.bin", len(datas[i // 2]), "video" if i % 2 == 0 else "audio")
+    ths = [threading.Thread(target=run, args=(i,)) for i in range(6)]
+    [t.start() for t in ths]
+    [t.join(30) for t in ths]
+    for i in range(6):
+        ok, info = res[i]
+        assert ok, info
+        assert sha256((tmp_path / f"c{i}.bin").read_bytes()) == sha256(datas[i // 2])
+
+
+# ----------------------------------------------------------------------------- aria2 RPC (engine C, chỉ bench)
+need_aria2 = pytest.mark.skipif(not shutil.which("aria2c"), reason="không có aria2c")
+
+
+@need_aria2
+def test_aria2_rpc_info_and_split(v94, gvs, tmp_path, monkeypatch):
+    monkeypatch.setattr(v94, "ARIA2C_PATH", shutil.which("aria2c"))
+    monkeypatch.setattr(v94, "V98_ARIA2_SPLIT", 8)
+    data = make_payload(12 * MB, seed=12)
+    url = gvs.add("/ar", data, rate=3 * MB)
+    info = {}
+    ok = v94._download_aria2c_rpc(url, tmp_path, "ar.bin", lambda m: None, 1, len(data), info=info)
+    assert ok, info
+    assert sha256((tmp_path / "ar.bin").read_bytes()) == sha256(data)
+    assert info["split"] == 8 and 2 <= info["connections"] <= 8 and info["ttfb_ms"] > 0
+
+
+@need_aria2
+def test_aria2_rpc_403_single_request(v94, gvs, tmp_path, monkeypatch):
+    monkeypatch.setattr(v94, "ARIA2C_PATH", shutil.which("aria2c"))
+    monkeypatch.setattr(v94, "V98_ARIA2_MAX_TRIES", 1)
+    url = gvs.add("/a403", mode="status", code=403)
+    info = {}
+    ok = v94._download_aria2c_rpc(url, tmp_path, "x.bin", lambda m: None, 1, 4 * MB, info=info)
+    assert not ok and info["fail_reason"] == "HTTP_403"
+    assert len(gvs.requests_for("/a403")) == 1
