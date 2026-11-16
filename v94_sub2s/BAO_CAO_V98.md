@@ -48,10 +48,11 @@ biến thể `noprewarm` trong `live480` để đo; DNS/TCP/TLS từng kết n�
 | `V98_WORKERS_LEARN` | `1` | `0` | mức "hi" = 20 × 1,6 = 32 (≤ `V98_SCALE_MAX`); file < 8 MiB và khi đã ép số worker → không áp dụng |
 | `V98_WRITE_MODE` | `lock` | `lock` | `split`/`pwrite` không nhanh hơn trên Linux; chờ số Windows |
 | `V98_SCALE_UP` | `0` | `0` | LOẠI: P90 tăng (S1 1946→2035 ms) + 20 request |
-| `V98_PART_MIB` | `0` | `0` | LOẠI: đoạn đầu ≤ 1 MiB chậm hơn rõ (0,5/1/2 MiB: +450…+830 ms, request 102→125–181; 4 MiB = không đổi) |
+| `V98_PART_MIB` | `0` | `0` | LOẠI: đoạn đầu nhỏ chậm hơn rõ (0,5/1/2 MiB: +450…+830 ms, request 102→125–181; 4 MiB = không đổi) |
 | `V98_ARIA2_SPLIT` / `V98_ARIA2_MAX_TRIES` | `0` (=cũ) / `2` (=cũ) | | chỉ bench dùng; downloader sản xuất KHÔNG đổi |
 
-Đặt cờ trên Windows: trong `RUN_V9_4_GUI.bat`, trước dòng `python ...` thêm ví dụ `set V98_WORKERS_LEARN=0`.
+Đặt cờ trên Windows: chạy GUI bằng `RUN_V9_8_GUI.bat` — bỏ `REM` ở dòng `set V98_...` muốn quay về (đã ghi sẵn).
+Bản V9.7.1 nguyên vẹn: **chép** `backup\V9_7_1_SUB2S_truoc_v98.py` ra thư mục tool rồi chạy file đó (ffmpeg\, aria2c.exe, config được tìm theo thư mục chứa file .py).
 Log khi bấm START có dòng `⚙️ V9.8 RANGE: prealloc=… | ghi=… | race=… | worker=… | scale-up=…`; mỗi lần tải có thêm
 `race=learn:probe|learn:all`, `wl=lo|hi`, `prealloc_bg=…ms`, `lock_wait=… lock_hold=… write=…ms/Nx(mode)`.
 
@@ -226,6 +227,7 @@ nhanh hơn 20, worker tự học sẽ tự giữ 20; nếu Windows cho thấy `p
 | `backup/V9_7_1_SUB2S_truoc_v98.py` | bản V9.7.1 gốc (không ghi đè) — engine A của bench |
 | `bench_v98.py`, `tests/mock_gvs_proc.py` | bench mock480 / linkcap / live_dl / live480 |
 | `BENCH_V98_480.bat` | chạy 4 bước trên Windows |
+| `RUN_V9_8_GUI.bat` | chạy GUI V9.8, có sẵn dòng rollback từng cờ |
 | `tests/test_v98.py` | 40 test mới |
 | `perf_report/v98_mock480_*` | toàn bộ số mock (jsonl / csv / json / summary.md) |
 

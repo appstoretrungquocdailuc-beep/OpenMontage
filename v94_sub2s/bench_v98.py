@@ -248,18 +248,18 @@ def _h2_fn(n):
 
 
 # Bộ biến thể đặt sẵn (BAT trên Windows không phải gõ JSON): --b-variants preset:<tên>
+_OFF = {"V98_PREALLOC_ASYNC": False, "V98_RACE_MODE": "fixed", "V98_WORKERS_LEARN": False, "V98_WRITE_MODE": "lock",
+        "V98_SCALE_UP": False}                              # = hành vi V9.7.1
 PRESETS = {
-    "flags": {"base": {}, "pa": {"V98_PREALLOC_ASYNC": True}, "split": {"V98_WRITE_MODE": "split"},
-              "pwrite": {"V98_WRITE_MODE": "pwrite"}, "scale": {"V98_SCALE_UP": True}, "adapt": {"V98_RACE_MODE": "adaptive"}},
+    # từng cờ riêng so với V9.7.1 ("off"), và bản V9.8 mặc định ("v98") ± ghi pwrite (ổ đĩa Windows thật)
+    "flags": {"off": dict(_OFF), "pa": dict(_OFF, V98_PREALLOC_ASYNC=True), "split": dict(_OFF, V98_WRITE_MODE="split"),
+              "pwrite": dict(_OFF, V98_WRITE_MODE="pwrite"), "v98": {}, "v98_pwrite": {"V98_WRITE_MODE": "pwrite"}},
     "v98": {"v98": {}},
-    "v98_vs_off": {"v98": {}, "v98off": {"V98_PREALLOC_ASYNC": False, "V98_WRITE_MODE": "lock", "V98_RACE_MODE": "fixed",
-                                         "V98_SCALE_UP": False}},
+    "v98_vs_off": {"v98": {}, "v98off": dict(_OFF)},
     # live480 (nguyên pipeline): V9.8 / không prewarm ffmpeg / opt-in FASTEST_VALID_480P (135 khi nhỏ hơn 244)
     "pipeline": {"v98": {}, "noprewarm": {"V94_FF_PREWARM": False}, "fv480": {"V94_FASTEST_VALID_480P": True}},
-    # live_dl: mặc định V9.8 / tắt hết cờ V9.8 / + scale-up / cố định 32 worker video (so scale-up với "cứ mở nhiều")
-    "live": {"v98": {}, "v98off": {"V98_PREALLOC_ASYNC": False, "V98_WRITE_MODE": "lock", "V98_RACE_MODE": "fixed",
-                                   "V98_SCALE_UP": False},
-             "v98scale": {"V98_SCALE_UP": True}, "v98w32": {"V94_RANGE_WORKERS_VIDEO": 32}},
+    # live_dl: V9.8 mặc định / tắt hết cờ V9.8 / + scale-up / cố định 32 worker video
+    "live": {"v98": {}, "v98off": dict(_OFF), "v98scale": {"V98_SCALE_UP": True}, "v98w32": {"V94_RANGE_WORKERS_VIDEO": 32}},
 }
 
 
@@ -524,6 +524,20 @@ def _summ_live(rows, ready_key="READY_MS"):
     return sorted(out, key=lambda x: (x["P50"] is None, x["P50"] or 0))
 
 
+TOOL_PATHS = ("ARIA2C_PATH", "IDM_PATH", "FFMPEG_PATH", "FFPROBE_PATH", "YTDLP_PATH")
+
+
+def _share_tool_paths(mods):
+    """Bản A nằm trong backup/ → nó tìm ffmpeg/, aria2c.exe… trong backup/. Dùng chung đường dẫn công cụ với bản B
+    (cùng máy, cùng công cụ) để so sánh công bằng."""
+    b = mods.get("B")
+    ref = b if b is not None else load_module("v98bench_B", ENGINE_FILES["B"])
+    for m in mods.values():
+        for k in TOOL_PATHS:
+            if not getattr(m, k, None) and getattr(ref, k, None):
+                setattr(m, k, getattr(ref, k))
+
+
 def _live_mods(args):
     _ensure_qt()
     mods = {}
@@ -531,6 +545,7 @@ def _live_mods(args):
         key = "B" if e in ("C", "D") else e
         if key in ENGINE_FILES and key not in mods:
             mods[key] = load_module(f"v98bench_{key}", ENGINE_FILES[key])
+    _share_tool_paths(mods)
     for m in mods.values():
         for fn in ("_prewarm_480_visitor_data", "_start_fast_keepalive"):
             try:
