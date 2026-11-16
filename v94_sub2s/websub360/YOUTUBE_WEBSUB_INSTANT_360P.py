@@ -1161,7 +1161,7 @@ def note_429():
         try:                                            # ghi nguyên tử: không bao giờ để file dở dang (đọc lúc khởi động)
             dst = Path(_SPEC_FILE[0])
             tmp = dst.with_name(f".{dst.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-            tmp.write_text(f"{time.time() + _SPEC_PAUSE_S:.0f}", encoding="utf-8")
+            tmp.write_text(f"{time.time() + _SPEC_PAUSE_S:.3f}", encoding="utf-8")
             os.replace(tmp, dst)
         except OSError:
             pass
@@ -1174,7 +1174,8 @@ def load_spec_pause(path):
         left = float(Path(path).read_text(encoding="utf-8").strip() or 0) - time.time()
     except (OSError, ValueError):
         return 0.0
-    if 0 < left <= _SPEC_PAUSE_S:
+    if 0 < left <= _SPEC_PAUSE_S + 5:                    # +5 s: sai lệch đồng hồ/làm tròn (file cũ ghi số nguyên)
+        left = min(left, _SPEC_PAUSE_S)
         _SPEC_OFF[0] = max(_SPEC_OFF[0], time.monotonic() + left)
         return left
     return 0.0

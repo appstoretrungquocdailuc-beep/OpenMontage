@@ -1033,7 +1033,7 @@ def test_429_pause_survives_restart_and_recover_keeps_next_try(tmp_path, monkeyp
     f = tmp_path / "pause_test.txt"
     monkeypatch.setattr(ws, "_SPEC_FILE", [f])                                      # tách khỏi file của engine/luồng nền khác
     ws.note_429()
-    assert 590 <= float(f.read_text(encoding="utf-8")) - time.time() <= 600
+    assert 590 <= float(f.read_text(encoding="utf-8")) - time.time() <= 600.5
     ws.reset_dl_v2_state()
     assert not ws.spec_paused()
     left = ws.load_spec_pause(f)                                                     # = Engine mới sau khởi động lại
@@ -1041,6 +1041,9 @@ def test_429_pause_survives_restart_and_recover_keeps_next_try(tmp_path, monkeyp
     f.write_text(f"{time.time() - 5:.0f}", encoding="utf-8")                         # đã hết hạn → không tạm dừng
     ws.reset_dl_v2_state()
     assert ws.load_spec_pause(f) == 0.0 and not ws.spec_paused()
+    f.write_text(f"{time.time() + 600.4:.0f}", encoding="utf-8")                     # file ghi số nguyên, làm tròn LÊN quá 600 s
+    ws.reset_dl_v2_state()
+    assert 590 < ws.load_spec_pause(f) <= 600 and ws.spec_paused()
     e.db.x("INSERT INTO videos(video_id, channel_id, url, engine, detected_at, state, next_try, error) VALUES(?,?,?,?,?,?,?,?)",
            ("REC429VID01", T.CH[0], "u", "WEBSUB", ws.iso(), "RETRY_WAIT", time.time() + 30, "HttpStatus: HTTP 429"))
     e.recover()
