@@ -200,7 +200,7 @@ nhanh hơn 20, worker tự học sẽ tự giữ 20; nếu Windows cho thấy `p
 
 ## 8. Kiểm thử
 
-- Hồi quy toàn bộ: V9.7.1 gốc **173 passed** → V9.8 __SUITE__.
+- Hồi quy toàn bộ: V9.7.1 gốc **173 passed** → V9.8 **212 passed + 1 xfailed** (= 173 test cũ + 40 test mới; xfail là test V9.3 cũ về ghi Excel song song, vốn chập chờn, không liên quan engine). 5 test cũ phải sửa vì ghi cứng chữ `[V9.7.1-SUB2S]` → nay đọc `V94_VERSION`.
 - `tests/test_v98.py` (40 test): đúng từng byte ở 3 kiểu ghi (cả nhánh Windows mỗi luồng 1 handle) với chẻ đoạn / mất kết nối
   / size sai / 416 / huỷ; handle đóng hết (đổi tên + xoá được file); Content-Range sai và 403 vẫn an toàn, không để file dở;
   prealloc nền (GET đầu < 100 ms, co/giãn chờ prealloc, lỗi prealloc = lỗi cứng, sạch file); race adaptive / learn (đổi chế độ
