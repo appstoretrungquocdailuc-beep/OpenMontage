@@ -1417,6 +1417,26 @@ def _hedged_follow(url, replica, delay_s, info, headers=None, on_primary_fail=No
     raise e429 or perr or got[-1][3]                            # có 429 ở bất kỳ bên nào → báo 429 (process chờ ≥ 10 s)
 
 
+def _v2_net_note(m):
+    """Phần ghi thêm cho dòng 🌐 MẠNG: tối ưu tải v2 đã làm gì ở lượt này (trống nếu không có gì)."""
+    xs = []
+    if m.get("redirect_skip_fail"):
+        xs.append(f"đoán 302 SAI ({m['redirect_skip_fail']}) → về URL gốc")
+    elif m.get("redirect_skip"):
+        xs.append(f"bỏ 302 (đoán theo {m['redirect_skip']}{', chưa rõ đúng/sai' if m.get('redirect_unconfirmed') else ''})")
+    if m.get("mn_preconnect"):
+        xs.append(f"mở sẵn {m['mn_preconnect']} máy chủ mn=")
+    if m.get("hedge_sent"):
+        xs.append(f"bắn kép → {'replica' if m.get('hedge_win') == 'replica' else 'máy chủ chính'} thắng")
+    if m.get("fallback_client"):
+        xs.append(f"link client {m['fallback_client']} (client thắng bị 403)")
+    if m.get("range_auto"):
+        xs.append(f"range auto {m['range_auto']} kết nối")
+    if m.get("saw_block"):
+        xs.append(f"gặp HTTP {m['saw_block']}")
+    return (" | v2: " + "; ".join(xs)) if xs else ""
+
+
 def _guess_failed(url, info, e):
     """Đoán máy chủ đích 302 sai (request tới máy chủ đoán lỗi, kể cả khi hedge đã cứu): ghi nhận + chặn đoán nguồn đó 10 phút."""
     if info.get("redirect_skip_fail"):
@@ -1947,6 +1967,14 @@ class Engine:
                  f"secret cũ đã biết: {len(load_secret_history(self.base))}")
         self.log(f"✅ {VERSION} chạy | {len(self.channels)} kênh | workers={self.cfg.get('workers')} | "
                  f"ffmpeg={'có' if FFMPEG else 'KHÔNG'} | ffprobe={'có' if FFPROBE else 'KHÔNG'} | yt-dlp={'có' if yt_dlp else 'KHÔNG'}")
+        o_ = NET_OPTS
+        yn = lambda k: "BẬT" if o_.get(k) else "tắt"
+        self.log(f"⚙️ TẢI: lớp mạng {_NET_MODE} | tối ưu v2: SSL dùng chung {yn('net_shared_ssl')} | nhớ 302 {yn('net_redirect_memory')} | "
+                 f"mở sẵn mn= {yn('net_mn_preconnect')} | hedge {yn('dl_hedge')}"
+                 + (f" ({o_.get('dl_hedge_delay_ms')} ms)" if o_.get("dl_hedge") else "")
+                 + f" | link client khác khi 403 {yn('dl_alt_url_on_403')} | kiểm nhanh MP4 {yn('dl_quick_integrity')} | "
+                 f"đường nóng {yn('dl_hotpath_v2')} | range_connections {self.cfg.get('range_connections', 1)}"
+                 + (" | ⏸ đang tạm dừng suy đoán (429)" if spec_paused() else ""))
 
     def _acquire_instance_lock(self):
         self._lockfh = open(self.base / self.lock_name, "a+")
@@ -2514,7 +2542,8 @@ class Engine:
                          f"({f_(rn.get('kb'))} KB) | parse {f_(rn.get('parse_ms'))} | race {plan.get('race_ms')} || "
                          f"TẢI {m_.get('host')}: {f_(m_.get('new_conns'))} kết nối mới/{f_(m_.get('hops'))} chặng | DNS {f_(m_.get('dns_ms'))} "
                          f"TCP {f_(m_.get('tcp_ms'))} TLS {f_(m_.get('tls_ms'))} | chờ máy chủ {f_(m_.get('server_wait_ms'))} | "
-                         f"TTFB {f_(m_.get('ttfb_ms'))} | truyền sau byte đầu {f_(m_.get('transfer_ms'))} | ffprobe {f_(verify_ms)}")
+                         f"TTFB {f_(m_.get('ttfb_ms'))} | truyền sau byte đầu {f_(m_.get('transfer_ms'))} | ffprobe {f_(verify_ms)}"
+                         + _v2_net_note(m_))
             except Exception as e:  # noqa: BLE001 — số đo không bao giờ làm hỏng việc tải
                 self.log(f"⚠️ ghi số đo mạng lỗi: {type(e).__name__}: {e}")
             det = self.race.get(vid) or {}

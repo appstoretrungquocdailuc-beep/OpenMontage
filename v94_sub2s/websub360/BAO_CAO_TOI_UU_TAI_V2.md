@@ -147,6 +147,14 @@ Thêm (không có trong yêu cầu, chỉ làm cho an toàn hơn): **bất kỳ 
 (đoán 302, hedge, mở sẵn, link client khác). Cờ tắt hết thì cơ chế này không có tác dụng gì và mọi đường lỗi giữ y bản cũ.
 
 ## 4. Hướng dẫn 5 dòng (đo thật trên máy bạn)
+
+**Cài đặt (2 chỗ):** (a) chép toàn bộ nội dung thư mục `websub360` trong zip đè vào thư mục WS360 đang dùng (không có `config.json`,
+database, Excel, secret trong zip nên không mất gì); (b) chép `TAM_PATCH\tam_INSTANT_POST.py` đè lên đúng file mà `"tam_path"` trong
+`config.json` trỏ tới (nhớ sao lưu file cũ) — bước (a) KHÔNG cập nhật TAM. **Kiểm từ log khi khởi động:** dòng `⚙️ TẢI: … nhớ 302 BẬT …`
+(có dòng này = đang chạy tải v2) và dòng `🎬 TikTok: … | TAM 5.5.0-TEST-NET (…)` (= TAM đã cập nhật; mỗi lần đăng có thêm dòng
+`🌐 [UPLOAD_NET]`). Dòng `🌐 MẠNG` của từng video có thêm `| v2: bỏ 302 … ; mở sẵn … ; bắn kép …`. Video ĐẦU TIÊN của mỗi cụm máy chủ
+vẫn đi đủ các chặng 302 (để học); từ video thứ 2 cùng cụm (trong 10 phút) mới bỏ được.
+
 1. Tắt WS360 đang chạy (để mạng không bị chia), giữ nguyên `config.json` hiện tại (bench tự đổi cờ cho từng biến thể).
 2. Chạy `BENCH_TAI_360.bat` → nhập **3–4 ID Shorts khác dung lượng** (vd ~3 MB, ~6 MB, ~9 MB), cách nhau dấu cách.
 3. Chờ chạy xong (8 biến thể × ≥ 20 lượt mỗi biến thể; mỗi lượt lấy link MỚI, tải lại từ đầu, không đăng TikTok, không ghi Excel).

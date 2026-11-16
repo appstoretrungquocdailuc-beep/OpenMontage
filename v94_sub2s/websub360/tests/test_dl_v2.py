@@ -1049,3 +1049,15 @@ def test_429_pause_survives_restart_and_recover_keeps_next_try(tmp_path, monkeyp
     e.recover()
     nb, _, job = e.dlq.get_nowait()
     assert nb >= time.time() + 25 and job["not_before"] == nb
+
+
+def test_startup_and_per_video_logs_show_v2_state(tmp_path):
+    """Người dùng tự kiểm từ log: cờ tải v2 nào đang bật, và mỗi video v2 đã làm gì."""
+    e = T.make_engine(tmp_path, T.CH[:1], excel_enabled=False)
+    e.start(websub=False)
+    e.stop()
+    line = next(l for l in e._logs if "⚙️ TẢI:" in l)
+    assert "nhớ 302 BẬT" in line and "hedge BẬT (120 ms)" in line and "range_connections 1" in line
+    note = ws._v2_net_note({"redirect_skip": "host", "mn_preconnect": 2, "hedge_sent": True, "hedge_win": "replica"})
+    assert "bỏ 302 (đoán theo host)" in note and "mở sẵn 2" in note and "replica thắng" in note
+    assert ws._v2_net_note({"hops": 3}) == ""

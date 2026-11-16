@@ -189,7 +189,8 @@ class TikTokBridge:
         else:
             pre = pids
         self.log(f"🎬 TikTok: {len(pids)} profile từ cột {self.cfg.get('col_profile', 'C')} | chế độ {mode} → mở sẵn {len(pre)} | "
-                 f"mở đồng thời tối đa {self.cfg.get('open_concurrency', 2)} | {self.stats['genlogin']}"
+                 f"mở đồng thời tối đa {self.cfg.get('open_concurrency', 2)} | {self.stats['genlogin']} | "
+                 f"TAM {getattr(self.tam, 'BACKEND_VERSION', '?')} ({self.cfg.get('tam_path') or 'tam_INSTANT_POST.py'})"
                  + (" | ⚠️ CHẠY THỬ: KHÔNG bấm Post" if self.cfg.get("tiktok_dry_run") else ""))
         for pid in pids:
             self._slot(pid)
