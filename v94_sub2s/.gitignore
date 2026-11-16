@@ -7,3 +7,4 @@ urls.txt
 benchmark_config.json
 perf_report/telemetry_2*.jsonl
 _temp_yt480p/
+backup/perf_report/
