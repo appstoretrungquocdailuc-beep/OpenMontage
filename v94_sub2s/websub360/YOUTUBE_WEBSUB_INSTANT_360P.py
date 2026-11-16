@@ -1111,6 +1111,8 @@ def _follow(url, headers=None, method="GET", preload=False, timeout=None):
         if r.status >= 400:
             ra = r.headers.get("Retry-After")
             r.close()
+            if r.status == 429 and _v2_spec_flags():
+                note_429()                              # v2: tạm dừng suy đoán NGAY (mọi worker), không đợi lần thử kết thúc
             raise HttpStatus(r.status, float(ra) if ra and ra.isdigit() else None)
         return r, cur
     raise HttpStatus(310)
@@ -1293,8 +1295,13 @@ def _close_quiet(r):
 def mark_block(info, e):
     """Ghi nhận 403/410/429 xảy ra ở BẤT KỲ request nào của lần thử (kể cả nhánh phụ) → process() nhớ theo video: các lần thử sau
     không request suy đoán, không thử link client khác."""
-    if info is not None and isinstance(e, HttpStatus) and e.code in (403, 410, 429) and info.get("saw_block") != 429:
-        info["saw_block"] = e.code                      # 429 được giữ ưu tiên
+    if info is None or not isinstance(e, HttpStatus) or e.code not in (403, 404, 410, 429):
+        return
+    for d in (info, info.get("blk")):                   # blk: trạng thái chung của 2 luồng DASH (hình + tiếng) cùng 1 video
+        if isinstance(d, dict) and d.get("saw_block") != 429:
+            d["saw_block"] = e.code                     # 429 được giữ ưu tiên
+            if e.code == 429:
+                d["saw_429_exc"] = e                    # giữ Retry-After
 
 
 def _hedge_error(tag, u, e, on_primary_fail, info=None):
@@ -1395,8 +1402,9 @@ def _v2_spec_flags() -> bool:
 
 def _speculative_ok(info) -> bool:
     """Request suy đoán (đoán 302, hedge, mở sẵn mn=) chỉ khi: lần thử trước không bị 403/429, không phải lượt dùng link client khác
-    sau 403, và chưa có 429 nào trong 10 phút qua."""
-    return not info.get("no_spec") and not info.get("no_hedge") and not spec_paused()
+    sau 403, lần thử này (cả luồng hình lẫn tiếng của DASH) chưa gặp 403/404/410/429, và chưa có 429 nào trong 10 phút qua."""
+    return (not info.get("no_spec") and not info.get("no_hedge") and not info.get("saw_block")
+            and not (info.get("blk") or {}).get("saw_block") and not spec_paused())
 
 
 def _open_media(url, info, allow_hedge=True, headers=None):
@@ -1429,12 +1437,21 @@ def _open_media(url, info, allow_hedge=True, headers=None):
                     raise                                          # có 429 (ở đây hoặc nơi khác) → không gửi thêm request nào
                 info["no_spec"] = True                             # quay về URL gốc NGAY (cùng lần thử): đúng 1 GET thường
                 info.pop("hedge_win", None)
-                return _follow(url, headers=headers)
+                try:
+                    return _follow(url, headers=headers)
+                except HttpStatus as e2:
+                    mark_block(info, e2)
+                    raise
     if spec and NET_OPTS.get("net_mn_preconnect") and not info.get("no_preconnect"):
         pre = mn_preconnect(url)
         if pre:
             info["mn_preconnect"] = len(pre)
-    return open_one(url)
+    try:
+        return open_one(url)
+    except HttpStatus as e:
+        if _v2_spec_flags():
+            mark_block(info, e)
+        raise
 
 
 def _hedge_delay_s():
@@ -1466,7 +1483,7 @@ def download_single(url: str, dest: Path, info: dict, cancel: threading.Event | 
     try:
         # v2 #8: khúc 1 MiB + ghi thẳng (urllib3 đã đệm) | bản trước: khúc 256 KB + bộ đệm file 1 MiB.
         # Khúc ĐẦU của v2 vẫn 256 KB → mốc 'byte đầu' (ttfb_ms/transfer_ms) đo y như bản trước, so sánh được giữa các biến thể.
-        with open(dest, "wb", buffering=0 if v2 else 1024 * 1024) as f:
+        with open(dest, "wb", buffering=0 if (v2 and not getattr(r, "chunked", False)) else 1024 * 1024) as f:
             for chunk in (_chunks_v2(r) if v2 else r.stream(256 * 1024)):
                 if first is None:
                     first = time.perf_counter_ns()
@@ -1518,8 +1535,18 @@ def download_ranges(url: str, dest: Path, size: int, n: int, info: dict, cancel=
         if pre:
             info["mn_preconnect"] = len(pre)
 
+    v2s = _v2_spec_flags()
+    stop_parts = threading.Event()
+
     def one(a, b):
-        rr, fin = _follow(url, headers={"Range": f"bytes={a}-{b}"}, preload=False)
+        try:
+            rr, fin = _follow(url, headers={"Range": f"bytes={a}-{b}"}, preload=False)
+        except HttpStatus as e:
+            if v2s:
+                mark_block(info, e)                        # ghi NGAY (luồng khác/worker khác thấy liền), không đợi mọi đoạn xong
+                if e.code == 429:
+                    stop_parts.set()                       # các đoạn còn lại dừng sớm
+            raise
         hops_all.extend(getattr(rr, "_ws_hops", []) or [])
         finals.append(fin)
         if rr.status != 206:
@@ -1537,6 +1564,8 @@ def download_ranges(url: str, dest: Path, size: int, n: int, info: dict, cancel=
                         firsts.append(time.perf_counter_ns())
                     if cancel is not None and cancel.is_set():
                         raise InterruptedError("dừng")
+                    if stop_parts.is_set():
+                        raise IOError("dừng đoạn: đoạn khác bị HTTP 429")
                     f.write(chunk)
                     got += len(chunk)
             if got != b - a + 1:
@@ -2293,6 +2322,8 @@ class Engine:
                                 itags=",".join(str(f["itag"]) for f in (pick["video"], pick["audio"]) if f),
                                 download_started_at=iso(), expected_size=exp_size or None)
             info_v, info_a = {}, {}
+            if _v2_spec_flags():
+                info_v["blk"] = info_a["blk"] = {}                       # v2: 403/429 ở luồng tiếng → luồng hình không suy đoán (và ngược lại)
             prev_err = str((row["error"] if row is not None and "error" in row.keys() else "") or "")
             if re.search(r"HTTP (403|410|429)", prev_err) or vid in self._dl_caution:
                 # v2: lần thử trước bị 403/410/429 → lần này KHÔNG request suy đoán nào (hedge, đoán 302, mở sẵn mn=) và không thử lại
@@ -2330,7 +2361,19 @@ class Engine:
                             errs.append(e)
                     th = threading.Thread(target=_a, daemon=True, name=f"audio-{vid}")
                     th.start()
-                self._fetch(pick["video"], vtmp, info_v, max(1, int(self.cfg.get("dash_range_connections", 4))), cancel)
+                try:
+                    self._fetch(pick["video"], vtmp, info_v, max(1, int(self.cfg.get("dash_range_connections", 4))), cancel)
+                except Exception:
+                    if th is not None and _v2_spec_flags():       # v2: hình lỗi → dừng tiếng, gom lỗi của tiếng (429 được báo trước)
+                        cancel.set()
+                        th.join(timeout=15)
+                        th = None
+                        for x in errs:
+                            mark_block(info_a, x)
+                        e429 = next((x for x in errs if isinstance(x, HttpStatus) and x.code == 429), None)
+                        if e429 is not None:
+                            raise e429
+                    raise
                 if th:
                     th.join()
                     th = None
@@ -2445,12 +2488,16 @@ class Engine:
                 if len(self._dl_caution) > 5000:
                     self._dl_caution.clear()
                 self._dl_caution.add(vid)                     # v2: các lần thử sau của video này: không suy đoán, không link client khác
-            if any(d_.get("saw_block") == 429 for d_ in inf_) and not (isinstance(e, HttpStatus) and e.code == 429):
-                e = HttpStatus(429)                           # 429 ở nhánh phụ bị lỗi khác che → vẫn chờ ≥ 10 s như 429
+            seen_blk = max([int(d_.get("saw_block") or 0) for d_ in inf_ if d_.get("saw_block") in (403, 404, 410)]
+                           + [999 for d_ in inf_ if d_.get("saw_block") == 429] + [0])
+            if seen_blk == 999 and not (isinstance(e, HttpStatus) and e.code == 429):
+                e = next((d_.get("saw_429_exc") for d_ in inf_ if d_.get("saw_429_exc") is not None), None) or HttpStatus(429)
+            err_tag = (f" [đã gặp HTTP {429 if seen_blk == 999 else seen_blk}]"
+                       if seen_blk and not isinstance(e, HttpStatus) else "")   # lần thử sau (kể cả sau khởi động lại) vẫn thận trọng
             sched = list(self.cfg.get("retry_schedule_sec") or [1, 2, 5])
             fatal = isinstance(e, Fatal) or (isinstance(e, HttpStatus) and e.code in (404, 410))
             if fatal or attempts + 1 > len(sched):
-                self.db.upd(vid, state="FAILED", error=f"{type(e).__name__}: {str(e)[:200]}")
+                self.db.upd(vid, state="FAILED", error=f"{type(e).__name__}: {str(e)[:200]}{err_tag}")
                 self.stats["failed"] += 1
                 self.log(f"❌ FAILED {vid} sau {attempts + 1} lần: {type(e).__name__}: {redact(str(e))[:200]}")
                 return "FAILED"
@@ -2465,7 +2512,7 @@ class Engine:
                 self.retry_gen[vid] = g
                 job = dict(job, not_before=time.time() + wait, gen=g)
                 self.retry_jobs[vid] = job
-            self.db.upd(vid, state="RETRY_WAIT", next_try=time.time() + wait, error=f"{type(e).__name__}: {str(e)[:200]}")
+            self.db.upd(vid, state="RETRY_WAIT", next_try=time.time() + wait, error=f"{type(e).__name__}: {str(e)[:200]}{err_tag}")
             self.log(f"⏳ {vid}: {type(e).__name__}: {redact(str(e))[:160]} → thử lại sau {wait}s (lần {attempts + 1}/{len(sched)})"
                      + (" — nếu nguồn phát hiện còn lại báo video này, thử lại ngay" if self.mode == "PARALLEL" else ""))
             self.dlq.put((job["not_before"], next(self.seq), job))
@@ -2516,7 +2563,9 @@ class Engine:
             info.update(no_spec=True, no_hedge=True, no_preconnect=True, alt_tried=True)
             info.pop("redirect_skip", None)
             tried = {fmt.get("url")}
-            for client, fut in alts:                          # v2 #5: link của client khác ĐÃ VỀ, cùng itag + dung lượng → thử ngay
+            for client, fut in alts:
+                if spec_paused():                             # 429 (worker khác) trong lúc đang thử link phụ → dừng
+                    raise e                          # v2 #5: link của client khác ĐÃ VỀ, cùng itag + dung lượng → thử ngay
                 if not fut.done():
                     continue
                 try:
@@ -2556,7 +2605,7 @@ class Engine:
                 info["probed_size"] = size
             except Exception as e:  # noqa: BLE001
                 info["probe_error"] = f"{type(e).__name__}"
-                if isinstance(e, HttpStatus) and e.code in (403, 410, 429) and _v2_spec_flags():
+                if isinstance(e, HttpStatus) and e.code in (403, 404, 410, 429) and _v2_spec_flags():
                     mark_block(info, e)                       # v2: GET sau đó là GET thường (không suy đoán) — cờ tắt: không đổi gì
                     info.update(no_spec=True, no_hedge=True, no_preconnect=True)
                     if e.code == 429:
@@ -4510,7 +4559,8 @@ def bench_dl_summary(base, names, summary, ref="warm_all", min_gain_ms=50.0, tol
             reason += f"; có thể chậm hơn {prev} (trong nhiễu)"
         if n_paused and v in V2_SPECULATIVE:
             reason += f"; {n_paused} lượt đo khi đang tạm dừng vì 429 (tính năng v2 bị tắt)"
-        out[v] = {"verdict_vs_ref": vref, "win_vs_ref": vref == "WIN", "incremental_ok": inc_state == "ok", "inc_state": inc_state,
+        out[v] = {"inc_vs": prev if inc_txt != "-" else None,
+                  "verdict_vs_ref": vref, "win_vs_ref": vref == "WIN", "incremental_ok": inc_state == "ok", "inc_state": inc_state,
                   "recommend_on": decision == "on", "decision": decision, "gain_median_ms": round(dm, 1), "gain_p90_ms": round(d9, 1),
                   "need_gain_ms": need, "ci_gain_median": cim, "ci_gain_p90": ci9, "error_rate": round(erate(x), 3), "reason": reason,
                   "paused_runs": n_paused}
@@ -4530,8 +4580,14 @@ def bench_dl_summary(base, names, summary, ref="warm_all", min_gain_ms=50.0, tol
             dec = "off" if fa["inc_state"] == "slower" else "inconclusive"
             why = "v2_full_auto so với v2_full: " + fa["reason"]
         else:
-            dec, why = "on", "warm_all_auto thắng warm_all ≥ 100 ms" + (" và v2_full_auto không chậm hơn v2_full" if fa else "")
+            dec = "on"
+            why = "warm_all_auto thắng warm_all ≥ 100 ms" + (
+                " và v2_full_auto không chậm hơn v2_full" if fa and fa.get("inc_vs") == "v2_full"
+                else " (chưa so được v2_full_auto với v2_full)" if fa else "")
         out["range_auto"] = {"decision": dec, "recommend_on": dec == "on", "reason": why}
+        for k in ("warm_all_auto", "v2_full_auto"):              # dòng riêng không được trái kết luận chung của range auto
+            if k in out and dec != "on" and out[k]["decision"] == "on":
+                out[k].update(decision=dec, recommend_on=False, reason=out[k]["reason"] + f"; range auto chung: {dec}")
         lines += ["", "**range_connections = \"auto\"**: " + {"on": "✅ có thể bật", "off": "⏸ giữ range_connections = 1",
                                                               "inconclusive": "❔ chưa kết luận — giữ range_connections = 1"}[dec]
                   + f" ({why})"]

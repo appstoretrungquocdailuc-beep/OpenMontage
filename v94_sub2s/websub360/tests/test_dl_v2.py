@@ -734,15 +734,19 @@ def test_video_remembers_block_across_attempts_even_if_last_error_is_not_http(tm
     assert len(gvs.requests_for(f"/vp/{vid}_a")) == 1                                # link phụ: đúng 1 lần cho cả video
 
 
+# số TỔNG (ms) của lần bench mock đã được review vòng 2 dùng làm ví dụ (commit 93ff0f3) — cố định trong test, không đọc file CSV
+_R2_MOCK = {"warm_all": [640, 2003, 638, 1986, 1873, 573, 590, 655, 1984, 576, 574, 637, 639, 654, 651, 637, 632, 655, 629, 2006],
+            "v2_ssl": [633, 645, 648, 2003, 635, 632, 630, 586, 646, 636, 640, 572, 631, 580, 640, 584, 631, 636, 1984, 634],
+            "v2_redirect": [577, 358, 372, 357, 374, 359, 357, 385, 355, 1708, 356, 1708, 351, 356, 1715, 361, 354, 363, 354, 368],
+            "v2_hedge": [371, 366, 356, 375, 376, 371, 554, 373, 370, 358, 356, 356, 363, 356, 360, 375, 359, 386, 355, 358],
+            "v2_full": [355, 492, 357, 542, 479, 356, 354, 355, 356, 358, 556, 542, 353, 373, 363, 358, 354, 545, 354, 364]}
+
+
 def test_summary_incremental_check_has_unsure_state_and_does_not_flip_on_one_run(tmp_path):
-    import csv as _csv
-    rows = list(_csv.DictReader(open(HERE.parent / "BENCH_DL_V2_MOCK.csv", encoding="utf-8")))
-    smp = {}
-    for r in rows:
-        if r["result"] == "DONE" and r["variant"] in ("warm_all", "v2_ssl", "v2_redirect", "v2_hedge", "v2_full"):
-            smp.setdefault(r["variant"], []).append(float(r["total_ms"]))
+    smp = {k: [float(x) for x in v] for k, v in _R2_MOCK.items()}
     out = ws.bench_dl_summary(tmp_path, list(smp), _summ(smp), samples=smp)
-    h2 = sorted(smp["v2_hedge"])[:-1] + [sorted(smp["v2_hedge"])[len(smp["v2_hedge"]) // 2]]   # bỏ lượt chậm nhất của v2_hedge
+    h2 = list(smp["v2_hedge"])
+    h2[h2.index(554.0)] = 370.0                                                      # đổi đúng 1 lượt của v2_hedge
     smp2 = dict(smp, v2_hedge=h2)
     out2 = ws.bench_dl_summary(tmp_path, list(smp2), _summ(smp2), samples=smp2)
     assert out["v2_full"]["decision"] != "on" and {out["v2_full"]["decision"], out2["v2_full"]["decision"]} != {"on", "off"}
@@ -768,3 +772,101 @@ def test_summary_marks_variants_measured_during_429_pause_inconclusive(tmp_path)
     smp = {"warm_all": _samples(rnd, 900), "v2_ssl": _samples(rnd, 899), "v2_redirect": _samples(rnd, 600)}
     out = ws.bench_dl_summary(tmp_path, list(smp), _summ(smp), samples=smp, paused={"v2_redirect": 4})
     assert out["v2_redirect"]["decision"] == "inconclusive" and "429" in out["v2_redirect"]["reason"]
+
+
+# ------------------------------------------------------------------ hồi quy review vòng 3
+@need_openssl
+def test_any_429_pauses_speculation_immediately_only_when_v2_on(hosts, cert, tmp_path):
+    hosts.add("/z", b"z" * 100)
+    hosts.host_status[(A3, "/z")] = 429
+    use(cert)                                                                        # cờ tắt: không đụng tới trạng thái v2
+    with pytest.raises(ws.HttpStatus):
+        ws._follow(hosts.url(A3, "/z"))
+    assert not ws.spec_paused()
+    use(cert, dl_hedge=True)
+    with pytest.raises(ws.HttpStatus):
+        ws._follow(hosts.url(A3, "/z"))
+    assert ws.spec_paused()                                                          # ghi NGAY lúc nhận 429, không đợi lần thử kết thúc
+
+
+@need_openssl
+def test_range_429_in_one_part_pauses_now_and_stops_other_parts(hosts, cert, tmp_path):
+    data = bytes(range(256)) * 4000
+    hosts.add("/q", data)
+    hosts.host_rules[A3] = {"server_wait": (0.6, 0, 0)}                              # các đoạn khác: header sau 0,6 s
+    real = ws._follow
+
+    def fake(url, headers=None, **k):
+        if int(headers["Range"].split("=")[1].split("-")[0]) > len(data) // 2:
+            if ws._v2_spec_flags():
+                ws.note_429()                                                        # như _follow thật khi nhận 429
+            raise ws.HttpStatus(429)
+        return real(url, headers=headers, **k)
+    use(cert, net_mn_preconnect=True)
+    seen = {}
+
+    info = {}
+
+    def watch():
+        time.sleep(0.25)
+        seen["paused_mid"] = ws.spec_paused()                                        # khi các đoạn khác CHƯA xong
+        seen["blk_mid"] = info.get("saw_block")                                      # ghi NGAY, không đợi mọi đoạn
+    monkeypatch_follow = ws._follow
+    ws._follow = fake
+    try:
+        threading.Thread(target=watch, daemon=True).start()
+        with pytest.raises(ws.HttpStatus) as ei:
+            ws.download_ranges(hosts.url(A3, "/q"), tmp_path / "q", len(data), 4, info)
+    finally:
+        ws._follow = monkeypatch_follow
+    assert ei.value.code == 429 and info["saw_block"] == 429 and seen["paused_mid"] is True and seen["blk_mid"] == 429
+
+
+def test_dash_streams_share_block_state():
+    ws.set_net_opts(dict(ws.NET_OPTS_OFF, dl_hedge=True))
+    blk = {}
+    info_v, info_a = {"blk": blk}, {"blk": blk}
+    assert ws._speculative_ok(info_v)
+    ws.mark_block(info_a, ws.HttpStatus(403))
+    assert not ws._speculative_ok(info_v) and blk["saw_block"] == 403
+    e = ws.HttpStatus(429, retry_after=12)
+    ws.mark_block(info_a, e)
+    ws.mark_block(info_a, ws.HttpStatus(403))
+    assert blk["saw_block"] == 429 and info_a["saw_429_exc"] is e                    # 429 giữ ưu tiên + giữ Retry-After
+
+
+@T.need_ff
+def test_hidden_block_is_written_into_error_and_hidden_429_keeps_retry_after(tmp_path, gvs, media, monkeypatch):
+    calls = []
+
+    def fetch(self, fmt, dest, info, n, cancel=None, alts=None):
+        calls.append(dict(info))
+        ws.mark_block(info, ws.HttpStatus(429, retry_after=12) if len(calls) == 1 else ws.HttpStatus(403))
+        raise IOError("mất kết nối giữa chừng")
+    monkeypatch.setattr(ws.Resolver, "resolve", lambda self, v, deadline_s=2.5: T.plan_prog(gvs, media, v))
+    monkeypatch.setattr(ws.Engine, "_fetch", fetch)
+    e = T.make_engine(tmp_path, T.CH[:1], excel_enabled=False, retry_schedule_sec=[0.2, 0.2, 0.2])
+    e.start(websub=False)
+    vid = "HIDDEN42901"
+    t0 = time.time()
+    e.on_event(T.CH[0], vid, "WEBSUB", T.TS)
+    end = time.time() + 10
+    row = None
+    while time.time() < end:
+        row = e.db.one("SELECT * FROM videos WHERE video_id=?", (vid,))
+        if row is not None and row["state"] == "RETRY_WAIT":
+            break
+        time.sleep(0.05)
+    e.stop()
+    assert row["state"] == "RETRY_WAIT" and "HTTP 429" in row["error"]              # 429 bị IOError che → vẫn là 429
+    assert row["next_try"] - t0 >= 11.5 and vid in e._dl_caution                     # giữ Retry-After 12 s
+
+
+def test_range_auto_rows_never_contradict_combined_decision(tmp_path):
+    import random as _r
+    rnd = _r.Random(11)
+    smp = {"warm_all": _samples(rnd, 900), "v2_full": _samples(rnd, 760), "v2_full_auto": _samples(rnd, 760),
+           "warm_all_auto": _samples(rnd, 899)}
+    names = ["warm_all", "v2_full", "v2_full_auto", "warm_all_auto"]
+    out = ws.bench_dl_summary(tmp_path, names, _summ(smp), samples=smp)
+    assert out["range_auto"]["decision"] == "off" and out["v2_full_auto"]["decision"] != "on"
