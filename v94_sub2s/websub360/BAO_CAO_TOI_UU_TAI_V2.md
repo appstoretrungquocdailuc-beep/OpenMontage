@@ -14,8 +14,9 @@
   ~550 ms thay vì ~1,7 s). Đây là số MOCK — trên YouTube thật có thể khác nhiều (vd nếu Google không 302 thì #2 không lợi gì).
 - #1 (SSLContext dùng chung) **không thể hiện được trên Linux**: chi phí nằm ở việc duyệt kho chứng chỉ Windows, mock không mô phỏng
   được. Chỉ `BENCH_TAI_360.bat` trên Windows mới đo được.
-- Vòng review đối kháng (70 agent, 4 góc nhìn: đúng/sai, an toàn YouTube, đồng thời, bench) xác nhận **12 lỗi** ở bản đầu → **đã sửa
-  hết, mỗi lỗi có test hồi quy** (mục 3). Quan trọng nhất: sau 403/429 bản đầu có thể gửi thêm 2–3 request ngay lập tức → nay **không**.
+- **3 vòng review đối kháng** (≈ 160 agent; góc nhìn: đúng/sai, an toàn YouTube, đồng thời, bench; mỗi phát hiện phải qua agent bác bỏ)
+  → **4 vòng sửa**, mỗi lỗi có test hồi quy (mục 3). Quan trọng nhất: sau 403/429 bản đầu có thể gửi thêm 2–3 request ngay lập tức → nay
+  **không**: mọi 429 ghi nhận ngay, tạm dừng mọi tối ưu gửi thêm request 10 phút (giữ cả khi khởi động lại), lần thử sau chờ ≥ 10 s.
 
 ## 1. Bảng hạng mục
 
@@ -76,7 +77,7 @@ của `v2_hedge`/`v2_full` đến từ các lượt request chính rơi vào đu
 | #8 tải 8,67 MB loopback (30 lượt) | 10,57 ms | 10,79 ms | không phân biệt được trên mock; giữ vì yêu cầu, rollback bằng `dl_hotpath_v2` |
 
 
-## 3. Review đối kháng (3 vòng)
+## 3. Review đối kháng (3 vòng review, 4 vòng sửa)
 
 ### Vòng 1 — 12 lỗi xác nhận ở bản đầu (70 agent)
 
@@ -115,7 +116,28 @@ Kết quả: 3/12 lỗi vòng 1 sửa trọn; 9 lỗi còn "ca biên"; 18 phát 
 | Bench: thiếu hoặc lỗi hết `warm_all_auto` mà vẫn ghi "range auto có thể bật"; dòng auto tự ghi BẬT trái kết luận chung | Range auto BẮT BUỘC có `warm_all_auto`; biến thể 0 lượt thành công = lỗi tăng; dòng auto trỏ về kết luận chung | `test_summary_range_auto_needs_warm_all_auto_and_failed_variants_count` |
 | Chặn đoán theo cụm bị bỏ qua khi máy chủ khác cùng cụm có cặp riêng (bị bác là "không vi phạm", vẫn làm cho chặt) | Kiểm chặn cụm trước mọi tra cứu | (phần cuối test đoán sai) |
 
-⟨ROUND3⟩
+### Vòng 3 — kiểm lại bản sửa vòng 2 + tìm lỗi mới (chỉ đọc code; chạy tiếp 23/31 agent sau khi chạm giới hạn sử dụng)
+- 27 mục của vòng 2: **19 đã sửa trọn**; 4 mục "một phần" là kết quả đọc TRƯỚC bản sửa `c12b7bd` (đã sửa ngay sau đó); 5 mục mới
+  "một phần" đều ở phần bench → sửa ở vòng 4.
+- 3 nhánh tìm lỗi mới (đúng/sai + giữ nguyên khi tắt cờ; an toàn YouTube; bench + đồng thời) → 15 phát hiện. Tất cả đã sửa (vòng 4).
+
+### Vòng 4 — sửa các phát hiện của vòng 3
+
+| Lỗi (vòng 3) | Sửa | Test hồi quy |
+|---|---|---|
+| 429 ở 1 đoạn Range / luồng tiếng DASH chỉ được ghi nhận khi mọi đoạn xong → worker khác vẫn suy đoán trong lúc đó | Ghi nhận 429 NGAY trong `_follow` (mọi 429); đoạn Range gặp 429 → ghi ngay + dừng các đoạn còn lại; 2 luồng DASH dùng chung trạng thái chặn; luồng hình lỗi → dừng + gom lỗi luồng tiếng | `test_any_429_pauses_speculation_immediately`, `test_range_429_in_one_part_pauses_now_and_stops_other_parts`, `test_dash_streams_share_block_state` |
+| Máy chủ ĐOÁN trả 404/410 đúng lúc tạm dừng 429 bắt đầu → video bị FAILED vĩnh viễn (URL thật chưa được thử) | Trường hợp đó → báo 429 (thử lại sau ≥ 10 s), không bao giờ để 404/410 của máy chủ đoán thành lỗi của video | `test_predicted_host_404_during_new_429_pause_is_retryable_not_fatal` |
+| 429 bị che → lỗi thật (Fatal, ffprobe, đổi tên) bị ghi đè thành 429 | Giữ lỗi thật (ghi + xét Fatal), chỉ áp hệ quả của 429 (chờ ≥ 10 s / Retry-After, không thử sớm) + ghi chú `[đã gặp HTTP 429]` | `test_fatal_error_is_not_rewritten_by_hidden_429`, `test_hidden_block_is_written_into_error_and_hidden_429_keeps_retry_after` |
+| Trạng thái "thận trọng" và tạm dừng 429 mất khi khởi động lại tool; khôi phục bỏ qua lịch chờ của 429 | Ghi chú `[đã gặp HTTP …]` vào lỗi trong DB; mốc hết tạm dừng lưu ở `ws360_spec_pause.txt` (đã thêm vào `.gitignore`); khôi phục giữ `next_try` của video bị 429 | `test_429_pause_survives_restart_and_recover_keeps_next_try` |
+| Range auto vẫn chia 2–4 đoạn ngay sau 403/429 hoặc khi đang tạm dừng; lỗi Range auto xử lý kiểu cũ (429 bị che) | Range auto → 1 kết nối khi đang thận trọng/tạm dừng; lỗi Range auto xử lý như v2 | `test_range_auto_uses_one_connection_while_cautious_or_paused` |
+| DASH: chỉ chờ luồng tiếng 15 s rồi bỏ (file tạm mồ côi trên Windows) | Chờ 30 s; còn chạy thì khối `finally` chờ tiếp như bản cũ | (đọc code) |
+| Link phụ: chỉ kiểm tạm dừng 429 lúc bắt đầu | Kiểm lại trước MỖI link | (đọc code) |
+| Bench: chạy lượt tiếp 0,3 s sau một 429 | Chờ ≥ 10 s (hoặc tới `next_try`) sau mọi 429; HTTP/2 cũng vậy | (đọc code) |
+| Bench: lọc "lượt sạch" chỉ ở phía v2 → bỏ riêng 1 video chậm làm nhóm KHÔNG tác dụng trông nhanh hơn → **BẬT sai** (mức cao) | So **theo cặp** (video, vòng): lượt bị loại ở biến thể này cũng bị loại ở phía được so | `test_summary_matched_pairs_do_not_reward_dropping_a_slow_video` |
+| Bench: lượt mà chính request thêm (hedge/đoán) bị 429 bị coi là "tắt suy đoán" và bỏ đi | Giữ lượt đó, đếm `own_429` → nhóm cờ đó **GIỮ TẮT** (lỗi an toàn) | `test_summary_own_429_keeps_group_off_and_failed_clean_runs_are_off` |
+| Bench: trạng thái thận trọng kéo dài suốt bench; biến thể có lượt sạch nhưng không lượt nào thành công lại ghi "chưa kết luận" | Mỗi lượt bench xoá trạng thái thận trọng của video (tạm dừng 429 thì giữ); DONE cũng xoá; có lượt sạch mà 0 thành công → GIỮ TẮT | (như trên) |
+| Bench: so với biến thể trước chỉ dựa biến thể liền trước (kể cả khi nó lỗi hết hoặc chưa kết luận); < 5 lượt vẫn kết luận | So với biến thể liền trước CÓ số đo VÀ biến thể gần nhất đã có kết luận chắc (lấy kết quả xấu hơn); < 5 lượt → CHƯA KẾT LUẬN | `test_summary_compares_with_last_firm_variant_and_skips_failed_predecessor`, `test_summary_with_fewer_than_5_runs_is_inconclusive` |
+
 
 Thêm (không có trong yêu cầu, chỉ làm cho an toàn hơn): **bất kỳ 429 nào từ googlevideo → 10 phút không gửi request suy đoán nào**
 (đoán 302, hedge, mở sẵn, link client khác). Cờ tắt hết thì cơ chế này không có tác dụng gì và mọi đường lỗi giữ y bản cũ.
@@ -145,6 +167,7 @@ Thêm (không có trong yêu cầu, chỉ làm cho an toàn hơn): **bất kỳ 
 Tất cả về giá trị cột phải = đúng đường code bản trước (test `test_all_flags_off_takes_exactly_the_old_path`). Lớp mạng cũ hơn nữa:
 `"net_mode": "legacy"`. Bản đầy đủ trước v2: `backup/YOUTUBE_WEBSUB_INSTANT_360P_truoc_toi_uu_tai_v2.py`, `backup/ws360_net_truoc_toi_uu_tai_v2.py`.
 `config.json` của bạn KHÔNG bị ghi đè: key nào thiếu thì lấy mặc định ở trên → muốn giữ hành vi cũ hoàn toàn, thêm các dòng ở cột phải.
+File mới duy nhất tool tự tạo: `ws360_spec_pause.txt` (mốc hết tạm dừng 10 phút sau HTTP 429; xoá được bất cứ lúc nào, chỉ ảnh hưởng tối ưu v2).
 
 ## 6. Kết quả `pytest` trước/sau
 
