@@ -157,7 +157,7 @@ def _v94_env(name, default):
         return default
 
 
-V94_VERSION = "V9.7.1-SUB2S"   # V9.7 + làm nóng ffmpeg cho 360p <60s
+V94_VERSION = "V9.8-SUB2S"     # V9.7.1 + RANGE: prealloc nền, race learn, worker tự học (xem BAO_CAO_V98.md)
 # Range: kiểm tra Content-Range start/end khớp đúng request (V9.3 chỉ đọc tổng).
 V94_STRICT_CONTENT_RANGE = _v94_env("STRICT_CONTENT_RANGE", True)
 # Range: size thật ≠ ước tính → co/giãn tại chỗ, không vứt dữ liệu và tải lại (V9.3 = restart).
@@ -311,14 +311,14 @@ def _v98_env(name, default):
 
 
 # Preallocation (Windows: _chsize ghi số 0, log thật 96ms/49MiB) chạy SONG SONG với đợt GET đầu (TTFB ~400ms) thay vì
-# trước nó; lần ghi đầu tiên chờ preallocation xong. (False = V9.7.1: truncate xong mới gửi GET)
-V98_PREALLOC_ASYNC = _v98_env("PREALLOC_ASYNC", False)
+# trước nó; lần ghi đầu tiên chờ preallocation xong. MẶC ĐỊNH BẬT. (V98_PREALLOC_ASYNC=0 = V9.7.1: truncate xong mới gửi GET)
+V98_PREALLOC_ASYNC = _v98_env("PREALLOC_ASYNC", True)
 # FIRST-WAVE-RACE: "fixed" = V9.7.1 (theo V94_FIRST_WAVE_RACE_MAX); "adaptive" = chỉ V98_RACE_PROBES đoạn đầu bắn kép
 # (thăm dò replica); các đoạn đợt đầu còn lại đi host chính và CHỈ hedge sang replica khi replica đã thắng thăm dò
 # (nhanh hơn thật) hoặc host chính chưa trả header sau V98_FIRST_HEDGE_SEC. File nhỏ (<= V94_RACE_ALL_IF_WORKERS_LE
-# đoạn) vẫn race hết như cũ. "learn" = như adaptive nhưng CHỈ khi các job gần đây replica không thắng lần nào
-# (xem V98_RACE_LEARN_*); còn lại race tất cả như "fixed".
-V98_RACE_MODE = str(os.environ.get("V98_RACE_MODE", "fixed") or "fixed").strip().lower()
+# đoạn) vẫn race hết như cũ. "learn" (MẶC ĐỊNH V9.8) = như adaptive nhưng CHỈ khi các job gần đây replica không thắng
+# lần nào (xem V98_RACE_LEARN_*); còn lại race tất cả như "fixed". Quay về V9.7.1: V98_RACE_MODE=fixed
+V98_RACE_MODE = str(os.environ.get("V98_RACE_MODE", "learn") or "learn").strip().lower()
 V98_RACE_PROBES = _v98_env("RACE_PROBES", 2)
 # "learn": nhớ N job gần nhất (trong TTL giây). Chưa có lịch sử, hoặc replica vừa THẮNG → race tất cả như V9.7.1;
 # replica không thắng job nào gần đây → chỉ V98_RACE_PROBES đoạn thăm dò (bớt ~30% request, không chậm hơn).
@@ -355,10 +355,10 @@ V98_PART_MIB = _v98_env("PART_MIB", 0.0)
 # aria2 RPC: số kết nối (0 = _aria2_tuned_split như V9.7.1) và max-tries (2 = V9.7.1; 1 = không tự thử lại khi 403/429).
 V98_ARIA2_SPLIT = _v98_env("ARIA2_SPLIT", 0)
 V98_ARIA2_MAX_TRIES = _v98_env("ARIA2_MAX_TRIES", 2)
-# Chọn số worker TỰ HỌC theo đo thật (mặc định TẮT): file >= MIN_MIB, không ép số worker → luân phiên mức "lo" (heuristic
+# Chọn số worker TỰ HỌC theo đo thật (MẶC ĐỊNH BẬT ở V9.8; quay về V9.7.1: V98_WORKERS_LEARN=0): file >= MIN_MIB, không ép số worker → luân phiên mức "lo" (heuristic
 # V9.7.1) và "hi" (= lo × MUL, ≤ V98_SCALE_MAX); mỗi mức >= 2 mẫu thì dùng mức có Mbps truyền (median 4 job gần nhất)
 # cao hơn ≥ GAIN, ngang nhau → mức ít kết nối hơn (ít request hơn). Cứ 10 job thử lại mức thua 1 lần (mạng/CDN thay đổi).
-V98_WORKERS_LEARN = _v98_env("WORKERS_LEARN", False)
+V98_WORKERS_LEARN = _v98_env("WORKERS_LEARN", True)
 V98_WORKERS_LEARN_MUL = _v98_env("WORKERS_LEARN_MUL", 1.6)
 V98_WORKERS_LEARN_MIN_MIB = _v98_env("WORKERS_LEARN_MIN_MIB", 8.0)
 V98_WORKERS_LEARN_GAIN = _v98_env("WORKERS_LEARN_GAIN", 0.12)

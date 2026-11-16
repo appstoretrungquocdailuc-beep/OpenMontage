@@ -144,3 +144,13 @@ def get_qapp():
 @pytest.fixture(scope="session", autouse=True)
 def qapp():
     return get_qapp()
+
+
+@pytest.fixture(autouse=True)
+def _v98_reset_learning():
+    """V9.8: race 'learn' + worker tự học nhớ lịch sử giữa các job trong 1 tiến trình — mỗi test bắt đầu sạch."""
+    m = sys.modules.get("V9_4_SUB2S")
+    if m is not None and hasattr(m, "_V98_RACE_HIST"):
+        m._V98_RACE_HIST.clear()
+        m._V98_WL.clear()
+    yield

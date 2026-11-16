@@ -30,12 +30,27 @@ def wmode(v94, monkeypatch, request):
     return m
 
 
-def test_defaults_are_v971_behaviour(v94):
-    """Rollback: tắt hết cờ V9.8 = đúng V9.7.1. Giá trị mặc định ghi trong BAO_CAO_V98.md."""
-    assert v94.V98_WRITE_MODE in ("lock", "split", "pwrite")
-    assert v94.V98_RACE_MODE in ("fixed", "adaptive")
-    assert float(v94.V98_PART_MIB) == 0.0
+def test_v98_defaults(v94):
+    """Mặc định V9.8 = chỉ các thay đổi đã qua A/B (BAO_CAO_V98.md); phần còn lại giữ đúng V9.7.1."""
+    assert v94.V94_VERSION.startswith("V9.8")
+    assert v94.V98_PREALLOC_ASYNC is True and v94.V98_RACE_MODE == "learn" and v94.V98_WORKERS_LEARN is True
+    assert v94.V98_WRITE_MODE == "lock" and v94.V98_SCALE_UP is False and float(v94.V98_PART_MIB) == 0.0
     assert int(v94.V98_ARIA2_SPLIT) == 0 and int(v94.V98_ARIA2_MAX_TRIES) == 2
+
+
+def test_v98_rollback_env(monkeypatch):
+    """Biến môi trường V98_*=0 / fixed → đúng hành vi V9.7.1 (đọc lại module trong tiến trình con)."""
+    import subprocess
+    import sys
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    code = ("import sys; sys.path.insert(0, r'%s'); sys.path.insert(0, r'%s');"
+            "import conftest; conftest._install_pyside6_stub();"
+            "import V9_4_SUB2S as m;"
+            "print(m.V98_PREALLOC_ASYNC, m.V98_RACE_MODE, m.V98_WORKERS_LEARN)") % (root, root / "tests")
+    env = dict(os.environ, V98_PREALLOC_ASYNC="0", V98_RACE_MODE="fixed", V98_WORKERS_LEARN="0", QT_QPA_PLATFORM="offscreen")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, timeout=120, cwd=str(root))
+    assert out.stdout.strip().splitlines()[-1] == "False fixed False", out.stderr[-2000:]
 
 
 @pytest.mark.parametrize("wmode", WRITE_MODES, indirect=True)
@@ -209,7 +224,8 @@ def test_adaptive_race_uses_replica_when_main_slow(v94, gvs, tmp_path, monkeypat
 
 
 def test_adaptive_race_alt_403_safe(v94, gvs, tmp_path, monkeypatch):
-    data = make_payload(8 * MB, seed=3)
+    data = make_payload(16 * MB, seed=3)              # > V94_RACE_ALL_IF_WORKERS_LE đoạn (file nhỏ vẫn race hết như cũ)
+    monkeypatch.setattr(v94, "V94_RANGE_WORKERS_VIDEO", 12)
     monkeypatch.setattr(v94, "V98_RACE_MODE", "adaptive")
     real = gvs.add("/a403/real", data, hdr_delay=0.05)
     main = gvs.add("/a403/main", mode="redirect", to=real)
