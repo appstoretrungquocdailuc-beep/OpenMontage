@@ -1209,6 +1209,15 @@ def redirect_predict(url):
     return urlparse(url)._replace(netloc=dst).geturl(), how
 
 
+def redirect_blocked(url) -> bool:
+    """Nguồn (máy chủ/cụm) đang bị chặn đoán vì vừa đoán sai? (để bench biết lượt đó không đo được #2)"""
+    a = _netloc(url)
+    sn = _gv_parts(a)[1]
+    now = time.monotonic()
+    with _RDR_LOCK:
+        return _RDR_BLOCK.get(a, 0) > now or bool(sn and _RDR_BLOCK.get("sn:" + sn, 0) > now)
+
+
 def redirect_forget(url):
     """Dự đoán sai → bỏ cặp đã học VÀ chặn đoán cho nguồn đó (máy chủ + cụm) 10 phút: request về URL gốc sẽ 302 tới đúng đích cũ và
     dạy lại cặp đó, nên chỉ xoá thì lần sau lại đoán sai (mỗi video thêm 1 request bị từ chối)."""
@@ -1419,9 +1428,13 @@ def _open_media(url, info, allow_hedge=True, headers=None):
             rep = _replica_for(u)
             if rep:
                 return _hedged_follow(u, rep, _hedge_delay_s(), info, headers, on_primary_fail=on_fail)
+            if mn_netlocs(u):
+                info["hedge_blocked"] = True                       # mọi replica đang bị cấm → lượt này không hedge được
         return _follow(u, headers=headers)
     if spec and NET_OPTS.get("net_redirect_memory"):
         pred, how = redirect_predict(url)
+        if not pred and redirect_blocked(url):
+            info["rdr_blocked"] = True                             # đang chặn đoán (vừa đoán sai) → lượt này không đo được #2
         if pred:
             info.update(redirect_skip=how, skipped_to=_netloc(pred))
             try:
@@ -2452,7 +2465,7 @@ class Engine:
                                                             "headers_ms", "first_byte_after_hdr_ms", "ttfb_ms", "transfer_ms",
                                                             "tls_resumed", "redirect_skip", "redirect_skip_fail", "mn_preconnect",
                                                             "hedge_sent", "hedge_win", "fallback_client", "range_auto",
-                                                            "redirect_unconfirmed", "saw_block")},
+                                                            "redirect_unconfirmed", "saw_block", "rdr_blocked", "hedge_blocked")},
                        "integrity_ms": integrity_ms,
                        "ffprobe_ms": verify_ms, "net_mode": _NET_MODE}
                 self.db.upd(vid, net=json.dumps(net, ensure_ascii=False))
@@ -4358,7 +4371,7 @@ def bench_dl(cfg, base, ids, reps=None, variants=None):
                     time.sleep(0.3)
                     continue
                 t = time.perf_counter_ns()
-                paused0, p429_0 = spec_paused(), DL_STATS["spec_pause_429"]
+                paused0, p429_0, caution0 = spec_paused(), DL_STATS["spec_pause_429"], vid in eng._dl_caution
                 with _RDR_LOCK:
                     blocks0 = sum(1 for x in _RDR_BLOCK.values() if x > time.monotonic())
                 eng.db.x("INSERT INTO videos(video_id, channel_id, url, engine, detected_at, state) VALUES(?,?,?,?,?,?)",
@@ -4382,6 +4395,10 @@ def bench_dl(cfg, base, ids, reps=None, variants=None):
                            ("?" + str(mn.get("redirect_skip"))) if mn.get("redirect_unconfirmed") and mn.get("redirect_skip")
                            else (mn.get("redirect_skip") or "")),
                        "spec_paused": 1 if (paused0 or DL_STATS["spec_pause_429"] > p429_0) else 0, "rdr_blocks": blocks0,
+                       # lượt mà tối ưu gửi thêm request KHÔNG chạy được (tạm dừng 429 / video đang 'thận trọng' / chặn đoán / mọi replica
+                       # bị cấm) → không dùng để chấm các biến thể v2 có suy đoán
+                       "spec_off": 1 if (paused0 or DL_STATS["spec_pause_429"] > p429_0 or caution0 or mn.get("rdr_blocked")
+                                         or mn.get("hedge_blocked")) else 0,
                        "hedge_win": mn.get("hedge_win") or "", "hedge_sent": 1 if mn.get("hedge_sent") else 0,
                        "fallback_client": mn.get("fallback_client") or "",
                        "integrity_ms": row.get("integrity_ms"), "range_auto": mn.get("range_auto"),
@@ -4407,7 +4424,7 @@ def bench_dl(cfg, base, ids, reps=None, variants=None):
           "tới khi file đã tải xong + ffprobe xác minh + bàn giao (không tính TTFB 2 lần: TTFB nằm trong 'tải').", "",
           "| Phương án | lượt | lỗi | TỔNG | ≤1000 ms | resolver | setup resolver | chờ máy chủ resolver | TTFB | setup tải | "
           "chờ máy chủ tải | truyền | ffprobe | tls_resumed | redirect_skip | hedge_win (gốc/replica, trên số lượt có bắn kép) | "
-          "fallback_client | integrity_ms | đo khi đang tạm dừng vì 429 |",
+          "fallback_client | integrity_ms | lượt suy đoán bị tắt (429 / thận trọng / chặn đoán) |",
           "|" + "---|" * 19]
     summary = {}
     for v in names:
@@ -4429,7 +4446,7 @@ def bench_dl(cfg, base, ids, reps=None, variants=None):
                   f"(bắn kép {sum(1 for r in ok if r.get('hedge_sent'))}) | "
                   f"{sum(1 for r in ok if r.get('fallback_client'))} | "
                   f"{f_(tuple(pct([r['integrity_ms'] for r in ok if r.get('integrity_ms') is not None], p_) for p_ in (50, 90, 95)))} | "
-                  f"{sum(1 for r in rs if r.get('spec_paused'))}/{len(rs)} |")
+                  f"{sum(1 for r in rs if r.get('spec_off'))}/{len(rs)} |")
     md += ["", "Phương án: legacy = bản trước (kết nối nguội); fast_cold = lớp mạng mới không giữ ấm; warm_resolver = giữ ấm "
            "Innertube, máy chủ video nguội; warm_all = giữ ấm cả máy chủ video vừa dùng; _r2/_r4 = chia 2/4 đoạn Range; "
            "warm_apihost = resolver qua youtubei.googleapis.com. v2_*: mỗi biến thể bật THÊM 1 nhóm cờ tối ưu tải v2; "
@@ -4438,9 +4455,9 @@ def bench_dl(cfg, base, ids, reps=None, variants=None):
            "vừa đăng thật; thứ tự xoay vòng để mọi phương án chịu ảnh hưởng như nhau."]
     (base / "BENCH_DL.md").write_text("\n".join(md) + "\n", encoding="utf-8")
     print("\n".join(md))
-    samples = {v: [r["total_ms"] for r in rows if r["variant"] == v and r["result"] == "DONE" and r.get("total_ms") is not None]
-               for v in names}
-    paused = {v: sum(1 for r in rows if r["variant"] == v and r.get("spec_paused")) for v in names}
+    paused = {v: sum(1 for r in rows if r["variant"] == v and r.get("spec_off")) for v in names}
+    samples = {v: [r["total_ms"] for r in rows if r["variant"] == v and r["result"] == "DONE" and r.get("total_ms") is not None
+                   and not (v in V2_SPECULATIVE and r.get("spec_off"))] for v in names}   # biến thể suy đoán: chỉ lượt 'sạch' 
     concl = bench_dl_summary(base, names, summary, samples=samples, paused=paused)
     return {"rows": rows, "summary": summary, "conclusion": concl}
 
@@ -4470,39 +4487,71 @@ def bench_dl_summary(base, names, summary, ref="warm_all", min_gain_ms=50.0, tol
     (1) So với mốc warm_all (như yêu cầu): median VÀ P90 nhanh hơn ≥ 50 ms (range auto: ≥ 100 ms), lỗi không tăng, và — khi có số đo
         từng lượt — cận dưới khoảng tin cậy 90% (bootstrap) của cả 2 chênh lệch > 0. Chắc chắn KHÔNG đạt ngưỡng (cận trên < ngưỡng)
         hoặc lỗi tăng → GIỮ TẮT. Còn lại → CHƯA KẾT LUẬN.
-    (2) Các biến thể v2_* CỘNG DỒN → so với biến thể liền trước: 'chậm hơn' (chắc chắn chậm hơn > 25 ms ở median hoặc P90, hoặc lỗi
-        tăng) → GIỮ TẮT; 'ổn' (không chậm hơn quá 25 ms: điểm ước lượng, hoặc cận dưới KTC) → được xét BẬT; còn lại 'chưa rõ' → CHƯA
-        KẾT LUẬN.
-    (3) Biến thể v2 có lượt đo khi đang tạm dừng vì 429 (tính năng bị tắt để an toàn) → CHƯA KẾT LUẬN.
+    (2) Các biến thể v2_* CỘNG DỒN → so với biến thể liền trước CÓ SỐ ĐO và với biến thể gần nhất đã có kết luận chắc (lấy kết quả xấu
+        hơn): 'chậm hơn' (chắc chắn chậm hơn > 25 ms ở median hoặc P90, hoặc lỗi tăng) → GIỮ TẮT; 'ổn' → được xét BẬT; 'chưa rõ' →
+        CHƯA KẾT LUẬN.
+    (3) Biến thể v2 có suy đoán: chỉ chấm trên lượt 'sạch' (không tạm dừng 429, video không ở trạng thái thận trọng, không bị chặn đoán,
+        replica không bị cấm hết) — 'samples' do bench_dl lọc sẵn. Còn < 5 lượt sạch → CHƯA KẾT LUẬN.
+    (4) Có số đo từng lượt mà < 5 lượt thành công → CHƯA KẾT LUẬN (không kết luận từ vài lượt).
     Range auto: kết luận chung, BẮT BUỘC có warm_all_auto (so với warm_all, ≥ 100 ms) VÀ v2_full_auto không chậm hơn v2_full."""
     out = {}
+    use_s = samples is not None
     samples, paused = samples or {}, paused or {}
     lines = [f"# BENCH_DL_SUMMARY — {iso()} — mốc '{ref}' (TỔNG = resolve → tải → ffprobe)", ""]
-    if ref not in summary or summary[ref]["total_ms"][0] is None:
+    pc3 = lambda xs: tuple(pct(xs, p_) for p_ in (50, 90, 95))
+    stat = lambda v: dict(summary[v], total_ms=pc3(samples[v])) if (use_s and samples.get(v)) else summary[v]
+    if ref not in summary or stat(ref)["total_ms"][0] is None:
         lines.append(f"Không có (đủ) số đo mốc '{ref}' trong lần chạy này → không kết luận.")
         (base / "BENCH_DL_SUMMARY.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
         return out
-    r = summary[ref]
+    r = stat(ref)
     erate = lambda x: x["fail"] / max(1, x["n"])
     ok_s = lambda v: len(samples.get(v) or []) >= 5
-    slow = lambda v: (f"{sum(1 for t in samples[v] if t > 1000)}/{len(samples[v])}" if ok_s(v) else "-")
+    slow = lambda v: (f"{sum(1 for t in samples[v] if t > 1000)}/{len(samples[v])}" if samples.get(v) else "-")
     lines += [f"Mốc {ref}: median {r['total_ms'][0]} ms | P90 {r['total_ms'][1]} ms | lỗi {r['fail']}/{r['n']} | lượt > 1 s: {slow(ref)}", "",
-              "| Biến thể | median | P90 | lỗi | lượt > 1 s | Δ median / Δ P90 so với warm_all [KTC 90%] | so với biến thể liền trước "
+              "| Biến thể | median | P90 | lỗi | lượt > 1 s | Δ median / Δ P90 so với warm_all [KTC 90%] | so với biến thể trước "
               "[KTC 90%] | Nhóm cờ | Đề xuất | Lý do |", "|---|---|---|---|---|---|---|---|---|---|"]
     fmt_ci = lambda c: f"[{c[0]:+.0f}…{c[1]:+.0f}]" if c else ""
     txt = {"on": "✅ BẬT nhóm cờ này", "off": "⏸ GIỮ TẮT nhóm cờ này", "inconclusive": "❔ CHƯA KẾT LUẬN (chạy thêm vòng)"}
-    prev = ref
+    rank = {"ok": 0, "unsure": 1, "slower": 2}
+    hist = []                                                     # (biến thể chuỗi v2 đã có số đo, kết luận)
     order = [x for x in V2_CHAIN if x in names and x != ref] + [x for x in names if x not in V2_CHAIN and x != ref]
+
+    def inc_vs(cmp_, x, v):
+        p_ = stat(cmp_)
+        im, i9 = p_["total_ms"][0] - x["total_ms"][0], p_["total_ms"][1] - x["total_ms"][1]
+        pim = pi9 = None
+        err = erate(x) > erate(p_)
+        if ok_s(v) and ok_s(cmp_):
+            pim, pi9 = _boot_ci(samples[cmp_], samples[v], 50), _boot_ci(samples[cmp_], samples[v], 90)
+            if err or pim[1] < -tol_ms or pi9[1] < -tol_ms:
+                st = "slower"
+            elif (im >= -tol_ms and i9 >= -tol_ms) or (pim[0] >= -tol_ms and pi9[0] >= -tol_ms):
+                st = "ok"
+            else:
+                st = "unsure"
+        else:
+            st = "ok" if (im >= -tol_ms and i9 >= -tol_ms and not err) else "slower"
+        return st, err, f"{cmp_}: {im:+.0f} {fmt_ci(pim)} / {i9:+.0f} {fmt_ci(pi9)}"
+
     for v in order:
         if v not in summary:
             continue
-        x = summary[v]
-        if x["total_ms"][0] is None:                              # không có lượt thành công nào → lỗi tăng → giữ tắt
-            out[v] = {"verdict_vs_ref": "LOSE", "win_vs_ref": False, "incremental_ok": False, "inc_state": "slower",
-                      "recommend_on": False, "decision": "off", "reason": "không có lượt thành công", "error_rate": round(erate(x), 3)}
-            lines.append(f"| {v} | - | - | {x['fail']}/{x['n']} | - | - | - | {V2_GROUP.get(v, '-')} | {txt['off']} | không có lượt thành công |")
-            if v in V2_CHAIN:
-                prev = v
+        x = stat(v)
+        n_paused = int(paused.get(v) or 0)
+        spec_v = v in V2_SPECULATIVE
+        if x["total_ms"][0] is None or (use_s and not ok_s(v)):
+            if x["total_ms"][0] is None and not (spec_v and n_paused):
+                dec_, why_ = "off", "không có lượt thành công"
+            else:
+                dec_ = "inconclusive"
+                why_ = (f"chỉ còn {len(samples.get(v) or [])} lượt sạch ({n_paused} lượt suy đoán bị tắt)" if spec_v and n_paused
+                        else f"chỉ {len(samples.get(v) or [])} lượt thành công (< 5)")
+            out[v] = {"verdict_vs_ref": "LOSE" if dec_ == "off" else "UNSURE", "win_vs_ref": False, "incremental_ok": False,
+                      "inc_state": "unsure", "inc_vs": None, "recommend_on": False, "decision": dec_, "reason": why_,
+                      "error_rate": round(erate(x), 3), "paused_runs": n_paused}
+            lines.append(f"| {v} | - | - | {x['fail']}/{x['n']} | {slow(v)} | - | - | {V2_GROUP.get(v, '-')} | "
+                         f"{'→ xem dòng range auto bên dưới' if v in ('warm_all_auto', 'v2_full_auto') else txt[dec_]} | {why_} |")
             continue
         need = V2_MIN_GAIN.get(v, min_gain_ms)
         dm, d9 = r["total_ms"][0] - x["total_ms"][0], r["total_ms"][1] - x["total_ms"][1]
@@ -4520,28 +4569,18 @@ def bench_dl_summary(base, names, summary, ref="warm_all", min_gain_ms=50.0, tol
             vref = "LOSE"
         else:
             vref = "UNSURE"
-        inc_state, inc_txt, inc_err = "ok", "-", False
-        p_ = summary.get(prev)
-        if v in V2_CHAIN and prev != ref and p_ is not None and p_["total_ms"][0] is not None:
-            im, i9 = p_["total_ms"][0] - x["total_ms"][0], p_["total_ms"][1] - x["total_ms"][1]
-            pim = pi9 = None
-            inc_err = erate(x) > erate(p_)
-            if ok_s(v) and ok_s(prev):
-                pim, pi9 = _boot_ci(samples[prev], samples[v], 50), _boot_ci(samples[prev], samples[v], 90)
-                if inc_err or pim[1] < -tol_ms or pi9[1] < -tol_ms:
-                    inc_state = "slower"                          # chắc chắn chậm hơn > dung sai
-                elif (im >= -tol_ms and i9 >= -tol_ms) or (pim[0] >= -tol_ms and pi9[0] >= -tol_ms):
-                    inc_state = "ok"
-                else:
-                    inc_state = "unsure"                          # có thể chậm hơn, nằm trong nhiễu
-            else:
-                inc_state = "ok" if (im >= -tol_ms and i9 >= -tol_ms and not inc_err) else "slower"
-            inc_txt = f"{prev}: {im:+.0f} {fmt_ci(pim)} / {i9:+.0f} {fmt_ci(pi9)}"
-        n_paused = int(paused.get(v) or 0)
+        inc_state, inc_txt, inc_err, inc_who = "ok", "-", False, None
+        if v in V2_CHAIN and hist:
+            prev_d = hist[-1][0]
+            firm = next((h for h, d in reversed(hist) if d != "inconclusive"), None)
+            res = [(c,) + inc_vs(c, x, v) for c in dict.fromkeys(c for c in (prev_d, firm) if c)]
+            worst = max(res, key=lambda t: rank[t[1]])
+            inc_who, inc_state, inc_err = worst[0], worst[1], worst[2]
+            inc_txt = " ; ".join(t[3] for t in res)
+        if spec_v and n_paused:
+            pass                                                  # đã chấm trên lượt sạch (≥ 5) — ghi chú ở lý do
         if vref == "LOSE" or inc_state == "slower":
             decision = "off"
-        elif n_paused and v in V2_SPECULATIVE:
-            decision = "inconclusive"                             # một phần lượt đo chạy với tính năng v2 bị tắt (429)
         elif vref == "WIN" and inc_state == "ok":
             decision = "on"
         else:
@@ -4554,22 +4593,21 @@ def bench_dl_summary(base, names, summary, ref="warm_all", min_gain_ms=50.0, tol
                                  else "trong nhiễu")
         reason = "lỗi tăng" if err_up else f"{_why('median', dm, cim)}; {_why('P90', d9, ci9)}"
         if inc_state == "slower":
-            reason += f"; lỗi tăng so với {prev}" if inc_err else f"; chậm hơn rõ so với {prev}"
+            reason += f"; lỗi tăng so với {inc_who}" if inc_err else f"; chậm hơn rõ so với {inc_who}"
         elif inc_state == "unsure":
-            reason += f"; có thể chậm hơn {prev} (trong nhiễu)"
-        if n_paused and v in V2_SPECULATIVE:
-            reason += f"; {n_paused} lượt đo khi đang tạm dừng vì 429 (tính năng v2 bị tắt)"
-        out[v] = {"inc_vs": prev if inc_txt != "-" else None,
-                  "verdict_vs_ref": vref, "win_vs_ref": vref == "WIN", "incremental_ok": inc_state == "ok", "inc_state": inc_state,
-                  "recommend_on": decision == "on", "decision": decision, "gain_median_ms": round(dm, 1), "gain_p90_ms": round(d9, 1),
-                  "need_gain_ms": need, "ci_gain_median": cim, "ci_gain_p90": ci9, "error_rate": round(erate(x), 3), "reason": reason,
-                  "paused_runs": n_paused}
+            reason += f"; có thể chậm hơn {inc_who} (trong nhiễu)"
+        if spec_v and n_paused:
+            reason += f"; đã bỏ {n_paused} lượt suy đoán bị tắt (429/thận trọng/chặn đoán)"
+        out[v] = {"inc_vs": inc_who, "verdict_vs_ref": vref, "win_vs_ref": vref == "WIN", "incremental_ok": inc_state == "ok",
+                  "inc_state": inc_state, "recommend_on": decision == "on", "decision": decision, "gain_median_ms": round(dm, 1),
+                  "gain_p90_ms": round(d9, 1), "need_gain_ms": need, "ci_gain_median": cim, "ci_gain_p90": ci9,
+                  "error_rate": round(erate(x), 3), "reason": reason, "paused_runs": n_paused}
         shown = "→ xem dòng range auto bên dưới" if v in ("warm_all_auto", "v2_full_auto") else txt[decision]
         lines.append(f"| {v} | {x['total_ms'][0]:.0f} | {x['total_ms'][1]:.0f} | {x['fail']}/{x['n']} | {slow(v)} | "
                      f"{dm:+.0f} {fmt_ci(cim)} / {d9:+.0f} {fmt_ci(ci9)} (ngưỡng {need:.0f}) | {inc_txt} | {V2_GROUP.get(v, '-')} | "
                      f"{shown} | {reason} |")
         if v in V2_CHAIN:
-            prev = v
+            hist.append((v, decision))
     if "warm_all_auto" in names or "v2_full_auto" in names:
         wa, fa = out.get("warm_all_auto"), out.get("v2_full_auto")
         if wa is None:
@@ -4578,7 +4616,7 @@ def bench_dl_summary(base, names, summary, ref="warm_all", min_gain_ms=50.0, tol
             dec, why = wa["decision"], "warm_all_auto: " + wa["reason"]
         elif fa is not None and fa["inc_state"] != "ok":
             dec = "off" if fa["inc_state"] == "slower" else "inconclusive"
-            why = "v2_full_auto so với v2_full: " + fa["reason"]
+            why = "v2_full_auto so với biến thể trước: " + fa["reason"]
         else:
             dec = "on"
             why = "warm_all_auto thắng warm_all ≥ 100 ms" + (
@@ -4594,10 +4632,11 @@ def bench_dl_summary(base, names, summary, ref="warm_all", min_gain_ms=50.0, tol
     lines += ["", "**Cộng dồn:** v2_redirect đo khi đã bật nhóm của v2_ssl; v2_hedge khi đã bật cả v2_ssl + v2_redirect; … Bật một nhóm "
               "sau mà TẮT nhóm trước nó = cấu hình CHƯA được đo (nên giữ các nhóm trước như lúc đo, trừ nhóm bị 'chậm hơn rõ' hoặc lỗi tăng)."]
     lines += ["", f"Δ dương = nhanh hơn. [KTC 90%] = khoảng tin cậy 90% bootstrap của chênh lệch (cần ≥ 5 lượt thành công). 'So với "
-              f"biến thể liền trước' chỉ tính là chậm hơn khi chắc chắn chậm hơn > {tol_ms:.0f} ms. 'Giữ tắt' = đặt các cờ của nhóm đó về "
-              "false (range_connections = 1) trong config.json. 'Chưa kết luận' = chênh lệch nằm trong nhiễu lấy mẫu → giữ như hiện tại "
-              "và chạy thêm vòng (BENCH_TAI_360.bat), không suy ra nhanh/chậm. Gặp 429 trong lúc đo: các tối ưu gửi thêm request bị tắt "
-              "10 phút (an toàn) → các lượt đó không đo được tác dụng v2 (cột 'đo khi đang tạm dừng vì 429' trong BENCH_DL.md)."]
+              f"biến thể trước' = biến thể liền trước có số đo và biến thể gần nhất đã có kết luận chắc; chỉ tính là chậm hơn khi chắc chắn "
+              f"chậm hơn > {tol_ms:.0f} ms. 'Giữ tắt' = đặt các cờ của nhóm đó về false (range_connections = 1) trong config.json. 'Chưa kết "
+              "luận' = chênh lệch nằm trong nhiễu lấy mẫu hoặc không đủ lượt → giữ như hiện tại và chạy thêm vòng (BENCH_TAI_360.bat). Lượt "
+              "mà tối ưu suy đoán bị tắt (gặp 429 → tạm dừng 10 phút; video từng bị 403/429 → thận trọng; chặn đoán sau khi đoán sai; mọi "
+              "replica bị cấm) không được dùng để chấm các nhóm v2 có suy đoán (cột cuối của BENCH_DL.md)."]
     (base / "BENCH_DL_SUMMARY.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return out
 
@@ -4610,11 +4649,14 @@ def bench_dl_summary_from_csv(csv_path, out_dir=None) -> dict:
     num = lambda x: float(x) if x not in (None, "") else None
     names = list(dict.fromkeys(r["variant"] for r in rows))
     summary, samples = {}, {}
-    paused = {v: sum(1 for r in rows if r["variant"] == v and str(r.get("spec_paused") or "0") not in ("0", "")) for v in names}
+    off_col = "spec_off" if rows and "spec_off" in rows[0] else "spec_paused"
+    is_off = lambda r: str(r.get(off_col) or "0") not in ("0", "")
+    paused = {v: sum(1 for r in rows if r["variant"] == v and is_off(r)) for v in names}
     for v in names:
         rs = [r for r in rows if r["variant"] == v]
         ok = [num(r.get("total_ms")) for r in rs if r.get("result") == "DONE" and num(r.get("total_ms")) is not None]
-        samples[v] = ok
+        samples[v] = [num(r.get("total_ms")) for r in rs if r.get("result") == "DONE" and num(r.get("total_ms")) is not None
+                      and not (v in V2_SPECULATIVE and is_off(r))]
         summary[v] = {"total_ms": tuple(pct(ok, p_) for p_ in (50, 90, 95)), "n": len(rs), "fail": len(rs) - len(ok)}
     return bench_dl_summary(Path(out_dir) if out_dir else csv_path.parent, names, summary, samples=samples, paused=paused)
 

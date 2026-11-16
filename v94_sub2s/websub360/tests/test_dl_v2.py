@@ -769,9 +769,64 @@ def test_summary_range_auto_needs_warm_all_auto_and_failed_variants_count(tmp_pa
 def test_summary_marks_variants_measured_during_429_pause_inconclusive(tmp_path):
     import random as _r
     rnd = _r.Random(8)
-    smp = {"warm_all": _samples(rnd, 900), "v2_ssl": _samples(rnd, 899), "v2_redirect": _samples(rnd, 600)}
-    out = ws.bench_dl_summary(tmp_path, list(smp), _summ(smp), samples=smp, paused={"v2_redirect": 4})
-    assert out["v2_redirect"]["decision"] == "inconclusive" and "429" in out["v2_redirect"]["reason"]
+    smp = {"warm_all": _samples(rnd, 900), "v2_ssl": _samples(rnd, 899), "v2_redirect": _samples(rnd, 600)[:3]}   # còn 3 lượt sạch
+    out = ws.bench_dl_summary(tmp_path, list(smp), _summ(smp), samples=smp, paused={"v2_redirect": 17})
+    assert out["v2_redirect"]["decision"] == "inconclusive" and "lượt sạch" in out["v2_redirect"]["reason"]
+    smp2 = dict(smp, v2_redirect=_samples(rnd, 600))                                  # đủ lượt sạch → chấm trên lượt sạch
+    out2 = ws.bench_dl_summary(tmp_path, list(smp2), _summ(smp2), samples=smp2, paused={"v2_redirect": 4})
+    assert out2["v2_redirect"]["decision"] == "on" and "đã bỏ 4 lượt" in out2["v2_redirect"]["reason"]
+
+
+def test_summary_lose_with_paused_runs_is_not_reported_as_keep_off(tmp_path):
+    """Review vòng 3: 429 làm mọi lượt v2 chạy như đã tắt → không được ghi 'GIỮ TẮT' cho tính năng chưa hề chạy."""
+    import random as _r
+    rnd = _r.Random(12)
+    smp = {"warm_all": _samples(rnd, 900), "v2_ssl": _samples(rnd, 890), "v2_redirect": []}
+    summ = dict(_summ({k: v for k, v in smp.items() if v}), v2_redirect={"total_ms": (None, None, None), "n": 20, "fail": 0})
+    out = ws.bench_dl_summary(tmp_path, list(smp), summ, samples=smp, paused={"v2_redirect": 20})
+    assert out["v2_redirect"]["decision"] == "inconclusive"
+
+
+def test_summary_compares_with_last_firm_variant_and_skips_failed_predecessor(tmp_path):
+    import random as _r
+    rnd = _r.Random(13)
+    # v2_hedge lỗi hết → v2_full phải so với v2_redirect (chậm hơn 150 ms) chứ không mặc định 'ổn'
+    smp = {"warm_all": _samples(rnd, 650), "v2_ssl": _samples(rnd, 640), "v2_redirect": _samples(rnd, 370), "v2_hedge": [],
+           "v2_full": _samples(rnd, 520)}
+    summ = dict(_summ({k: v for k, v in smp.items() if v}), v2_hedge={"total_ms": (None, None, None), "n": 20, "fail": 20})
+    out = ws.bench_dl_summary(tmp_path, list(smp), summ, samples=smp)
+    assert out["v2_hedge"]["decision"] == "off" and out["v2_full"]["decision"] == "off" and out["v2_full"]["inc_vs"] == "v2_redirect"
+    # v2_hedge chưa kết luận → v2_full còn phải so với v2_redirect (biến thể chắc gần nhất); P90 kém 100+ ms trong nhiễu → không BẬT
+    smp2 = {k: [float(x) for x in v] for k, v in _R2_MOCK.items()}
+    smp2["v2_redirect"] = [370.0] * 19 + [380.0]
+    smp2["v2_hedge"] = [365.0] * 16 + [1700.0] * 4
+    smp2["v2_full"] = [365.0] * 16 + [520.0] * 4
+    out2 = ws.bench_dl_summary(tmp_path, list(smp2), _summ(smp2), samples=smp2)
+    assert out2["v2_hedge"]["decision"] != "on" and out2["v2_full"]["decision"] != "on"
+
+
+def test_summary_with_fewer_than_5_runs_is_inconclusive(tmp_path):
+    smp = {"warm_all": [900.0, 905, 910, 895], "v2_ssl": [700.0, 705, 710, 695]}
+    out = ws.bench_dl_summary(tmp_path, list(smp), _summ(smp), samples=smp)
+    assert out == {} or all(v["decision"] == "inconclusive" for v in out.values())
+
+
+def test_summary_from_csv_drops_runs_where_speculation_was_off(tmp_path):
+    import csv as _csv
+    import random as _r
+    rnd = _r.Random(14)
+    rows = []
+    for v, med_ in (("warm_all", 900), ("v2_ssl", 895), ("v2_redirect", 600)):
+        for i, t in enumerate(_samples(rnd, med_)):
+            rows.append({"variant": v, "video_id": "X", "rep": i, "result": "DONE", "total_ms": round(t, 1), "spec_off": 0})
+    for i in range(10):                                                              # lượt bị tắt suy đoán: chậm như warm_all
+        rows.append({"variant": "v2_redirect", "video_id": "X", "rep": 50 + i, "result": "DONE", "total_ms": 900.0, "spec_off": 1})
+    with open(tmp_path / "BENCH_DL.csv", "w", newline="", encoding="utf-8") as f:
+        w = _csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    out = ws.bench_dl_summary_from_csv(tmp_path / "BENCH_DL.csv")
+    assert out["v2_redirect"]["decision"] == "on" and out["v2_redirect"]["paused_runs"] == 10
 
 
 # ------------------------------------------------------------------ hồi quy review vòng 3

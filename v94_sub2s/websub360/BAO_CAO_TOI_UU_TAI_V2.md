@@ -49,12 +49,17 @@ không đổi.
 | `v2_ssl` (+#1) | 641 | 1985 | 4/20 | 430 / 1780 | 126 / 126 | 0 | 0 / 0 | ⏸ GIỮ TẮT (median không nhanh hơn — đúng dự đoán trên Linux) |
 | `v2_redirect` (+#2 #3) | 368 | 399* | 1/20 | 152 / 174 | 0 / 6 | 19 / 0 | 0 / 0 | ✅ BẬT |
 | `v2_hedge` (+#4) | 374 | 550 | 1/20 | 153 / 338 | 0 / 63 | 17 / 3 | 20 / 3 | ❔ CHƯA KẾT LUẬN (P90 có thể kém v2_redirect — trong nhiễu) |
-| `v2_full` (+#5 #7 #8) | 372 | 503 | 0/20 | 153 / 280 | 0 / 63 | 17 / 3 | 20 / 3 | ✅ BẬT |
+| `v2_full` (+#5 #7 #8) | 372 | 503 | 0/20 | 153 / 280 | 0 / 63 | 17 / 3 | 20 / 3 | ❔ CHƯA KẾT LUẬN (thắng chắc warm_all; P90 có thể kém v2_redirect — trong nhiễu) |
 | `v2_full_auto` (+#6) | 599 | 1923 | 3/20 | 353 / 372 | 63 / 65 | 9 / 1 | 10 / 1 | range auto: ⏸ giữ 1 |
 | `warm_all_auto` (#6 riêng) | 651 | 1997 | 6/20 | 434 / 1780 | 66 / 126 | 0 | 0 / 0 | ⏸ GIỮ TẮT (ngưỡng 100 ms) |
 
 Lần chạy trước (cùng đường tải thành công, trước các bản sửa an toàn của vòng 2): `warm_all` 639 / 1988 (5/20 lượt > 1 s), `v2_redirect`
 360 / **1708\*** (3/20), `v2_hedge` 365 / 377 (0/20), `v2_full` 358 / 543 (0/20).
+
+Đọc bảng: so với **bản hiện tại (`warm_all`)**, `v2_redirect`, `v2_hedge`, `v2_full` đều **chắc chắn nhanh hơn ≥ 50 ms ở CẢ median lẫn P90**
+(KTC 90% của mức giảm > 0). "Chưa kết luận" của `v2_hedge`/`v2_full` là ở bước so với `v2_redirect`: trong lần chạy này `v2_redirect`
+chỉ có 1/20 lượt rơi vào đuôi chậm nên P90 của nó thấp bất thường; với 20 lượt không phân định được hedge có làm P90 tốt hơn hay kém đi
+(lần chạy trước thì ngược lại: `v2_redirect` P90 1708 ms, `v2_hedge` 377 ms). Trên máy thật cần ≥ 2 lần `BENCH_TAI_360.bat`.
 
 \* P90 với 20 lượt và đuôi chậm đúng 10% nằm ngay ranh giới đuôi: 1 hay 3 lượt rơi vào đuôi làm P90 của `v2_redirect` nhảy giữa 399 và
 1708 ms giữa 2 lần chạy. Vì vậy `BENCH_DL_SUMMARY.md` dùng khoảng tin cậy bootstrap và trả "CHƯA KẾT LUẬN" thay vì đoán. P90 ~500–550 ms
