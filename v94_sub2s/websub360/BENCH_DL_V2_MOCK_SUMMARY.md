@@ -1,4 +1,4 @@
-# BENCH_DL_SUMMARY — 2026-11-16T07:31:29.945+00:00 — mốc 'warm_all' (TỔNG = resolve → tải → ffprobe)
+# BENCH_DL_SUMMARY — 2026-11-16T07:55:32.883+00:00 — mốc 'warm_all' (TỔNG = resolve → tải → ffprobe)
 
 Mốc warm_all: median 653.727 ms | P90 1982.733 ms | lỗi 0/20 | lượt > 1 s: 5/20
 

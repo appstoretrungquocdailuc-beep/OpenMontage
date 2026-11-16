@@ -831,17 +831,15 @@ def test_summary_from_csv_drops_runs_where_speculation_was_off(tmp_path):
 
 # ------------------------------------------------------------------ hồi quy review vòng 3
 @need_openssl
-def test_any_429_pauses_speculation_immediately_only_when_v2_on(hosts, cert, tmp_path):
+def test_any_429_pauses_speculation_immediately(hosts, cert, tmp_path):
+    """Review vòng 3/4: 429 được ghi NGAY lúc nhận, ở mọi biến thể (kể cả cờ tắt — trạng thái này chỉ đường v2 đọc), để biến thể v2
+    chạy ngay sau đó (bench, worker khác) không suy đoán."""
     hosts.add("/z", b"z" * 100)
     hosts.host_status[(A3, "/z")] = 429
-    use(cert)                                                                        # cờ tắt: không đụng tới trạng thái v2
+    use(cert)
     with pytest.raises(ws.HttpStatus):
         ws._follow(hosts.url(A3, "/z"))
-    assert not ws.spec_paused()
-    use(cert, dl_hedge=True)
-    with pytest.raises(ws.HttpStatus):
-        ws._follow(hosts.url(A3, "/z"))
-    assert ws.spec_paused()                                                          # ghi NGAY lúc nhận 429, không đợi lần thử kết thúc
+    assert ws.spec_paused()
 
 
 @need_openssl
@@ -925,3 +923,122 @@ def test_range_auto_rows_never_contradict_combined_decision(tmp_path):
     names = ["warm_all", "v2_full", "v2_full_auto", "warm_all_auto"]
     out = ws.bench_dl_summary(tmp_path, names, _summ(smp), samples=smp)
     assert out["range_auto"]["decision"] == "off" and out["v2_full_auto"]["decision"] != "on"
+
+
+# ------------------------------------------------------------------ hồi quy review vòng 4
+def _rows(spec):
+    """spec: {biến thể: [(video, vòng, TỔNG|None, spec_off, own_429), ...]} → các dòng như BENCH_DL.csv."""
+    return [{"variant": v, "video_id": vid, "rep": rep, "result": "DONE" if t is not None else "FAILED", "total_ms": t,
+             "spec_off": so, "own_429": o4} for v, xs in spec.items() for vid, rep, t, so, o4 in xs]
+
+
+def _summ_rows(rows, names):
+    out = {}
+    for v in names:
+        rs = [r for r in rows if r["variant"] == v]
+        ok = [r["total_ms"] for r in rs if r["total_ms"] is not None]
+        out[v] = {"total_ms": tuple(ws.pct(ok, p) for p in (50, 90, 95)), "n": len(rs), "fail": len(rs) - len(ok)}
+    return out
+
+
+def test_summary_matched_pairs_do_not_reward_dropping_a_slow_video(tmp_path):
+    """Review vòng 3 (cao): lọc lượt 'bẩn' chỉ ở phía v2 → bỏ đúng video chậm làm nhóm KHÔNG có tác dụng trông nhanh hơn → BẬT sai."""
+    import random as _r
+    rnd = _r.Random(21)
+    spec = {}
+    for v in ("warm_all", "v2_ssl", "v2_redirect"):
+        xs = []
+        for rep in range(7):
+            for vid, base_ in (("S", 700), ("M", 1000), ("L", 1300)):
+                off_ = 1 if (v == "v2_redirect" and vid == "L") else 0                  # video L luôn bị 'thận trọng' ở v2
+                xs.append((vid, rep, rnd.gauss(base_, 10), off_, 0))
+        spec[v] = xs
+    rows = _rows(spec)
+    names = list(spec)
+    keyed, off, own = ws._bench_keyed(rows, names, lambda r: bool(r["spec_off"]))
+    out = ws.bench_dl_summary(tmp_path, names, _summ_rows(rows, names), keyed=keyed, off=off, own429=own)
+    assert out["v2_redirect"]["decision"] != "on" and abs(out["v2_redirect"]["gain_median_ms"]) < 50
+
+
+def test_summary_own_429_keeps_group_off_and_failed_clean_runs_are_off(tmp_path):
+    import random as _r
+    rnd = _r.Random(22)
+    spec = {"warm_all": [("A", i, rnd.gauss(900, 10), 0, 0) for i in range(20)],
+            "v2_ssl": [("A", i, rnd.gauss(890, 10), 0, 0) for i in range(20)],
+            "v2_redirect": [("A", i, rnd.gauss(600, 10), 0, 1 if i == 3 else 0) for i in range(20)],
+            "v2_hedge": [("A", i, None, 1 if i == 0 else 0, 0) for i in range(20)]}
+    rows = _rows(spec)
+    names = list(spec)
+    keyed, off, own = ws._bench_keyed(rows, names, lambda r: bool(r["spec_off"]))
+    out = ws.bench_dl_summary(tmp_path, names, _summ_rows(rows, names), keyed=keyed, off=off, own429=own)
+    assert out["v2_redirect"]["decision"] == "off" and "429" in out["v2_redirect"]["reason"]
+    assert out["v2_hedge"]["decision"] == "off"                                      # 19 lượt sạch, 0 thành công → giữ tắt
+
+
+@need_openssl
+def test_predicted_host_404_during_new_429_pause_is_retryable_not_fatal(hosts, cert, tmp_path):
+    hosts.host_rules[A1] = {"redirect_to": B1}
+    hosts.add("/f1", b"1" * 1000)
+    hosts.add("/f2", b"2" * 1000)
+    use(cert, net_redirect_memory=True)
+    ws.download_single(hosts.url(A1, "/f1"), tmp_path / "1", {})
+    hosts.host_rules[B1] = {"server_wait": (0.2, 0, 0)}
+    hosts.host_status[(B1, "/f2")] = 404
+
+    def other_worker_429():
+        time.sleep(0.05)
+        ws.note_429()
+    threading.Thread(target=other_worker_429, daemon=True).start()
+    with pytest.raises(ws.HttpStatus) as ei:
+        ws.download_single(hosts.url(A1, "/f2"), tmp_path / "2", {})
+    assert ei.value.code == 429 and hosts.reqs[(A1, "/f2")] == 0                      # không thành 404 'vĩnh viễn' của video
+
+
+@T.need_ff
+def test_fatal_error_is_not_rewritten_by_hidden_429(tmp_path, gvs, media, monkeypatch):
+    def fetch(self, fmt, dest, info, n, cancel=None, alts=None):
+        ws.mark_block(info, ws.HttpStatus(429, retry_after=11))
+        raise ws.Fatal("cần ffmpeg")
+    monkeypatch.setattr(ws.Resolver, "resolve", lambda self, v, deadline_s=2.5: T.plan_prog(gvs, media, v))
+    monkeypatch.setattr(ws.Engine, "_fetch", fetch)
+    e = T.make_engine(tmp_path, T.CH[:1], excel_enabled=False, retry_schedule_sec=[0.2, 0.2])
+    e.start(websub=False)
+    e.on_event(T.CH[0], "FATAL429VID", "WEBSUB", T.TS)
+    r = T.wait_state(e, "FATAL429VID", states=("FAILED", "RETRY_WAIT"), t=10)
+    e.stop()
+    assert r["state"] == "FAILED" and r["error"].startswith("Fatal") and "[đã gặp HTTP 429]" in r["error"]
+
+
+def test_range_auto_uses_one_connection_while_cautious_or_paused(tmp_path, gvs, monkeypatch):
+    seen = []
+    real = ws.Engine._fetch_one
+    monkeypatch.setattr(ws.Engine, "_fetch_one", lambda self, fmt, dest, info, n, cancel=None: seen.append(n) or
+                        real(self, fmt, dest, info, n, cancel))
+    monkeypatch.setattr(ws.Resolver, "resolve", lambda self, v, deadline_s=2.5: {"pick": {"kind": "progressive", "audio": None,
+                        "video": T.mkfmt(gvs.add(f"/ra/{v}", b"\0" * 8_000_000, "ok"), 18, 360, 'video/mp4; codecs="avc1, mp4a"', 8_000_000)},
+                        "source": "MOCK"})
+    monkeypatch.setattr(ws, "ffprobe_info", lambda p: {"ok": True, "audio": True})
+    e = T.make_engine(tmp_path, T.CH[:1], excel_enabled=False, range_connections="auto", dl_quick_integrity=False)
+    e.start(websub=False)
+    ws.note_429()
+    e.on_event(T.CH[0], "RAUTOPAUSE1", "WEBSUB", T.TS)
+    assert T.wait_state(e, "RAUTOPAUSE1")["state"] == "DONE"
+    e.stop()
+    assert seen == [1]                                                               # đang tạm dừng vì 429 → không chia 4 đoạn
+
+
+def test_429_pause_survives_restart_and_recover_keeps_next_try(tmp_path):
+    ws.reset_dl_v2_state()
+    ws.set_net_opts(dict(ws.NET_OPTS_OFF, dl_hedge=True))
+    e = T.make_engine(tmp_path, T.CH[:1], excel_enabled=False)
+    ws.note_429()
+    assert (tmp_path / "ws360_spec_pause.txt").exists()
+    ws.reset_dl_v2_state()
+    assert not ws.spec_paused()
+    left = ws.load_spec_pause(tmp_path / "ws360_spec_pause.txt")                       # = Engine mới sau khởi động lại
+    assert 500 < left <= 600 and ws.spec_paused()
+    e.db.x("INSERT INTO videos(video_id, channel_id, url, engine, detected_at, state, next_try, error) VALUES(?,?,?,?,?,?,?,?)",
+           ("REC429VID01", T.CH[0], "u", "WEBSUB", ws.iso(), "RETRY_WAIT", time.time() + 30, "HttpStatus: HTTP 429"))
+    e.recover()
+    nb, _, job = e.dlq.get_nowait()
+    assert nb >= time.time() + 25 and job["not_before"] == nb
