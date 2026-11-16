@@ -355,7 +355,7 @@ def write_report(mode, rows, summary, notes):
         f"- Máy: {sys.platform} | Python {sys.version.split()[0]} | CPU={os.cpu_count()}", "",
         "| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
     for s in summary:
-        md.append("| " + " | ".join("-" if s.get(c) is None else str(s.get(c)) for c in cols) + " |")
+        md.append("| " + " | ".join("-" if s.get(c) is None else str(s.get(c)).replace("|", " / ") for c in cols) + " |")
     Path(f"{base}_summary.md").write_text("\n".join(md) + "\n", encoding="utf-8")
     print("\n".join(md))
     print(f"\n→ {base}.jsonl / .csv / .json / _summary.md")

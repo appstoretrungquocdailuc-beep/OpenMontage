@@ -301,3 +301,48 @@ def test_aria2_rpc_403_single_request(v94, gvs, tmp_path, monkeypatch):
     ok = v94._download_aria2c_rpc(url, tmp_path, "x.bin", lambda m: None, 1, 4 * MB, info=info)
     assert not ok and info["fail_reason"] == "HTTP_403"
     assert len(gvs.requests_for("/a403")) == 1
+
+
+def test_learn_race_mode_switches_by_history(v94, gvs, tmp_path, monkeypatch):
+    """learn: chưa có lịch sử → race hết; replica không thắng → job sau chỉ thăm dò; CDN chính chậm lại → thăm dò thắng,
+    hedge ngay trong job đó, và job sau quay lại race hết."""
+    monkeypatch.setattr(v94, "V98_RACE_MODE", "learn")
+    monkeypatch.setattr(v94, "_V98_RACE_HIST", [])
+    monkeypatch.setattr(v94, "V94_RANGE_WORKERS_VIDEO", 12)
+    data = make_payload(16 * MB, seed=40)
+    seq = [("l1", 0.05, 0.4, "learn:all"), ("l2", 0.05, 0.4, "learn:probe"),
+           ("l3", 0.9, 0.05, "learn:probe"), ("l4", 0.9, 0.05, "learn:all")]
+    infos = {}
+    for tag, md, ad, want in seq:
+        main = _two_host(v94, gvs, monkeypatch, data, md, ad, tag)
+        ok, info = _dl(v94, main, tmp_path, f"{tag}.bin", len(data))
+        assert ok, info
+        assert sha256((tmp_path / f"{tag}.bin").read_bytes()) == sha256(data)
+        assert info["race_mode"] == want, (tag, info["race_mode"])
+        infos[tag] = info
+        time.sleep(0.3)
+    assert infos["l1"]["races"] == 12 and infos["l1"]["alt_wins"] == 0
+    assert infos["l2"]["races"] == int(v94.V98_RACE_PROBES)
+    assert infos["l3"]["alt_wins"] >= 1 and infos["l3"]["elapsed_ms"] < 900
+    assert infos["l4"]["races"] == 12
+
+
+@pytest.mark.parametrize("link_capped", [False, True])
+def test_workers_learn_picks_by_measured_speed(v94, tmp_path, monkeypatch, link_capped):
+    """Giới hạn THEO KẾT NỐI → sau 4 job thử, chọn mức nhiều worker; giới hạn ĐƯỜNG TRUYỀN → giữ mức ít worker."""
+    from mock_gvs import MockGVS
+    monkeypatch.setattr(v94, "V98_WORKERS_LEARN", True)
+    monkeypatch.setattr(v94, "_V98_WL", {})
+    monkeypatch.setattr(v94, "V94_RANGE_WORKERS_VIDEO", 0)
+    data = make_payload(16 * MB, seed=50)
+    arms = []
+    with MockGVS(link_bytes_per_sec=(8 * MB if link_capped else 0)) as g:
+        url = g.add("/wl", data, rate=(0 if link_capped else 1 * MB))
+        for i in range(5):
+            ok, info = _dl(v94, url, tmp_path, f"wl{i}.bin", len(data))
+            assert ok, info
+            assert sha256((tmp_path / f"wl{i}.bin").read_bytes()) == sha256(data)
+            arms.append((info["workers_learn"], info["workers_initial"]))
+    assert [a for a, _ in arms[:4]] == ["lo", "hi", "lo", "hi"]
+    assert arms[1][1] > arms[0][1]
+    assert arms[4][0] == ("lo" if link_capped else "hi"), arms

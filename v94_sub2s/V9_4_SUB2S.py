@@ -316,9 +316,30 @@ V98_PREALLOC_ASYNC = _v98_env("PREALLOC_ASYNC", False)
 # FIRST-WAVE-RACE: "fixed" = V9.7.1 (theo V94_FIRST_WAVE_RACE_MAX); "adaptive" = chỉ V98_RACE_PROBES đoạn đầu bắn kép
 # (thăm dò replica); các đoạn đợt đầu còn lại đi host chính và CHỈ hedge sang replica khi replica đã thắng thăm dò
 # (nhanh hơn thật) hoặc host chính chưa trả header sau V98_FIRST_HEDGE_SEC. File nhỏ (<= V94_RACE_ALL_IF_WORKERS_LE
-# đoạn) vẫn race hết như cũ. ("fixed")
+# đoạn) vẫn race hết như cũ. "learn" = như adaptive nhưng CHỈ khi các job gần đây replica không thắng lần nào
+# (xem V98_RACE_LEARN_*); còn lại race tất cả như "fixed".
 V98_RACE_MODE = str(os.environ.get("V98_RACE_MODE", "fixed") or "fixed").strip().lower()
 V98_RACE_PROBES = _v98_env("RACE_PROBES", 2)
+# "learn": nhớ N job gần nhất (trong TTL giây). Chưa có lịch sử, hoặc replica vừa THẮNG → race tất cả như V9.7.1;
+# replica không thắng job nào gần đây → chỉ V98_RACE_PROBES đoạn thăm dò (bớt ~30% request, không chậm hơn).
+V98_RACE_LEARN_JOBS = _v98_env("RACE_LEARN_JOBS", 6)
+V98_RACE_LEARN_TTL_SEC = _v98_env("RACE_LEARN_TTL_SEC", 900.0)
+_V98_RACE_HIST = []                 # [(time, replica_thắng)] mới nhất ở cuối
+_V98_RACE_HIST_LOCK = threading.Lock()
+
+
+def _v98_race_probe_only() -> bool:
+    """learn: True = các job gần đây replica mn KHÔNG thắng lần nào → lần này chỉ thăm dò."""
+    now = time.time()
+    with _V98_RACE_HIST_LOCK:
+        recent = [w for (t, w) in _V98_RACE_HIST if now - t <= float(V98_RACE_LEARN_TTL_SEC)]
+    return bool(recent) and not any(recent)
+
+
+def _v98_race_note(alt_won: bool):
+    with _V98_RACE_HIST_LOCK:
+        _V98_RACE_HIST.append((time.time(), bool(alt_won)))
+        del _V98_RACE_HIST[:-max(1, int(V98_RACE_LEARN_JOBS))]
 V98_FIRST_HEDGE_SEC = _v98_env("FIRST_HEDGE_SEC", 0.9)
 # Ghi file: "lock" = V9.7.1 (seek+write dưới khoá chung với bộ lập lịch); "split" = khoá ghi riêng (bộ lập lịch không
 # chờ đĩa); "pwrite" = không khoá ghi (POSIX os.pwrite / Windows mỗi luồng 1 handle riêng). Đúng offset, không trùng byte.
@@ -334,6 +355,46 @@ V98_PART_MIB = _v98_env("PART_MIB", 0.0)
 # aria2 RPC: số kết nối (0 = _aria2_tuned_split như V9.7.1) và max-tries (2 = V9.7.1; 1 = không tự thử lại khi 403/429).
 V98_ARIA2_SPLIT = _v98_env("ARIA2_SPLIT", 0)
 V98_ARIA2_MAX_TRIES = _v98_env("ARIA2_MAX_TRIES", 2)
+# Chọn số worker TỰ HỌC theo đo thật (mặc định TẮT): file >= MIN_MIB, không ép số worker → luân phiên mức "lo" (heuristic
+# V9.7.1) và "hi" (= lo × MUL, ≤ V98_SCALE_MAX); mỗi mức >= 2 mẫu thì dùng mức có Mbps truyền (median 4 job gần nhất)
+# cao hơn ≥ GAIN, ngang nhau → mức ít kết nối hơn (ít request hơn). Cứ 10 job thử lại mức thua 1 lần (mạng/CDN thay đổi).
+V98_WORKERS_LEARN = _v98_env("WORKERS_LEARN", False)
+V98_WORKERS_LEARN_MUL = _v98_env("WORKERS_LEARN_MUL", 1.6)
+V98_WORKERS_LEARN_MIN_MIB = _v98_env("WORKERS_LEARN_MIN_MIB", 8.0)
+V98_WORKERS_LEARN_GAIN = _v98_env("WORKERS_LEARN_GAIN", 0.12)
+_V98_WL = {}
+_V98_WL_LOCK = threading.Lock()
+
+
+def _v98_workers_pick(kind: str, base: int):
+    """→ (số worker, nhãn mức). Không bao giờ dưới heuristic V9.7.1 hay quá V98_SCALE_MAX."""
+    hi = min(int(V98_SCALE_MAX), max(base + 2, int(round(base * float(V98_WORKERS_LEARN_MUL)))))
+    if hi <= base:
+        return base, "lo"
+    with _V98_WL_LOCK:
+        st = _V98_WL.setdefault(kind, {"lo": [], "hi": [], "n": 0})
+        st["n"] += 1
+        lo_s, hi_s = st["lo"][-4:], st["hi"][-4:]
+        if len(lo_s) < 2 or len(hi_s) < 2:
+            arm = "hi" if len(hi_s) < len(lo_s) else "lo"
+        else:
+            m = lambda a: sorted(a)[len(a) // 2]
+            best = "hi" if m(hi_s) >= m(lo_s) * (1.0 + float(V98_WORKERS_LEARN_GAIN)) else "lo"
+            arm = best if st["n"] % 10 else ("lo" if best == "hi" else "hi")
+    return (hi if arm == "hi" else base), arm
+
+
+def _v98_workers_note(kind: str, arm: str, mbps):
+    try:
+        v = float(mbps)
+    except (TypeError, ValueError):
+        return
+    if v <= 0 or arm not in ("lo", "hi"):
+        return
+    with _V98_WL_LOCK:
+        st = _V98_WL.setdefault(kind, {"lo": [], "hi": [], "n": 0})
+        st[arm].append(v)
+        del st[arm][:-8]
 
 # V9.4.1: A/B số worker video nhỏ theo job ("6,11" → job lẻ 6, job chẵn 11) + mốc phát hiện gần nhất.
 _V94_AB_LOCK = threading.Lock()
@@ -3934,10 +3995,14 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
     min_part_bytes = RANGE_AUDIO_MIN_PART_BYTES if is_audio else RANGE_MIN_PART_BYTES
     # V9.4.1: số worker riêng cho video <= 4MiB (A/B theo job qua info["small_video_workers"]).
     svw = 0 if is_audio else int(info.get("small_video_workers") or V94_VIDEO_SMALL_WORKERS or 0)
+    _wl_arm = None
     if size_known:
         workers = _range_worker_count(total0, media_kind, svw)
         if int(info.get("workers_override") or 0) > 0:      # V9.6: ép N đoạn (A/B 360p)
             workers = int(info["workers_override"])
+        elif (V98_WORKERS_LEARN and total0 >= float(V98_WORKERS_LEARN_MIN_MIB) * 1048576
+                and not int(V94_RANGE_WORKERS_AUDIO if is_audio else V94_RANGE_WORKERS_VIDEO)):
+            workers, _wl_arm = _v98_workers_pick(media_kind, workers)
         workers = max(1, min(workers, max(1, total0 // min_part_bytes)))
     else:
         # Size chưa biết: chia khoảng đoán [0, guess) cho vài request song song ngay t=0 (đoạn vượt
@@ -4008,7 +4073,11 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
     _rm = int(V94_FIRST_WAVE_RACE_MAX)
     _le = int(V94_RACE_ALL_IF_WORKERS_LE or 0)
     race_max = -1 if (_rm != 0 and _le > 0 and workers <= _le) else _rm
-    adaptive = (V98_RACE_MODE == "adaptive" and not (_le > 0 and workers <= _le))
+    _small_all = (_le > 0 and workers <= _le)
+    adaptive = (not _small_all and (V98_RACE_MODE == "adaptive"
+                                    or (V98_RACE_MODE == "learn" and _rm != 0 and _v98_race_probe_only())))
+    race_mode_s = ("adaptive" if V98_RACE_MODE == "adaptive" else
+                   ("learn:probe" if adaptive else "learn:all") if V98_RACE_MODE == "learn" else "fixed")
     if adaptive:                                    # V9.8: chỉ vài đoạn đầu thăm dò replica
         race_max = max(0, int(V98_RACE_PROBES))
     if (RANGE_MN_RACE and (workers >= 4 or not size_known) and time.time() >= _MN_RACE_BAD_UNTIL[0]):
@@ -4728,7 +4797,7 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
                  + f" conc_peak={state['conc_peak']} splits={state['splits']} takeovers={state['takeovers']}"
                  + f" prealloc={prealloc_ms:.0f}ms" + (f" ab={svw}" if svw and total <= 4 * 1048576 else "")
                  + (f" prealloc_bg={_pa['ms']:.0f}ms" if V98_PREALLOC_ASYNC and _pa["ms"] is not None else "")
-                 + (" race=adaptive" if adaptive else "") + (f" scale+{state['scale_added']}" if state["scale_added"] else "")
+                 + (f" race={race_mode_s}" if race_mode_s != "fixed" else "") + (f" wl={_wl_arm}" if _wl_arm else "") + (f" scale+{state['scale_added']}" if state["scale_added"] else "")
                  + f" lock_wait={state['lock_wait_ns'] / 1e6:.0f}ms lock_hold={state['lock_hold_ns'] / 1e6:.0f}ms"
                  + f" write={state['write_ns'] / 1e6:.0f}ms/{state['writes']}x({wmode})")
         logger(
@@ -4760,6 +4829,8 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
             except OSError:
                 pass
         ex.shutdown(wait=False, cancel_futures=True)
+        if V98_RACE_MODE == "learn" and state["alt"] and (state["races"] or state["hedges"]):
+            _v98_race_note(state["alt_wins"] > 0)
         _range_progress_end(temp_file)
         if not ok:
             try:
@@ -4802,9 +4873,12 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
             "prealloc_async": bool(V98_PREALLOC_ASYNC), "prealloc_bg_ms": _pa["ms"],
             "first_get_ms": (round((info["first_get_ns"] - t0_ns) / 1e6, 2) if info.get("first_get_ns") else None),
             "lock_hold_ms": round(state["lock_hold_ns"] / 1e6, 3), "write_ms": round(state["write_ns"] / 1e6, 3),
-            "write_mode": wmode, "race_mode": ("adaptive" if adaptive else "fixed"), "scale_added": state["scale_added"],
+            "write_mode": wmode, "race_mode": race_mode_s, "scale_added": state["scale_added"],
             "scale_steps": list(state["scale_steps"]), "part_bytes": int(part), "segments_initial": len(segs),
+            "workers_learn": _wl_arm,
         })
+        if _wl_arm:
+            _v98_workers_note(media_kind, _wl_arm, info.get("xfer_mbps"))
         TELEM.span(job, f"{media_kind}_download_complete", **{k: v for k, v in info.items()
                                                                 if k not in ("job", "cancel", "pool")})
 
@@ -7728,7 +7802,8 @@ class PremiumDownloaderApp(QWidget):
         )
         self.logger_qt.log(
             f"⚙️ V9.8 RANGE: prealloc={'NỀN' if V98_PREALLOC_ASYNC else 'trước GET'} | ghi={V98_WRITE_MODE} | "
-            f"race={V98_RACE_MODE}" + (f"({V98_RACE_PROBES} thăm dò)" if V98_RACE_MODE == "adaptive" else "")
+            f"race={V98_RACE_MODE}" + (f"({V98_RACE_PROBES} thăm dò)" if V98_RACE_MODE in ("adaptive", "learn") else "")
+            + f" | worker={'TỰ HỌC (×' + str(V98_WORKERS_LEARN_MUL) + ' ≤' + str(V98_SCALE_MAX) + ')' if V98_WORKERS_LEARN else 'cố định'}"
             + f" | scale-up={'BẬT ≤' + str(V98_SCALE_MAX) if V98_SCALE_UP else 'tắt'}"
             + (f" | đoạn đầu ≤{V98_PART_MIB}MiB" if float(V98_PART_MIB or 0) > 0 else "")
             + " | rollback: đặt biến môi trường V98_* (xem BAO_CAO_V98.md)"
