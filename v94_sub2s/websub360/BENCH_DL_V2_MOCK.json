@@ -5,233 +5,245 @@
    "n": 20,
    "fail": 0,
    "total_ms_p50_p90_p95": [
-    653.727,
-    1982.733,
-    1993.617
+    655.412,
+    1982.158,
+    2000.817
    ],
    "ttfb_ms_p50_p90_p95": [
-    430.606,
-    1780.041,
-    1780.413
+    431.431,
+    1779.28,
+    1780.777
    ]
   },
   "v2_ssl": {
    "n": 20,
    "fail": 0,
    "total_ms_p50_p90_p95": [
-    640.717,
-    1984.605,
-    1986.215
+    649.791,
+    1998.962,
+    2004.228
    ],
    "ttfb_ms_p50_p90_p95": [
-    430.16,
-    1779.75,
-    1779.975
+    430.173,
+    1781.099,
+    1781.724
    ]
   },
   "v2_redirect": {
    "n": 20,
    "fail": 0,
    "total_ms_p50_p90_p95": [
-    367.83,
-    398.914,
-    648.935
+    371.173,
+    405.255,
+    629.505
    ],
    "ttfb_ms_p50_p90_p95": [
-    152.206,
-    174.254,
-    428.686
+    152.52,
+    175.589,
+    427.939
    ]
   },
   "v2_hedge": {
    "n": 20,
    "fail": 0,
    "total_ms_p50_p90_p95": [
-    374.453,
-    550.363,
-    612.871
+    375.826,
+    588.233,
+    647.143
    ],
    "ttfb_ms_p50_p90_p95": [
-    153.146,
-    337.545,
-    395.882
+    153.049,
+    339.891,
+    398.348
    ]
   },
   "v2_full": {
    "n": 20,
    "fail": 0,
    "total_ms_p50_p90_p95": [
-    371.629,
-    503.406,
-    541.483
+    374.991,
+    492.102,
+    541.614
    ],
    "ttfb_ms_p50_p90_p95": [
-    153.167,
-    280.235,
-    336.534
+    153.255,
+    280.569,
+    336.462
    ]
   },
   "v2_full_auto": {
    "n": 20,
    "fail": 0,
    "total_ms_p50_p90_p95": [
-    599.043,
-    1923.206,
-    2002.714
+    595.841,
+    1929.031,
+    2015.285
    ],
    "ttfb_ms_p50_p90_p95": [
-    353.385,
-    372.409,
-    375.866
+    354.399,
+    375.605,
+    381.065
    ]
   },
   "warm_all_auto": {
    "n": 20,
    "fail": 0,
    "total_ms_p50_p90_p95": [
-    651.087,
-    1996.798,
-    1998.892
+    653.976,
+    1998.57,
+    2001.443
    ],
    "ttfb_ms_p50_p90_p95": [
-    434.121,
-    1780.066,
-    1780.407
+    434.208,
+    1780.172,
+    1781.474
    ]
   }
  },
  "conclusion": {
   "v2_ssl": {
+   "inc_vs": null,
    "verdict_vs_ref": "LOSE",
    "win_vs_ref": false,
    "incremental_ok": true,
    "inc_state": "ok",
    "recommend_on": false,
    "decision": "off",
-   "gain_median_ms": 13.0,
-   "gain_p90_ms": -1.9,
+   "gain_median_ms": 5.6,
+   "gain_p90_ms": -16.8,
    "need_gain_ms": 50.0,
    "ci_gain_median": [
-    -0.565,
-    20.059
+    -9.863,
+    30.53
    ],
    "ci_gain_p90": [
-    -1198.038,
-    1289.263
+    -1180.391,
+    1276.743
    ],
    "error_rate": 0.0,
    "reason": "median chắc chắn KHÔNG đạt ngưỡng; P90 trong nhiễu",
-   "paused_runs": 0
+   "paused_runs": 0,
+   "own_429": 0
   },
   "v2_redirect": {
+   "inc_vs": "v2_ssl",
    "verdict_vs_ref": "WIN",
    "win_vs_ref": true,
    "incremental_ok": true,
    "inc_state": "ok",
    "recommend_on": true,
    "decision": "on",
-   "gain_median_ms": 285.9,
-   "gain_p90_ms": 1583.8,
+   "gain_median_ms": 284.2,
+   "gain_p90_ms": 1576.9,
    "need_gain_ms": 50.0,
    "ci_gain_median": [
-    277.475,
-    294.716
+    270.037,
+    308.066
    ],
    "ci_gain_p90": [
-    195.458,
-    1618.272
+    202.558,
+    1624.577
    ],
    "error_rate": 0.0,
    "reason": "median chắc chắn nhanh hơn; P90 chắc chắn nhanh hơn",
-   "paused_runs": 0
+   "paused_runs": 0,
+   "own_429": 0
   },
   "v2_hedge": {
+   "inc_vs": "v2_redirect",
    "verdict_vs_ref": "WIN",
    "win_vs_ref": true,
    "incremental_ok": false,
    "inc_state": "unsure",
    "recommend_on": false,
    "decision": "inconclusive",
-   "gain_median_ms": 279.3,
-   "gain_p90_ms": 1432.4,
+   "gain_median_ms": 279.6,
+   "gain_p90_ms": 1393.9,
    "need_gain_ms": 50.0,
    "ci_gain_median": [
-    229.778,
-    289.468
+    234.392,
+    300.866
    ],
    "ci_gain_p90": [
-    232.553,
-    1550.458
+    220.833,
+    1557.821
    ],
    "error_rate": 0.0,
    "reason": "median chắc chắn nhanh hơn; P90 chắc chắn nhanh hơn; có thể chậm hơn v2_redirect (trong nhiễu)",
-   "paused_runs": 0
+   "paused_runs": 0,
+   "own_429": 0
   },
   "v2_full": {
+   "inc_vs": "v2_redirect",
    "verdict_vs_ref": "WIN",
    "win_vs_ref": true,
-   "incremental_ok": true,
-   "inc_state": "ok",
-   "recommend_on": true,
-   "decision": "on",
-   "gain_median_ms": 282.1,
-   "gain_p90_ms": 1479.3,
+   "incremental_ok": false,
+   "inc_state": "unsure",
+   "recommend_on": false,
+   "decision": "inconclusive",
+   "gain_median_ms": 280.4,
+   "gain_p90_ms": 1490.1,
    "need_gain_ms": 50.0,
    "ci_gain_median": [
-    226.67,
-    290.331
+    235.443,
+    307.172
    ],
    "ci_gain_p90": [
-    282.595,
-    1556.466
+    321.119,
+    1564.789
    ],
    "error_rate": 0.0,
-   "reason": "median chắc chắn nhanh hơn; P90 chắc chắn nhanh hơn",
-   "paused_runs": 0
+   "reason": "median chắc chắn nhanh hơn; P90 chắc chắn nhanh hơn; có thể chậm hơn v2_redirect (trong nhiễu)",
+   "paused_runs": 0,
+   "own_429": 0
   },
   "v2_full_auto": {
+   "inc_vs": "v2_full",
    "verdict_vs_ref": "UNSURE",
    "win_vs_ref": false,
    "incremental_ok": false,
    "inc_state": "slower",
    "recommend_on": false,
    "decision": "off",
-   "gain_median_ms": 54.7,
-   "gain_p90_ms": 59.5,
+   "gain_median_ms": 59.6,
+   "gain_p90_ms": 53.1,
    "need_gain_ms": 100.0,
    "ci_gain_median": [
-    -1.794,
-    279.719
+    -4.248,
+    291.322
    ],
    "ci_gain_p90": [
-    -1300.681,
-    1336.496
+    -1308.649,
+    1337.093
    ],
    "error_rate": 0.0,
    "reason": "median trong nhiễu; P90 trong nhiễu; chậm hơn rõ so với v2_full",
-   "paused_runs": 0
+   "paused_runs": 0,
+   "own_429": 0
   },
   "warm_all_auto": {
+   "inc_vs": null,
    "verdict_vs_ref": "LOSE",
    "win_vs_ref": false,
    "incremental_ok": true,
    "inc_state": "ok",
    "recommend_on": false,
    "decision": "off",
-   "gain_median_ms": 2.6,
-   "gain_p90_ms": -14.1,
+   "gain_median_ms": 1.4,
+   "gain_p90_ms": -16.4,
    "need_gain_ms": 100.0,
    "ci_gain_median": [
-    -11.034,
-    10.941
+    -21.636,
+    23.636
    ],
    "ci_gain_p90": [
-    -1209.756,
-    65.852
+    -1182.484,
+    55.365
    ],
    "error_rate": 0.0,
    "reason": "median chắc chắn KHÔNG đạt ngưỡng; P90 chắc chắn KHÔNG đạt ngưỡng",
-   "paused_runs": 0
+   "paused_runs": 0,
+   "own_429": 0
   },
   "range_auto": {
    "decision": "off",
@@ -262,27 +274,27 @@
      "attempts": 3
     },
     {
-     "ms": 3625,
+     "ms": 3632,
      "state": "FAILED",
      "attempts": 3
     },
     {
-     "ms": 3625,
+     "ms": 3633,
      "state": "FAILED",
      "attempts": 3
     },
     {
-     "ms": 3623,
+     "ms": 3626,
      "state": "FAILED",
      "attempts": 3
     },
     {
-     "ms": 3624,
+     "ms": 3627,
      "state": "FAILED",
      "attempts": 3
     }
    ],
-   "median_ms": 3624
+   "median_ms": 3627
   },
   "on": {
    "runs": [
@@ -292,12 +304,12 @@
      "attempts": 1
     },
     {
-     "ms": 303,
+     "ms": 302,
      "state": "DONE",
      "attempts": 1
     },
     {
-     "ms": 302,
+     "ms": 303,
      "state": "DONE",
      "attempts": 1
     },
