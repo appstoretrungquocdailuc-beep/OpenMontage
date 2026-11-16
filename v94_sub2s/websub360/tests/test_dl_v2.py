@@ -1027,16 +1027,20 @@ def test_range_auto_uses_one_connection_while_cautious_or_paused(tmp_path, gvs, 
     assert seen == [1]                                                               # đang tạm dừng vì 429 → không chia 4 đoạn
 
 
-def test_429_pause_survives_restart_and_recover_keeps_next_try(tmp_path):
-    ws.reset_dl_v2_state()
+def test_429_pause_survives_restart_and_recover_keeps_next_try(tmp_path, monkeypatch):
     ws.set_net_opts(dict(ws.NET_OPTS_OFF, dl_hedge=True))
     e = T.make_engine(tmp_path, T.CH[:1], excel_enabled=False)
+    f = tmp_path / "pause_test.txt"
+    monkeypatch.setattr(ws, "_SPEC_FILE", [f])                                      # tách khỏi file của engine/luồng nền khác
     ws.note_429()
-    assert (tmp_path / "ws360_spec_pause.txt").exists()
+    assert 590 <= float(f.read_text(encoding="utf-8")) - time.time() <= 600
     ws.reset_dl_v2_state()
     assert not ws.spec_paused()
-    left = ws.load_spec_pause(tmp_path / "ws360_spec_pause.txt")                       # = Engine mới sau khởi động lại
+    left = ws.load_spec_pause(f)                                                     # = Engine mới sau khởi động lại
     assert 500 < left <= 600 and ws.spec_paused()
+    f.write_text(f"{time.time() - 5:.0f}", encoding="utf-8")                         # đã hết hạn → không tạm dừng
+    ws.reset_dl_v2_state()
+    assert ws.load_spec_pause(f) == 0.0 and not ws.spec_paused()
     e.db.x("INSERT INTO videos(video_id, channel_id, url, engine, detected_at, state, next_try, error) VALUES(?,?,?,?,?,?,?,?)",
            ("REC429VID01", T.CH[0], "u", "WEBSUB", ws.iso(), "RETRY_WAIT", time.time() + 30, "HttpStatus: HTTP 429"))
     e.recover()

@@ -1158,8 +1158,11 @@ def note_429():
     _SPEC_OFF[0] = time.monotonic() + _SPEC_PAUSE_S
     DL_STATS["spec_pause_429"] += 1
     if _SPEC_FILE[0] is not None:
-        try:
-            Path(_SPEC_FILE[0]).write_text(f"{time.time() + _SPEC_PAUSE_S:.0f}", encoding="utf-8")
+        try:                                            # ghi nguyên tử: không bao giờ để file dở dang (đọc lúc khởi động)
+            dst = Path(_SPEC_FILE[0])
+            tmp = dst.with_name(f".{dst.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+            tmp.write_text(f"{time.time() + _SPEC_PAUSE_S:.0f}", encoding="utf-8")
+            os.replace(tmp, dst)
         except OSError:
             pass
 
