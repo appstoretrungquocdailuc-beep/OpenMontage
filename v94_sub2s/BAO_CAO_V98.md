@@ -67,7 +67,24 @@ Ngoài ra: worker tự học trước đây so `xfer_mbps` (không thấy TTFB) 
   2 giờ, dùng `learn`); **log chẩn đoán** (`lỗi từ host=chính|replica | header 206: chính=a/b replica=c/d`).
 - Muốn tắt hẳn dual ngay: `set V98_RACE_MODE=learn` trong `RUN_V9_8_GUI.bat`.
 
-**Kiểm thử V9.8.1:** toàn bộ **222 passed + 1 xfailed** (bản 21:30, thêm 3 test failover / tự bảo vệ / 429). Bản trước: **219 passed + 1 xfailed** (xfail = test V9.3 cũ về Excel, không liên quan). Thêm 7 test: dual (2N kết nối đều tải, host chính chậm → hedge, replica 403 → về host chính, cả hai 403 → lỗi cứng không spam, chỉ áp dụng video có replica), ép aria2 (SHA đúng, ≤ 16 kết nối, 403 đúng 1 request, sai dung lượng → về RANGE-TURBO), trần split 16. 3 test luật race V9.4.1 được ghim vào `V98_RACE_MODE=fixed` (chế độ mà chúng kiểm tra).
+**Log thật 21:23 (V9.8.1, video 229,7 MB, link native, dual, KHÔNG 401)**
+
+- 229,71 MB trong **3,488 s** = 552 Mbps (video 200,7 MB hôm trước: 4,249 s = 396 Mbps). HOT READY 3,637 s.
+- Tiến độ: 0→1,06 s chỉ 12 MB; 1,06→2,10 s 97 MB (≈783 Mbps); 2,10→3,14 s 108 MB (**≈875 Mbps** → đường truyền chịu được
+  ít nhất mức này); 0,35 s cuối 12 MB.
+- Giây đầu chậm vì replica chậm cả cụm (`alt=1.39s/52req`) trong khi host chính nhanh (`main=0.17s/118req`): 32 đoạn gán cho
+  replica chờ ~0,85 s mới hedge, mỗi lúc chỉ 16 hedge (`hedge_real=36`).
+- **Sửa (`V98_DUAL_FAST_HEDGE`, mặc định bật):** host mình chưa trả header nào mà host kia đã trả ≥ ¼ số worker → hedge sau
+  (TTFB host kia + 0,1 s), không giới hạn 25%. MOCK R9 (83,5 MiB, 6 vòng): kịch bản replica chậm (S5) 1430 / 1451 → **1267 / 1358 ms**,
+  request 258 → 210; host chính chậm (S3) 1561 → 1521 ms; S4, S2 không đổi. V9.7.1 ở S5: 1617 / 1655 ms.
+- Sàn vật lý cho 230 MB ở 875 Mbps: ≈ 2,2 s truyền + ~0,5 s TTFB + 0,14 s resolve ≈ **2,85 s**.
+
+**GUI: lựa chọn "ARIA2C (ép)"** trong ô *Công cụ tải (Download Engine)* — video + audio 480p tải bằng aria2c RPC (tối đa 16 kết
+nối/máy chủ, `max-tries=1`, 403/429 không thử lại cùng link, lỗi khác → RANGE-TURBO). Mặc định vẫn là *SMART AUTO* (RANGE-TURBO).
+Lựa chọn được lưu trong config. Log mỗi video: `[ARIA2-RPC] ✅ VIDEO | …MB | …s | ≈…Mbps | ttfb=… | kết nối thật=N/16 (ép aria2c)`.
+360p không đổi.
+
+**Kiểm thử V9.8.1:** toàn bộ **__SUITE2__** (bản mới nhất: + GUI aria2c + fast-hedge). Bản 21:30: **222 passed + 1 xfailed** (bản 21:30, thêm 3 test failover / tự bảo vệ / 429). Bản trước: **219 passed + 1 xfailed** (xfail = test V9.3 cũ về Excel, không liên quan). Thêm 7 test: dual (2N kết nối đều tải, host chính chậm → hedge, replica 403 → về host chính, cả hai 403 → lỗi cứng không spam, chỉ áp dụng video có replica), ép aria2 (SHA đúng, ≤ 16 kết nối, 403 đúng 1 request, sai dung lượng → về RANGE-TURBO), trần split 16. 3 test luật race V9.4.1 được ghim vào `V98_RACE_MODE=fixed` (chế độ mà chúng kiểm tra).
 
 **Cần bạn gửi lại:** vài dòng log `[RANGE-TURBO] ✅ HOÀN TẤT VIDEO` của bản V9.8.1 (có `race=dual`), tốt nhất gồm 2–3 video
 **40–60 MB**. Nhìn `workers=`, `xfer≈`, `ttfb=`, `splits=`: nếu `xfer` tăng rõ so với bảng trên mà `ttfb` không tăng → dual
