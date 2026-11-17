@@ -5025,7 +5025,7 @@ def _v98_aria2_forced(url, temp_dir, filename, logger, min_bytes, expected, medi
                      "elapsed_ms": round(el * 1000.0, 2), "ttfb_ms": ai.get("ttfb_ms"), "connections": ai.get("connections"),
                      "mbps": round(size * 8 / 1e6 / el, 1), "workers_initial": ai.get("split")})
         logger(f"    [ARIA2-RPC] ✅ {media_kind.upper()} | {size/1048576:.2f}MB | {el:.3f}s | ≈{size*8/1e6/el:.0f}Mbps | "
-               f"ttfb={float(ai.get('ttfb_ms') or 0)/1000:.2f}s | kết nối thật={ai.get('connections')}/{ai.get('split')} (V98_FORCE_ARIA2)")
+               f"ttfb={float(ai.get('ttfb_ms') or 0)/1000:.2f}s | kết nối thật={ai.get('connections')}/{ai.get('split')} (ép aria2c)")
         return True
     for q in (temp_file, Path(str(temp_file) + ".aria2")):
         try:
@@ -5055,7 +5055,7 @@ def _download_http_range_turbo(url: str, temp_dir: Path, filename: str, logger,
                          "fail_reason": "" if ok else "v93_fail"})
         return ok
     info = info if isinstance(info, dict) else {}
-    if V98_FORCE_ARIA2 and ARIA2C_PATH and int(expected_bytes or 0) > 0:
+    if (V98_FORCE_ARIA2 or info.get("force_aria2")) and ARIA2C_PATH and int(expected_bytes or 0) > 0:
         r = _v98_aria2_forced(url, temp_dir, filename, logger, min_bytes, int(expected_bytes), media_kind, info)
         if r is not None:
             return r
@@ -6391,6 +6391,10 @@ class Worker(threading.Thread):
         self.keep_temp      = self.master.keep_temp_checkbox.isChecked()
         self.final_move_dir = self.master.final_move_entry.text().strip()
         self.download_engine = (self.master.combo_downloader.currentData() or "aria2c").lower()
+        # V9.8.1: lựa chọn GUI "ARIA2C (ép)" = như SMART AUTO nhưng video/audio 480p tải bằng aria2c RPC (≤16 kết nối/máy chủ)
+        self.force_aria2 = bool(V98_FORCE_ARIA2 or self.download_engine == "aria2c_force")
+        if self.download_engine == "aria2c_force":
+            self.download_engine = "aria2c"
         # V9.5: chế độ chất lượng chụp 1 lần lúc tạo Worker (đổi radio giữa chừng không ảnh hưởng job đang chạy).
         try:
             _qm = self.master.quality_mode() if callable(getattr(self.master, "quality_mode", None)) else "480hard"
@@ -7136,7 +7140,7 @@ class Worker(threading.Thread):
                     t_v0 = time.perf_counter_ns()
                     vinfo = self._v94["video"]
                     vinfo.update({"job": self._v94["job"], "itag": str(d.get("video_format_id") or ""),
-                                  "source": str(d.get("source") or "")})
+                                  "source": str(d.get("source") or ""), "force_aria2": self.force_aria2})
                     source = str(d.get("source") or "")
                     expected = int(d.get("video_content_length") or 0)
                     fmt_id = str(d.get("video_format_id") or "?")
@@ -7205,7 +7209,7 @@ class Worker(threading.Thread):
                     t_a0 = time.perf_counter_ns()
                     ainfo = self._v94["audio"]
                     ainfo.update({"job": self._v94["job"], "itag": str(d.get("audio_format_id") or ""),
-                                  "source": str(d.get("source") or ""),
+                                  "source": str(d.get("source") or ""), "force_aria2": self.force_aria2,
                                   "inferred_single_ja": bool(d.get("audio_inferred_single_ja"))})
                     source = str(d.get("source") or "")
                     expected = int(d.get("audio_content_length") or 0)
@@ -7757,6 +7761,7 @@ class PremiumDownloaderApp(QWidget):
         self.combo_downloader = QComboBox()
         self.combo_downloader.addItem("SMART AUTO — Direct small + Aria2 RPC (khuyến nghị)", "aria2c")
         self.combo_downloader.addItem("IDM — video 244→135; audio Nhật tải song song", "idm")
+        self.combo_downloader.addItem("ARIA2C (ép) — 480p tải bằng aria2c RPC, tối đa 16 kết nối/máy chủ", "aria2c_force")
         self.combo_downloader.setToolTip(
             f"IDM: {IDM_PATH}" if IDM_PATH else "IDM: chưa tìm thấy IDMan.exe trên máy"
         )
@@ -7894,7 +7899,7 @@ class PremiumDownloaderApp(QWidget):
                 "Đã chọn IDM nhưng tool không tìm thấy IDMan.exe.\n"
                 "Hãy cài IDM bình thường hoặc đặt IDMan.exe cạnh file tool rồi mở lại tool."
             ); return
-        if engine == "aria2c" and not ARIA2C_PATH:
+        if engine in ("aria2c", "aria2c_force") and not ARIA2C_PATH:
             QMessageBox.warning(self, "Không tìm thấy Aria2c", "Đã chọn Aria2c nhưng không tìm thấy aria2c.exe."); return
         
         if self.realtime_thread and self.realtime_thread.is_alive(): return
@@ -7970,7 +7975,8 @@ class PremiumDownloaderApp(QWidget):
             + (f"(video 2N kết nối đều tải ≤{V98_DUAL_MAX_CONNS}; audio=learn)" if V98_RACE_MODE == "dual" else "")
             + f" | worker={'TỰ HỌC (×' + str(V98_WORKERS_LEARN_MUL) + ' ≤' + str(V98_SCALE_MAX) + ')' if V98_WORKERS_LEARN else 'cố định'}"
             + f" | scale-up={'BẬT ≤' + str(V98_SCALE_MAX) if V98_SCALE_UP else 'tắt'}"
-            + (" | ⚠️ ÉP ARIA2C (≤16 kết nối)" if V98_FORCE_ARIA2 else "")
+            + (" | ⚠️ ÉP ARIA2C (≤16 kết nối/máy chủ; chọn SMART AUTO để về RANGE-TURBO)"
+               if (V98_FORCE_ARIA2 or (self.combo_downloader.currentData() or "") == "aria2c_force") else "")
             + (f" | đoạn đầu ≤{V98_PART_MIB}MiB" if float(V98_PART_MIB or 0) > 0 else "")
             + " | rollback: đặt biến môi trường V98_* (xem BAO_CAO_V98.md)"
         )

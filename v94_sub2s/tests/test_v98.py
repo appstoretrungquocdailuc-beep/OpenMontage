@@ -529,3 +529,70 @@ def test_aria2_split_clamped_to_16(v94, gvs, tmp_path, monkeypatch):
     ok = v94._download_aria2c_rpc(gvs.add("/cl", data), tmp_path, "cl.bin", lambda m: None, 1, 100 * MB, info=info)
     assert ok and info["split"] == 16
     assert sha256((tmp_path / "cl.bin").read_bytes()) == sha256(data)
+
+
+# ----------------------------------------------------------------------------- GUI: lựa chọn "ARIA2C (ép)"
+def test_gui_has_force_aria2_option_and_saves_it(v94, monkeypatch, tmp_path):
+    import json
+    from conftest import get_qapp
+    if get_qapp() is None:
+        pytest.skip("cần PySide6 thật")
+    monkeypatch.setattr(v94, "CONFIG_JSON", str(tmp_path / "cfg.json"))
+    monkeypatch.setattr(v94, "CONFIG_THEME_JSON", str(tmp_path / "theme.json"))
+    w = v94.PremiumDownloaderApp()
+    assert w.combo_downloader.currentData() == "aria2c"                 # mặc định KHÔNG đổi: SMART AUTO (RANGE-TURBO)
+    idx = w.combo_downloader.findData("aria2c_force")
+    assert idx >= 0
+    w.combo_downloader.setCurrentIndex(idx)
+    w._save_config()
+    assert json.load(open(tmp_path / "cfg.json", encoding="utf-8"))["download_engine"] == "aria2c_force"
+    w2 = v94.PremiumDownloaderApp()
+    assert w2.combo_downloader.currentData() == "aria2c_force"
+    for x in (w, w2):
+        x.logger_qt.stop()
+
+
+def _mk_worker(v94, tmp_path, engine):
+    import types
+
+    class _T:
+        def __init__(self, v): self.v = v
+        def text(self): return self.v
+
+    class _C:
+        def isChecked(self): return False
+
+    class _Combo:
+        def currentData(self): return engine
+    m = types.SimpleNamespace()
+    m.worker_signals = v94.WorkerSignals()
+    m.out_entry, m.keep_temp_checkbox, m.final_move_entry = _T(str(tmp_path / "out")), _C(), _T(str(tmp_path / "final"))
+    m.combo_downloader, m.cutsec_entry = _Combo(), _T("0")
+    m.quality_mode = lambda: "480hard"
+    m.realtime_stop_event = threading.Event()
+    return v94.Worker(m, "", "URL", "STATUS")
+
+
+def test_worker_force_aria2_from_gui_choice(v94, tmp_path, monkeypatch):
+    monkeypatch.setattr(v94, "ARIA2C_PATH", shutil.which("aria2c") or "/bin/true")
+    w = _mk_worker(v94, tmp_path, "aria2c_force")
+    assert w.force_aria2 is True and w.download_engine == "aria2c"      # mọi nhánh khác coi như SMART AUTO
+    w = _mk_worker(v94, tmp_path, "aria2c")
+    assert w.force_aria2 is False and w.download_engine == "aria2c"
+    w = _mk_worker(v94, tmp_path, "idm")
+    assert w.force_aria2 is False and w.download_engine == "idm"
+
+
+@need_aria2
+def test_force_aria2_per_job_info(v94, gvs, tmp_path, monkeypatch):
+    """Lựa chọn GUI truyền qua info['force_aria2'] của từng job (không cần biến môi trường)."""
+    monkeypatch.setattr(v94, "ARIA2C_PATH", shutil.which("aria2c"))
+    assert v94.V98_FORCE_ARIA2 is False
+    data = make_payload(10 * MB, seed=70)
+    url = gvs.add("/gj", data, rate=3 * MB)
+    ok, info = _dl(v94, url, tmp_path, "gj.bin", len(data), info={"force_aria2": True})
+    assert ok and info["engine"] == "aria2_rpc" and 1 <= info["connections"] <= 16
+    assert sha256((tmp_path / "gj.bin").read_bytes()) == sha256(data)
+    ok, info = _dl(v94, url, tmp_path, "gj2.bin", len(data), "audio", info={"force_aria2": True})
+    assert ok and info["engine"] == "aria2_rpc"
+    assert sha256((tmp_path / "gj2.bin").read_bytes()) == sha256(data)
