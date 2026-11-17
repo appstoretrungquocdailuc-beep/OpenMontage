@@ -306,6 +306,8 @@ def configs_from(args, eng_mods):
                             variants = ({"": {}} if eng != "B" else (args.b_variants or {"": {}}))
                             for vn, vflags in variants.items():
                                 fl = dict(flags)
+                                if vn and rc != "adaptive":
+                                    fl.pop("V98_RACE_MODE", None)      # biến thể có tên: giữ MẶC ĐỊNH của bản B (không ép fixed)
                                 if eng == "B":
                                     fl["V98_PART_MIB"] = pm
                                     fl.update(args.b_flags or {})
