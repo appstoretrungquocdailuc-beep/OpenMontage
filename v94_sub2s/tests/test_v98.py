@@ -437,7 +437,50 @@ def test_dual_main_403_is_hard_fail(v94, gvs, tmp_path, monkeypatch):
     v94._MN_RACE_BAD_UNTIL[0] = 0.0
     assert not ok and info["fail_reason"] == "HTTP_403"
     assert not (tmp_path / "m4.bin").exists()
-    assert len(gvs.requests_for("/m403/")) <= 2 * 24
+    assert len(gvs.requests_for("/m403/")) <= 2 * 12 + 2        # mỗi đoạn đúng 1 request: KHÔNG failover khi cả 2 host từ chối
+    # tự bảo vệ: dual tắt 30 phút → job sau dùng learn (race như V9.8), vẫn đúng từng byte
+    assert v94._V98_DUAL_GUARD["strikes"] == 1 and v94._V98_DUAL_GUARD["until"] > time.time() + 1000
+    monkeypatch.setattr(v94, "V98_WORKERS_LEARN", False)
+    data = make_payload(16 * MB, seed=67)
+    main2 = _two_host_rate(v94, gvs, monkeypatch, data, 0.05, 0.05, "aftg", 0)
+    ok, info = _dl(v94, main2, tmp_path, "ag.bin", len(data))
+    assert ok and info["dual"] is False and info["race_mode"].startswith("learn") and info["workers_initial"] == 12
+    assert sha256((tmp_path / "ag.bin").read_bytes()) == sha256(data)
+
+
+@pytest.mark.parametrize("code", [401, 403])
+def test_dual_failover_when_main_rejects_but_replica_serves(v94, gvs, tmp_path, monkeypatch, code):
+    """Host chính từ chối, replica phục vụ được (race V9.7.1 vốn che được trường hợp này) → dual chuyển đoạn sang replica,
+    mỗi đoạn tối đa 1 request tới host lỗi, không tính là 'dual bị từ chối'."""
+    monkeypatch.setattr(v94, "V98_RACE_MODE", "dual")
+    monkeypatch.setattr(v94, "V98_WORKERS_LEARN", False)
+    monkeypatch.setattr(v94, "V94_RANGE_WORKERS_VIDEO", 12)
+    data = make_payload(16 * MB, seed=68)
+    main = gvs.add(f"/fo{code}/main", mode="status", code=code)
+    alt = gvs.add(f"/fo{code}/alt", data, hdr_delay=0.15)
+    monkeypatch.setattr(v94, "_gvs_alt_url", lambda u: alt if str(u) == main else "")
+    v94._MN_RACE_BAD_UNTIL[0] = 0.0
+    ok, info = _dl(v94, main, tmp_path, "fo.bin", len(data))
+    assert ok, info
+    assert sha256((tmp_path / "fo.bin").read_bytes()) == sha256(data)
+    assert info["failovers"] >= 10 and info["host_ok"][0] == 0
+    assert len(gvs.requests_for(f"/fo{code}/main")) <= 12 + 1
+    assert v94._V98_DUAL_GUARD["strikes"] == 0
+
+
+def test_dual_429_never_fails_over(v94, gvs, tmp_path, monkeypatch):
+    monkeypatch.setattr(v94, "V98_RACE_MODE", "dual")
+    monkeypatch.setattr(v94, "V98_WORKERS_LEARN", False)
+    monkeypatch.setattr(v94, "V94_RANGE_WORKERS_VIDEO", 12)
+    data = make_payload(16 * MB, seed=69)
+    main = gvs.add("/f429/main", mode="status", code=429, headers={"Retry-After": "2"})
+    alt = gvs.add("/f429/alt", data, hdr_delay=0.3)
+    monkeypatch.setattr(v94, "_gvs_alt_url", lambda u: alt if str(u) == main else "")
+    v94._MN_RACE_BAD_UNTIL[0] = 0.0
+    ok, info = _dl(v94, main, tmp_path, "f9.bin", len(data))
+    assert not ok and info["fail_reason"] == "HTTP_429" and info["failovers"] == 0
+    assert len(gvs.requests_for("/f429/main")) <= 12
+    assert not (tmp_path / "f9.bin").exists()
 
 
 def test_dual_only_for_video_with_replica(v94, gvs, tmp_path, monkeypatch):

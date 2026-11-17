@@ -153,4 +153,6 @@ def _v98_reset_learning():
     if m is not None and hasattr(m, "_V98_RACE_HIST"):
         m._V98_RACE_HIST.clear()
         m._V98_WL.clear()
+        if hasattr(m, "_V98_DUAL_GUARD"):
+            m._V98_DUAL_GUARD.update(until=0.0, strikes=0)
     yield

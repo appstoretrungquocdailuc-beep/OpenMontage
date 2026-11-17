@@ -325,6 +325,24 @@ V98_RACE_PROBES = _v98_env("RACE_PROBES", 2)
 # Đoạn kẹt ở host chậm: hedge sang host kia khi host kia đã có header (chờ 1.5×TTFB của nó + 0.1 s) hoặc quá
 # V98_FIRST_HEDGE_SEC; sau đó work-stealing lo phần còn lại. Chỉ áp dụng cho VIDEO; audio giữ luật "learn".
 V98_DUAL_MAX_CONNS = _v98_env("DUAL_MAX_CONNS", 64)
+# Tự bảo vệ: job dual bị máy chủ từ chối (401/403/404/410) → tắt dual 30 phút (dùng "learn" như V9.8); các lần sau
+# trong cùng phiên → 2 giờ. (Log thật 17/11 21:06: lần dual đầu tiên trên link native bị HTTP_401.)
+V98_DUAL_GUARD_SEC = _v98_env("DUAL_GUARD_SEC", 1800.0)
+_V98_DUAL_GUARD = {"until": 0.0, "strikes": 0}
+_V98_DUAL_GUARD_LOCK = threading.Lock()
+
+
+def _v98_dual_strike(reason: str, logger=None):
+    with _V98_DUAL_GUARD_LOCK:
+        _V98_DUAL_GUARD["strikes"] += 1
+        n = _V98_DUAL_GUARD["strikes"]
+        hold = float(V98_DUAL_GUARD_SEC) * (1 if n == 1 else 4)
+        _V98_DUAL_GUARD["until"] = time.time() + hold
+    if logger:
+        try:
+            logger(f"    🛡️ DUAL bị từ chối ({reason}, lần {n}) → tắt dual {hold / 60:.0f} phút, dùng race=learn như V9.8")
+        except Exception:  # noqa: BLE001
+            pass
 # Tốc độ/ETA của mỗi đoạn tính từ lúc CÓ HEADER (bắt đầu nhận dữ liệu), không phải từ lúc gửi request. V9.7.1 chia cho cả
 # thời gian chờ máy chủ (TTFB) → đoạn vừa bắt đầu bị coi là "chậm" → chẻ đôi thừa, mỗi lần chẻ tốn thêm 1 vòng TTFB
 # (log thật 17/11, video 83 MB: 49 lần chẻ, 8 MB cuối mất 0,8 s). 0 = cách tính V9.7.1.
@@ -4030,7 +4048,8 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
     def _dual_ok(w):
         return bool(V98_RACE_MODE == "dual" and not is_audio and size_known and RANGE_MN_RACE and w >= 4 and w > _le0
                     and int(V94_FIRST_WAVE_RACE_MAX) != 0 and not int(info.get("workers_override") or 0)
-                    and time.time() >= _MN_RACE_BAD_UNTIL[0] and _gvs_alt_url(url))
+                    and time.time() >= _MN_RACE_BAD_UNTIL[0] and time.time() >= _V98_DUAL_GUARD["until"]
+                    and _gvs_alt_url(url))
     if size_known:
         workers = _range_worker_count(total0, media_kind, svw)
         if int(info.get("workers_override") or 0) > 0:      # V9.6: ép N đoạn (A/B 360p)
@@ -4112,7 +4131,8 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
              "splits": 0, "takeovers": 0, "losers": [], "loser_pending": 0, "inflight": 0, "conc_peak": 0,
              "conn_ids": set(), "req_seq": 0, "late_ttfb": [], "body_rates": [], "bans": 0,
              # V9.8 telemetry
-             "lock_hold_ns": 0, "write_ns": 0, "w_inflight": 0, "scale_added": 0, "scale_steps": []}
+             "lock_hold_ns": 0, "write_ns": 0, "w_inflight": 0, "scale_added": 0, "scale_steps": [],
+             "host_ok": [0, 0], "host_err": [0, 0], "err_host": -1, "failovers": 0}
     # V9.4.1: file nhỏ (<= V94_RACE_ALL_IF_WORKERS_LE segment đợt đầu) race TẤT CẢ như V9.3; file lớn giữ trần.
     # Log live: video 6 worker chỉ race 4 → 2 segment còn lại phải chờ host chính + 302 (+~150ms trong mock).
     _rm = int(V94_FIRST_WAVE_RACE_MAX)
@@ -4384,7 +4404,31 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
                     state["hedges"] += 1
                     state["host_req"][other_h] += 1
                 return ok_
-        while not _try_budget():
+        _force = False
+        if (dual and seg.first and seg.retries == 0 and seg.hpre >= 0 and f_first.done()
+                and f_first.exception() is not None and getattr(f_first.exception(), "status", None) != 429):
+            # V9.8.1 FAILOVER: host được gán báo lỗi → chuyển đoạn sang host kia, NHƯNG chỉ khi host kia đã phục vụ được 206
+            # trong job này (chờ tối đa 0.6 s). Cả 2 host cùng lỗi → không thử thêm (link bị từ chối thật → SAFE-REFRESH).
+            _fe = time.perf_counter() + 0.6
+            _proven = False
+            with lock:
+                state["host_err"][first_h] += 1
+            while not finished.is_set():
+                with lock:
+                    _proven = state["host_ok"][other_h] > 0 and not (other_h == 1 and state["alt_ok"] is False)
+                    _both = state["host_err"][other_h] > 0 and state["host_ok"][other_h] == 0
+                    _dead = state["error"] is not None or state["closed"]
+                if _proven or _both or _dead or time.perf_counter() >= _fe:
+                    break
+                time.sleep(0.02)
+            if _proven and not _dead:
+                with lock:
+                    state["hedges"] += 1
+                    state["host_req"][other_h] += 1
+                    state["hedging"] += 1
+                    state["failovers"] += 1
+                _force = True
+        while not _force and not _try_budget():
             if f_first.done() or finished.is_set() or state["alt_ok"] is False:
                 seg.h = first_h
                 return (*f_first.result(), urls[first_h], traces[first_h])
@@ -4536,6 +4580,7 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
                 _hn = time.perf_counter() - seg.t_start
                 _ht = state["host_ttfb"][seg.h]
                 state["host_ttfb"][seg.h] = _hn if _ht is None else 0.7 * _ht + 0.3 * _hn
+                state["host_ok"][seg.h] += 1
                 if seg.h == 1:
                     state["alt_ok"] = True
                 if seg.h == 0 and got_url != cur_url and state["url"] == cur_url:
@@ -4681,6 +4726,7 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
                             or es.startswith("no_content_range") or es.startswith("inconsistent_total")
                             or es.startswith("size_mismatch") or es.startswith("content_range")):
                         state["error"] = e
+                        state["err_host"] = seg.h
                     elif seg.retries + 1 > RANGE_SEG_MAX_RETRY:
                         state["error"] = e
                     else:
@@ -4822,7 +4868,11 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
             except OSError:
                 pass
         if err is not None:
-            logger(f"    [RANGE-TURBO] ⚠️ {type(err).__name__}: {err} → fallback")
+            _eh = state["err_host"]
+            logger(f"    [RANGE-TURBO] ⚠️ {type(err).__name__}: {err} → fallback"
+                   + f" | sau {time.perf_counter() - t0:.2f}s | lỗi từ host={'chính' if _eh == 0 else 'replica' if _eh == 1 else '?'}"
+                   + f" | header 206: chính={state['host_ok'][0]}/{state['host_req'][0]}req replica={state['host_ok'][1]}/{state['host_req'][1]}req"
+                   + f" | {done / 1048576:.2f}MB đã nhận | race={race_mode_s} workers={workers}")
             return False
         size = temp_file.stat().st_size if temp_file.exists() else 0
         if done != total or size != total or size < min_bytes:
@@ -4859,7 +4909,8 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
                  + f" conc_peak={state['conc_peak']} splits={state['splits']} takeovers={state['takeovers']}"
                  + f" prealloc={prealloc_ms:.0f}ms" + (f" ab={svw}" if svw and total <= 4 * 1048576 else "")
                  + (f" prealloc_bg={_pa['ms']:.0f}ms" if V98_PREALLOC_ASYNC and _pa["ms"] is not None else "")
-                 + (f" race={race_mode_s}" if race_mode_s != "fixed" else "") + (f" wl={_wl_arm}" if _wl_arm else "") + (f" scale+{state['scale_added']}" if state["scale_added"] else "")
+                 + (f" race={race_mode_s}" if race_mode_s != "fixed" else "") + (f" wl={_wl_arm}" if _wl_arm else "")
+                 + (f" failover={state['failovers']}" if state["failovers"] else "") + (f" scale+{state['scale_added']}" if state["scale_added"] else "")
                  + f" lock_wait={state['lock_wait_ns'] / 1e6:.0f}ms lock_hold={state['lock_hold_ns'] / 1e6:.0f}ms"
                  + f" write={state['write_ns'] / 1e6:.0f}ms/{state['writes']}x({wmode})")
         logger(
@@ -4893,6 +4944,8 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
         ex.shutdown(wait=False, cancel_futures=True)
         if _rmode == "learn" and state["alt"] and (state["races"] or state["hedges"]):
             _v98_race_note(state["alt_wins"] > 0)
+        if dual and not ok and str(state["error"] or "").startswith(("HTTP_401", "HTTP_403", "HTTP_404", "HTTP_410")):
+            _v98_dual_strike(str(state["error"]), logger)
         _range_progress_end(temp_file)
         if not ok:
             try:
@@ -4937,7 +4990,7 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
             "lock_hold_ms": round(state["lock_hold_ns"] / 1e6, 3), "write_ms": round(state["write_ns"] / 1e6, 3),
             "write_mode": wmode, "race_mode": race_mode_s, "scale_added": state["scale_added"],
             "scale_steps": list(state["scale_steps"]), "part_bytes": int(part), "segments_initial": len(segs),
-            "workers_learn": _wl_arm, "dual": dual,
+            "workers_learn": _wl_arm, "dual": dual, "failovers": state["failovers"], "host_ok": list(state["host_ok"]),
         })
         if _wl_arm:
             _v98_workers_note(media_kind, _wl_arm, info.get("mbps"))    # Mbps TỔNG (gồm TTFB): log thật 17/11 cho thấy TTFB tăng theo số kết nối
