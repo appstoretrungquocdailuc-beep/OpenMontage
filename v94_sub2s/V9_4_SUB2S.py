@@ -328,6 +328,10 @@ V98_DUAL_MAX_CONNS = _v98_env("DUAL_MAX_CONNS", 64)
 # Tự bảo vệ: job dual bị máy chủ từ chối (401/403/404/410) → tắt dual 30 phút (dùng "learn" như V9.8); các lần sau
 # trong cùng phiên → 2 giờ. (Log thật 17/11 21:06: lần dual đầu tiên trên link native bị HTTP_401.)
 V98_DUAL_GUARD_SEC = _v98_env("DUAL_GUARD_SEC", 1800.0)
+# dual: host của mình CHƯA trả header nào mà host kia đã trả ≥ nửa số đoạn của nó → host mình chậm cả cụm: hedge sang host
+# kia sau (TTFB host kia + 0.1 s) thay vì 1.5×TTFB + 0.1 s, và không giới hạn 25% hedge đồng thời. (Log thật 17/11 21:23,
+# video 230 MB: replica TTFB 1.39 s, host chính 0.17 s → 32 đoạn của replica chờ tới ~1 s, giây đầu chỉ tải 12 MB.)
+V98_DUAL_FAST_HEDGE = _v98_env("DUAL_FAST_HEDGE", True)
 _V98_DUAL_GUARD = {"until": 0.0, "strikes": 0}
 _V98_DUAL_GUARD_LOCK = threading.Lock()
 
@@ -4366,6 +4370,10 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
                 _nw = time.perf_counter()
                 with lock:
                     _ot = state["host_ttfb"][other_h]
+                    _cluster_slow = (V98_DUAL_FAST_HEDGE and state["host_ok"][first_h] == 0
+                                     and state["host_ok"][other_h] >= max(2, workers // 4))
+                if _ot is not None and _cluster_slow and _nw - t_sub >= max(RANGE_HEDGE_DELAY_MIN, _ot + 0.10):
+                    break
                 if (_ot is not None and _nw - t_sub >= max(RANGE_HEDGE_DELAY_MIN, 1.5 * _ot + 0.10)) or _nw >= _dl:
                     break
         elif adaptive and seg.first and not race_now and seg.retries == 0:
@@ -4396,7 +4404,9 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
             with lock:
                 _a, _b = state["host_ttfb"]
                 alt_proven = state["alt_wins"] > 0 and _b is not None and (_a is None or _b < _a)
-                cap = workers if alt_proven else max(1, int(workers * RANGE_HEDGE_MAX_FRAC))
+                _cl = (dual and V98_DUAL_FAST_HEDGE and state["host_ok"][first_h] == 0
+                       and state["host_ok"][other_h] >= max(2, workers // 4))
+                cap = workers if (alt_proven or _cl) else max(1, int(workers * RANGE_HEDGE_MAX_FRAC))
                 ok_ = (not finished.is_set() and bool(urls[other_h]) and state["alt_ok"] is not False and
                        state["hedging"] < cap)
                 if ok_:

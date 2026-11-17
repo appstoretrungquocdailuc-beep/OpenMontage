@@ -123,6 +123,8 @@ SCENARIOS = {
                        link=380, v_conn=40.0, a_conn=20.0, redirect_ms=120, final_ms=200, alt_ms=420),
     "S4_log1117": dict(note="theo log thật 17/11 (video 83 MB): 16.4/9.7 Mbps mỗi kết nối, đường truyền 700 Mbps, 2 host TTFB ngang nhau",
                        link=700, v_conn=16.4, a_conn=9.7, redirect_ms=100, final_ms=200, alt_ms=250),
+    "S5_altslow": dict(note="theo log thật 17/11 21:23 (video 230 MB): host chính nhanh (TTFB ~0.2 s), REPLICA chậm (1.4 s), 18.6 Mbps mỗi kết nối, đường truyền 900 Mbps",
+                       link=900, v_conn=18.6, a_conn=20.0, redirect_ms=60, final_ms=140, alt_ms=1400),
     "S3_mainslow": dict(note="host chính CHẬM (302 + 650 ms), replica NHANH (150 ms) — kiểm tra P90 khi CDN chính kém",
                         link=600, v_conn=14.0, a_conn=7.4, redirect_ms=150, final_ms=500, alt_ms=150),
 }
