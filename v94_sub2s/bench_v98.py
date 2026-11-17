@@ -258,11 +258,12 @@ def _h2_fn(n):
 
 # Bộ biến thể đặt sẵn (BAT trên Windows không phải gõ JSON): --b-variants preset:<tên>
 _OFF = {"V98_PREALLOC_ASYNC": False, "V98_RACE_MODE": "fixed", "V98_WORKERS_LEARN": False, "V98_WRITE_MODE": "lock",
-        "V98_SCALE_UP": False}                              # = hành vi V9.7.1
+        "V98_SCALE_UP": False, "V98_ETA_FIRST_BYTE": False}  # = hành vi V9.7.1
 PRESETS = {
     # từng cờ riêng so với V9.7.1 ("off"), và bản V9.8 mặc định ("v98") ± ghi pwrite (ổ đĩa Windows thật)
     "flags": {"off": dict(_OFF), "pa": dict(_OFF, V98_PREALLOC_ASYNC=True), "split": dict(_OFF, V98_WRITE_MODE="split"),
-              "pwrite": dict(_OFF, V98_WRITE_MODE="pwrite"), "v98": {}, "v98_pwrite": {"V98_WRITE_MODE": "pwrite"}},
+              "pwrite": dict(_OFF, V98_WRITE_MODE="pwrite"), "learn": {"V98_RACE_MODE": "learn"}, "v981": {},
+              "v981_pwrite": {"V98_WRITE_MODE": "pwrite"}},
     "v98": {"v98": {}},
     "dual": {"learn": {"V98_RACE_MODE": "learn"}, "dual": {"V98_RACE_MODE": "dual"},
              "dual_fixw": {"V98_RACE_MODE": "dual", "V98_WORKERS_LEARN": False}},
@@ -270,7 +271,7 @@ PRESETS = {
     # live480 (nguyên pipeline): V9.8 / không prewarm ffmpeg / opt-in FASTEST_VALID_480P (135 khi nhỏ hơn 244)
     "pipeline": {"v98": {}, "noprewarm": {"V94_FF_PREWARM": False}, "fv480": {"V94_FASTEST_VALID_480P": True}},
     # live_dl: V9.8 mặc định / tắt hết cờ V9.8 / + scale-up / cố định 32 worker video
-    "live": {"v98": {}, "v98off": dict(_OFF), "v98scale": {"V98_SCALE_UP": True}, "v98w32": {"V94_RANGE_WORKERS_VIDEO": 32}},
+    "live": {"v981": {}, "v98off": dict(_OFF), "v98learn": {"V98_RACE_MODE": "learn"}, "v981_eta0": {"V98_ETA_FIRST_BYTE": False}},
 }
 
 

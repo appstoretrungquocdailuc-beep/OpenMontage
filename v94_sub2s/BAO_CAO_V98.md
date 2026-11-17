@@ -1,9 +1,63 @@
-# V9.8-SUB2S — TỐI ƯU TẢI 480P (video 244 + audio JA) — 2026-11-16
+# V9.8.1-SUB2S — TỐI ƯU TẢI 480P (video 244 + audio JA) — 2026-11-17 (mục 0 = mới nhất; mục 1–10 = bản 16/11)
 
 > **Đọc trước:** mọi số trong mục 4–6 là **SỐ MOCK** — máy chủ GoogleVideo GIẢ (127.0.0.1, chạy ở tiến trình riêng,
 > mô phỏng theo log thật của bạn). Máy thử ở đây **không tải được googlevideo**. Số mock chứng minh **độ đúng** và **tác
 > dụng tương đối** của từng thay đổi, KHÔNG phải tốc độ YouTube trên máy bạn. Chưa có cơ sở để nói "đã đạt ≤ 1,5 s" —
 > chỉ `BENCH_V98_480.bat` chạy trên máy bạn trả lời được (mục 7).
+
+## 0. CẬP NHẬT V9.8.1 (17/11) — sau khi đọc log THẬT của bạn
+
+**Log thật (V9.8, Windows) nói gì**
+
+| Video | Dung lượng | Thời gian video | Tốc độ truyền | Mỗi kết nối | TTFB | Chẻ đoạn |
+|---|---|---|---|---|---|---|
+| gQT1bf3iPHw | 145,7 MB | 4,70 s | 307 Mbps | 15,8 Mbps | 0,65 s | 53 |
+| V98lX3y8D3w | 200,7 MB | 4,25 s | 542 Mbps | 23,3 Mbps | 1,01 s | 59 |
+| QI8YPV9pnVo | 158,3 MB | 2,80 s | **694 Mbps** | 70,3 Mbps | 0,64 s | 36 |
+| Zfi4nk_EWyM | 83,5 MB | 2,85 s | 325 Mbps | 16,4 Mbps | 0,66 s | 49 |
+
+- Các video này nặng **83–200 MB**, không phải 40–60 MB của mục tiêu ≤ 1,5 s. 158 MB ở 694 Mbps (gần trần đường truyền đo
+  được) cần tối thiểu ≈ 1,9 s truyền + 0,64 s TTFB + 0,2 s resolve ≈ 2,75 s (thực tế 2,99 s). Muốn 158 MB trong 1–2 s cần
+  > 1,3 Gbps — **không downloader nào** làm được trên đường truyền này.
+- Video 83 MB thì engine **lãng phí thật** (2,85 s trong khi ~2,0 s là khả thi): 3 lỗi dưới đây.
+
+**3 lỗi tìm ra từ log thật — đã sửa**
+
+| # | Lỗi | Bằng chứng trong log | Sửa (cờ rollback) |
+|---|---|---|---|
+| 1 | Mở 64 kết nối (32 host chính + 32 replica để race) nhưng **32 kết nối thua bị đóng bỏ**; chỉ 32 tải dữ liệu, mỗi cái ~16 Mbps | `conc_peak=64 … race=32 … alt_lost=32/0/0`, `conn_p50≈16.4Mbps` | **dual**: chia 2N đoạn, chẵn → host chính, lẻ → replica; vẫn 2N kết nối nhưng TẤT CẢ đều tải. Chỉ video; audio giữ `learn`. (`V98_RACE_MODE=learn` hoặc `fixed`) |
+| 2 | Tốc độ mỗi đoạn tính bằng byte ÷ (thời gian **kể cả lúc chờ máy chủ**) → đoạn vừa bắt đầu bị coi là chậm → chẻ đôi thừa, mỗi lần chẻ tốn thêm 1 vòng TTFB ~0,2 s | `splits=49 steal=55`; 8 MB cuối mất 0,79 s (75,22 MB lúc 2,06 s → xong lúc 2,85 s) | ETA tính từ lúc có header (`V98_ETA_FIRST_BYTE=0` để quay về) |
+| 3 | Cập nhật tiến độ gọi `path.resolve()` (syscall) cho **mỗi khối 128 KiB ngay trong khoá chung** | video 200 MB: `lock_hold=1430ms` nhưng `write=168ms`; `lock_wait=8565ms` | key tính 1 lần/job. **Đã xác nhận trên máy bạn**: log 20:13 `lock_hold=197ms write=189ms` |
+
+Ngoài ra: worker tự học trước đây so `xfer_mbps` (không thấy TTFB) → nay so Mbps tổng; khi dual bật thì không cộng thêm mức "hi".
+
+**MOCK A/B bản V9.8.1 mặc định so với V9.7.1** (R8, 6 vòng; số MOCK — KHÔNG phải YouTube; SHA-256 đúng 100%, 0 lỗi)
+
+| Kịch bản | Video 49,2 MiB: V9.7.1 → V9.8.1 (P50 / P90, ms) | request | Video 83,5 MiB: V9.7.1 → V9.8.1 (P50 / P90, ms) | request |
+|---|---|---|---|---|
+| S1 giới hạn theo kết nối (14 Mbps, link 600) | 1953 / 1968 → **1233 / 1236** | 102 → 90 | 2107 / 2161 → **1679 / 1690** | 168 → 146 |
+| S4 theo log 17/11 (16,4 Mbps, link 700) | 1657 / 1703 → **1008 / 1017** | 102 → 102 | 1811 / 1940 → **1451 / 1455** | 168 → 168 |
+| S2 giới hạn đường truyền 380 Mbps | 1638 / 1657 → 1584 / 1592 | 102 → 90 | 2415 / 2470 → 2369 / 2379 | 168 → 146 |
+| S3 host chính chậm, replica nhanh | 1762 / 1799 → **1474 / 1480** | 102 → 122 | 1977 / 2006 → **1554 / 1562** | 168 → 200 |
+
+- Riêng sửa ETA (dual có/không): S3 49 MiB 1590 / 1663 → 1474 / 1480, S3 83 MiB 1645 / 1850 → 1554 / 1562, request 217 → 200;
+  các kịch bản khác P50 ngang nhau, P90 thấp hơn hoặc bằng.
+- Khi đường truyền là giới hạn (S2) dual chỉ lợi nhờ prealloc nền — đúng như dự đoán: thêm kết nối không tạo thêm băng thông.
+- S3: request tăng ~20% (hedge sang host nhanh) — đổi lại nhanh hơn 16–21%.
+
+**aria2c — vì sao không dùng làm mặc định, và cách tự kiểm**
+
+- aria2c giới hạn CỨNG **16 kết nối / máy chủ** (`max-connection-per-server must be between 1 and 16` — đã thử trên 1.37.0).
+  Với ~16 Mbps/kết nối như log 83 MB → trần ≈ 260 Mbps, thấp hơn 325 Mbps tool đang đạt.
+- Số aria2 thật của chính bạn (360pok): 101,1 MB trong 2,91 s ≈ 278 Mbps. V9.8 vừa tải 158,3 MB trong 2,80 s ≈ 475 Mbps.
+- Lỗi cũ tìm thấy: `_aria2_tuned_split` xin 20/24 kết nối cho file > 48 MiB → aria2 từ chối → luôn rơi về aria2c kiểu cũ. Đã chặn ở 16.
+- **Tự so trên máy bạn:** trong `RUN_V9_8_GUI.bat` bỏ `REM` ở dòng `set V98_FORCE_ARIA2=1`. Log sẽ có
+  `[ARIA2-RPC] ✅ VIDEO | …MB | …s | ≈…Mbps | ttfb=… | kết nối thật=N/16`. 403/429: `max-tries=1`, không thử lại cùng link;
+  lỗi khác → tự quay về RANGE-TURBO. Tải 3–4 video mỗi chế độ rồi so dòng `HOÀN TẤT VIDEO` / `HOT 480P READY`.
+
+**Cần bạn gửi lại:** vài dòng log `[RANGE-TURBO] ✅ HOÀN TẤT VIDEO` của bản V9.8.1 (có `race=dual`), tốt nhất gồm 2–3 video
+**40–60 MB**. Nhìn `workers=`, `xfer≈`, `ttfb=`, `splits=`: nếu `xfer` tăng rõ so với bảng trên mà `ttfb` không tăng → dual
+có tác dụng thật; nếu `ttfb` tăng → đặt `V98_DUAL_MAX_CONNS=48`.
 
 ## 1. Đường chạy 480p (đã đọc code)
 
@@ -44,7 +98,7 @@ biến thể `noprewarm` trong `live480` để đo; DNS/TCP/TLS từng kết n�
 | Cờ | Mặc định V9.8 | Quay về V9.7.1 | Ghi chú |
 |---|---|---|---|
 | `V98_PREALLOC_ASYNC` | `1` | `0` | mock (mô phỏng 1,95 ms/MiB như log thật): −50…−80 ms P50 **và** P90 ở cả 3 kịch bản; GET đầu đi ở ~20 ms thay vì ~100 ms |
-| `V98_RACE_MODE` | `learn` | `fixed` | `adaptive` (luôn chỉ thăm dò) bị LOẠI: P90 +153 ms khi CDN chính chậm |
+| `V98_RACE_MODE` | `dual` (từ 17/11; 16/11: `learn`) | `fixed` | `adaptive` (luôn chỉ thăm dò) bị LOẠI: P90 +153 ms khi CDN chính chậm |
 | `V98_WORKERS_LEARN` | `1` | `0` | mức "hi" = 20 × 1,6 = 32 (≤ `V98_SCALE_MAX`); file < 8 MiB và khi đã ép số worker → không áp dụng |
 | `V98_WRITE_MODE` | `lock` | `lock` | `split`/`pwrite` không nhanh hơn trên Linux; chờ số Windows |
 | `V98_SCALE_UP` | `0` | `0` | LOẠI: P90 tăng (S1 1946→2035 ms) + 20 request |
