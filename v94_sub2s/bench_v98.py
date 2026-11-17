@@ -121,6 +121,8 @@ SCENARIOS = {
                        link=600, v_conn=14.0, a_conn=7.4, redirect_ms=120, final_ms=200, alt_ms=420),
     "S2_linkcap": dict(note="giới hạn ĐƯỜNG TRUYỀN 380 Mbps (mỗi kết nối 40/20 Mbps), host chính 302, replica chậm hơn",
                        link=380, v_conn=40.0, a_conn=20.0, redirect_ms=120, final_ms=200, alt_ms=420),
+    "S4_log1117": dict(note="theo log thật 17/11 (video 83 MB): 16.4/9.7 Mbps mỗi kết nối, đường truyền 700 Mbps, 2 host TTFB ngang nhau",
+                       link=700, v_conn=16.4, a_conn=9.7, redirect_ms=100, final_ms=200, alt_ms=250),
     "S3_mainslow": dict(note="host chính CHẬM (302 + 650 ms), replica NHANH (150 ms) — kiểm tra P90 khi CDN chính kém",
                         link=600, v_conn=14.0, a_conn=7.4, redirect_ms=150, final_ms=500, alt_ms=150),
 }
@@ -170,12 +172,19 @@ def _patch_open(mod, ms_per_mib):
     mod.open = op
 
 
+_LEARN_STORE = {}
+
+
 def run_pair(mod, mp, cfg, vsize, asize, vsha, asha, win_prealloc):
     """Video + audio SONG SONG như production. Trả 1 dòng kết quả."""
     saved = {}
     for k, v in cfg.get("flags", {}).items():
         saved[k] = getattr(mod, k, None)
         setattr(mod, k, v)
+    # bộ nhớ "học" (race learn, worker tự học) RIÊNG cho từng cấu hình — không thì các biến thể B dùng chung lịch sử
+    if hasattr(mod, "_V98_WL"):
+        st = _LEARN_STORE.setdefault((id(mp), cfg.get("label")), {"wl": {}, "rh": []})
+        mod._V98_WL, mod._V98_RACE_HIST = st["wl"], st["rh"]
     alt = {mp.url("/v/main"): mp.url("/v/alt"), mp.url("/a/main"): mp.url("/a/alt")}
     old_alt = mod._gvs_alt_url
     mod._gvs_alt_url = lambda u: alt.get(str(u), "")
@@ -255,6 +264,8 @@ PRESETS = {
     "flags": {"off": dict(_OFF), "pa": dict(_OFF, V98_PREALLOC_ASYNC=True), "split": dict(_OFF, V98_WRITE_MODE="split"),
               "pwrite": dict(_OFF, V98_WRITE_MODE="pwrite"), "v98": {}, "v98_pwrite": {"V98_WRITE_MODE": "pwrite"}},
     "v98": {"v98": {}},
+    "dual": {"learn": {"V98_RACE_MODE": "learn"}, "dual": {"V98_RACE_MODE": "dual"},
+             "dual_fixw": {"V98_RACE_MODE": "dual", "V98_WORKERS_LEARN": False}},
     "v98_vs_off": {"v98": {}, "v98off": dict(_OFF)},
     # live480 (nguyên pipeline): V9.8 / không prewarm ffmpeg / opt-in FASTEST_VALID_480P (135 khi nhỏ hơn 244)
     "pipeline": {"v98": {}, "noprewarm": {"V94_FF_PREWARM": False}, "fv480": {"V94_FASTEST_VALID_480P": True}},

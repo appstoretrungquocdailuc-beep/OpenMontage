@@ -362,3 +362,126 @@ def test_workers_learn_picks_by_measured_speed(v94, tmp_path, monkeypatch, link_
     assert [a for a, _ in arms[:4]] == ["lo", "hi", "lo", "hi"]
     assert arms[1][1] > arms[0][1]
     assert arms[4][0] == ("lo" if link_capped else "hi"), arms
+
+
+# ----------------------------------------------------------------------------- V9.8.1: dual-host + ép aria2
+def _two_host_rate(v94, gvs, monkeypatch, data, main_delay, alt_delay, tag, rate):
+    real = gvs.add(f"/{tag}/real", data, hdr_delay=main_delay, rate=rate)
+    main = gvs.add(f"/{tag}/main", mode="redirect", to=real)
+    alt = gvs.add(f"/{tag}/alt", data, hdr_delay=alt_delay, rate=rate)
+    monkeypatch.setattr(v94, "_gvs_alt_url", lambda u: alt if str(u) == main else "")
+    v94._MN_RACE_BAD_UNTIL[0] = 0.0
+    return main
+
+
+def test_dual_all_connections_carry_data(v94, gvs, tmp_path, monkeypatch):
+    """dual: 2N kết nối đều tải (không bắn kép), nhanh hơn race-all khi giới hạn THEO KẾT NỐI, không nhiều request hơn."""
+    monkeypatch.setattr(v94, "V98_WORKERS_LEARN", False)
+    monkeypatch.setattr(v94, "V94_RANGE_WORKERS_VIDEO", 12)
+    data = make_payload(24 * MB, seed=61)
+    res = {}
+    for mode in ("fixed", "dual"):
+        monkeypatch.setattr(v94, "V98_RACE_MODE", mode)
+        main = _two_host_rate(v94, gvs, monkeypatch, data, 0.05, 0.08, mode, 1 * MB)
+        ok, info = _dl(v94, main, tmp_path, f"{mode}.bin", len(data))
+        assert ok, info
+        assert sha256((tmp_path / f"{mode}.bin").read_bytes()) == sha256(data)
+        time.sleep(0.5)
+        res[mode] = (info, len(gvs.requests_for(f"/{mode}/")))
+    fi, di = res["fixed"][0], res["dual"][0]
+    assert di["dual"] is True and di["race_mode"] == "dual" and di["races"] == 0
+    assert di["workers_initial"] == 24 and fi["workers_initial"] == 12
+    assert len(gvs.requests_for("/dual/alt")) >= 10 and len(gvs.requests_for("/dual/real")) >= 10
+    assert di["elapsed_ms"] < 0.75 * fi["elapsed_ms"], (di["elapsed_ms"], fi["elapsed_ms"])
+    assert res["dual"][1] <= res["fixed"][1] + 6, (res["dual"][1], res["fixed"][1])
+
+
+def test_dual_slow_main_hedges_to_replica(v94, gvs, tmp_path, monkeypatch):
+    monkeypatch.setattr(v94, "V98_RACE_MODE", "dual")
+    monkeypatch.setattr(v94, "V98_WORKERS_LEARN", False)
+    monkeypatch.setattr(v94, "V94_RANGE_WORKERS_VIDEO", 12)
+    data = make_payload(16 * MB, seed=62)
+    main = _two_host_rate(v94, gvs, monkeypatch, data, 1.2, 0.05, "dslow", 0)
+    ok, info = _dl(v94, main, tmp_path, "ds.bin", len(data))
+    assert ok, info
+    assert sha256((tmp_path / "ds.bin").read_bytes()) == sha256(data)
+    assert info["elapsed_ms"] < 1100, info["elapsed_ms"]         # không chờ host chính 1.2 s
+
+
+def test_dual_replica_403_falls_back_to_main(v94, gvs, tmp_path, monkeypatch):
+    monkeypatch.setattr(v94, "V98_RACE_MODE", "dual")
+    monkeypatch.setattr(v94, "V98_WORKERS_LEARN", False)
+    monkeypatch.setattr(v94, "V94_RANGE_WORKERS_VIDEO", 12)
+    data = make_payload(16 * MB, seed=63)
+    real = gvs.add("/d403/real", data, hdr_delay=0.05)
+    main = gvs.add("/d403/main", mode="redirect", to=real)
+    alt = gvs.add("/d403/alt", mode="status", code=403)
+    monkeypatch.setattr(v94, "_gvs_alt_url", lambda u: alt if str(u) == main else "")
+    v94._MN_RACE_BAD_UNTIL[0] = 0.0
+    ok, info = _dl(v94, main, tmp_path, "d4.bin", len(data))
+    v94._MN_RACE_BAD_UNTIL[0] = 0.0
+    assert ok, info
+    assert sha256((tmp_path / "d4.bin").read_bytes()) == sha256(data)
+    assert len(gvs.requests_for("/d403/alt")) <= 13              # tối đa 1 request/đoạn gán cho replica, không thử lại
+
+
+def test_dual_main_403_is_hard_fail(v94, gvs, tmp_path, monkeypatch):
+    monkeypatch.setattr(v94, "V98_RACE_MODE", "dual")
+    monkeypatch.setattr(v94, "V94_RANGE_WORKERS_VIDEO", 12)
+    main = gvs.add("/m403/main", mode="status", code=403)
+    alt = gvs.add("/m403/alt", mode="status", code=403)
+    monkeypatch.setattr(v94, "_gvs_alt_url", lambda u: alt if str(u) == main else "")
+    v94._MN_RACE_BAD_UNTIL[0] = 0.0
+    ok, info = _dl(v94, main, tmp_path, "m4.bin", 16 * MB)
+    v94._MN_RACE_BAD_UNTIL[0] = 0.0
+    assert not ok and info["fail_reason"] == "HTTP_403"
+    assert not (tmp_path / "m4.bin").exists()
+    assert len(gvs.requests_for("/m403/")) <= 2 * 24
+
+
+def test_dual_only_for_video_with_replica(v94, gvs, tmp_path, monkeypatch):
+    monkeypatch.setattr(v94, "V98_RACE_MODE", "dual")
+    monkeypatch.setattr(v94, "V98_WORKERS_LEARN", False)
+    data = make_payload(12 * MB, seed=64)
+    main = _two_host_rate(v94, gvs, monkeypatch, data, 0.05, 0.05, "daud", 0)
+    ok, info = _dl(v94, main, tmp_path, "au.bin", len(data), "audio")
+    assert ok and info["dual"] is False and info["race_mode"].startswith("learn")
+    assert sha256((tmp_path / "au.bin").read_bytes()) == sha256(data)
+    monkeypatch.setattr(v94, "_gvs_alt_url", lambda u: "")       # không có replica mn → như cũ
+    monkeypatch.setattr(v94, "V94_RANGE_WORKERS_VIDEO", 12)
+    ok, info = _dl(v94, gvs.add("/noalt", data), tmp_path, "na.bin", len(data))
+    assert ok and info["dual"] is False and info["workers_initial"] == 12
+
+
+@need_aria2
+def test_force_aria2_switch(v94, gvs, tmp_path, monkeypatch):
+    monkeypatch.setattr(v94, "ARIA2C_PATH", shutil.which("aria2c"))
+    data = make_payload(12 * MB, seed=65)
+    url = gvs.add("/fa", data, rate=3 * MB)
+    ok, info = _dl(v94, url, tmp_path, "off.bin", len(data))     # mặc định TẮT → RANGE-TURBO
+    assert ok and info.get("engine") != "aria2_rpc"
+    monkeypatch.setattr(v94, "V98_FORCE_ARIA2", True)
+    ok, info = _dl(v94, url, tmp_path, "on.bin", len(data))
+    assert ok and info["engine"] == "aria2_rpc" and 1 <= info["connections"] <= 16
+    assert sha256((tmp_path / "on.bin").read_bytes()) == sha256(data)
+    deny = gvs.add("/fa403", mode="status", code=403)
+    ok, info = _dl(v94, deny, tmp_path, "deny.bin", 4 * MB)
+    assert not ok and info["fail_reason"] == "HTTP_403" and v94._v94_is_auth_fail(info)
+    assert len(gvs.requests_for("/fa403")) == 1                  # không thử lại, không rơi về RANGE-TURBO cùng link
+    assert not (tmp_path / "deny.bin").exists()
+    # dung lượng sai → không nhận file, quay về RANGE-TURBO (tự co/giãn đúng size)
+    ok, info = _dl(v94, url, tmp_path, "sz.bin", len(data) + 4096)
+    assert ok and info.get("engine") != "aria2_rpc"
+    assert sha256((tmp_path / "sz.bin").read_bytes()) == sha256(data)
+
+
+@need_aria2
+def test_aria2_split_clamped_to_16(v94, gvs, tmp_path, monkeypatch):
+    """aria2c từ chối > 16 kết nối/máy chủ: file > 48 MiB trước đây xin 20/24 → RPC lỗi."""
+    monkeypatch.setattr(v94, "ARIA2C_PATH", shutil.which("aria2c"))
+    assert v94._aria2_tuned_split(100 * MB) > 16
+    data = make_payload(6 * MB, seed=66)
+    info = {}
+    ok = v94._download_aria2c_rpc(gvs.add("/cl", data), tmp_path, "cl.bin", lambda m: None, 1, 100 * MB, info=info)
+    assert ok and info["split"] == 16
+    assert sha256((tmp_path / "cl.bin").read_bytes()) == sha256(data)

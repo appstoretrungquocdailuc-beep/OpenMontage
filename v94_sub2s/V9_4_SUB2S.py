@@ -320,6 +320,14 @@ V98_PREALLOC_ASYNC = _v98_env("PREALLOC_ASYNC", True)
 # lần nào (xem V98_RACE_LEARN_*); còn lại race tất cả như "fixed". Quay về V9.7.1: V98_RACE_MODE=fixed
 V98_RACE_MODE = str(os.environ.get("V98_RACE_MODE", "learn") or "learn").strip().lower()
 V98_RACE_PROBES = _v98_env("RACE_PROBES", 2)
+# "dual" (V9.8.1): KHÔNG bắn kép. Chia file thành 2N đoạn, đoạn chẵn → host chính, đoạn lẻ → replica mn: vẫn 2N kết nối
+# như race-all nhưng CẢ 2N đều tải dữ liệu (race-all: N kết nối thua bị bỏ — log thật 17/11: 64 kết nối mở, 32 bị đóng).
+# Đoạn kẹt ở host chậm: hedge sang host kia khi host kia đã có header (chờ 1.5×TTFB của nó + 0.1 s) hoặc quá
+# V98_FIRST_HEDGE_SEC; sau đó work-stealing lo phần còn lại. Chỉ áp dụng cho VIDEO; audio giữ luật "learn".
+V98_DUAL_MAX_CONNS = _v98_env("DUAL_MAX_CONNS", 64)
+# Ép tải video/audio native bằng aria2c RPC (để tự so sánh trên máy thật; mặc định TẮT). aria2c giới hạn CỨNG 16 kết nối
+# tới 1 máy chủ. 403/429: max-tries=1, không thử lại cùng link. Lỗi khác → quay về RANGE-TURBO.
+V98_FORCE_ARIA2 = _v98_env("FORCE_ARIA2", False)
 # "learn": nhớ N job gần nhất (trong TTL giây). Chưa có lịch sử, hoặc replica vừa THẮNG → race tất cả như V9.7.1;
 # replica không thắng job nào gần đây → chỉ V98_RACE_PROBES đoạn thăm dò (bớt ~30% request, không chậm hơn).
 V98_RACE_LEARN_JOBS = _v98_env("RACE_LEARN_JOBS", 6)
@@ -3341,7 +3349,7 @@ def _gvs_alt_url(url: str) -> str:
 
 class _RangeSeg:
     __slots__ = ("pos", "end", "last_t", "retries", "taken", "t_start", "got", "h", "first", "gen",
-                 "kind", "hmode")
+                 "kind", "hmode", "hpre")
 
     def __init__(self, pos: int, end: int, retries: int = 0):
         self.pos = int(pos)
@@ -3356,6 +3364,7 @@ class _RangeSeg:
         self.gen = 0        # số lần đoạn này đã bị giành lại (backoff chống livelock)
         self.kind = "first" # V9.4.1 telemetry: first/split/takeover/retry/ext (engine V9.3 bỏ qua)
         self.hmode = ""     # V9.4.1 telemetry: ""/race/hedge
+        self.hpre = -1      # V9.8 dual: host gán sẵn cho đoạn đợt đầu (0/1); -1 = để engine chọn
 
     def eta(self, now: float) -> float:
         rem = self.end - self.pos + 1
@@ -4014,6 +4023,15 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
         # Size chưa biết: chia khoảng đoán [0, guess) cho vài request song song ngay t=0 (đoạn vượt
         # size thật nhận 416 "*/N" hoặc bị cắt theo Content-Range → vô hại), header đầu → fan-out phần còn lại.
         workers = max(1, min(int(V94_UNKNOWN_FIRST_WORKERS), max(1, total0 // min_part_bytes)))
+    dual = False
+    _le0 = int(V94_RACE_ALL_IF_WORKERS_LE or 0)
+    if (V98_RACE_MODE == "dual" and not is_audio and size_known and RANGE_MN_RACE and workers >= 4 and workers > _le0
+            and int(V94_FIRST_WAVE_RACE_MAX) != 0 and not int(info.get("workers_override") or 0)
+            and time.time() >= _MN_RACE_BAD_UNTIL[0] and _gvs_alt_url(url)):
+        dual = True                                          # video: 2N kết nối đều tải (= số kết nối của race-all)
+        workers = max(workers, min(2 * workers, int(V98_DUAL_MAX_CONNS), max(1, total0 // min_part_bytes)))
+    # audio / file nhỏ / không có replica khi đặt "dual" → dùng luật "learn" (audio không nằm trên đường găng)
+    _rmode = "learn" if (V98_RACE_MODE == "dual" and not dual) else V98_RACE_MODE
     part = (total0 + workers - 1) // workers
     if size_known and float(V98_PART_MIB or 0) > 0:          # V9.8: trần kích thước đoạn đợt đầu (đoạn còn lại xếp hàng)
         part = max(min_part_bytes, min(part, int(float(V98_PART_MIB) * 1048576)))
@@ -4025,6 +4043,8 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
         e_ = min(total0 - 1, s_ + part - 1)
         segs.append(_RangeSeg(s_, e_))
         segs[-1].first = len(segs) <= workers
+        if dual and segs[-1].first:
+            segs[-1].hpre = (len(segs) - 1) % 2
         s_ = e_ + 1
     workers = min(workers, len(segs))
 
@@ -4081,10 +4101,12 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
     _le = int(V94_RACE_ALL_IF_WORKERS_LE or 0)
     race_max = -1 if (_rm != 0 and _le > 0 and workers <= _le) else _rm
     _small_all = (_le > 0 and workers <= _le)
-    adaptive = (not _small_all and (V98_RACE_MODE == "adaptive"
-                                    or (V98_RACE_MODE == "learn" and _rm != 0 and _v98_race_probe_only())))
-    race_mode_s = ("adaptive" if V98_RACE_MODE == "adaptive" else
-                   ("learn:probe" if adaptive else "learn:all") if V98_RACE_MODE == "learn" else "fixed")
+    adaptive = (not _small_all and (_rmode == "adaptive"
+                                    or (_rmode == "learn" and _rm != 0 and _v98_race_probe_only())))
+    race_mode_s = ("adaptive" if _rmode == "adaptive" else
+                   ("learn:probe" if adaptive else "learn:all") if _rmode == "learn" else "fixed")
+    if dual:
+        adaptive, race_max, race_mode_s = False, 0, "dual"
     if adaptive:                                    # V9.8: chỉ vài đoạn đầu thăm dò replica
         race_max = max(0, int(V98_RACE_PROBES))
     if (RANGE_MN_RACE and (workers >= 4 or not size_known) and time.time() >= _MN_RACE_BAD_UNTIL[0]):
@@ -4168,7 +4190,7 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
             if pending:
                 seg = pending.pop(0)
                 seg.last_t = seg.t_start = time.perf_counter()
-                seg.h = _pick_host_locked(initial=(seg.retries == 0 and state["done"] == 0))
+                seg.h = seg.hpre if seg.hpre >= 0 else _pick_host_locked(initial=(seg.retries == 0 and state["done"] == 0))
                 active.add(seg)
                 return seg
             if not state["size_known"]:
@@ -4294,7 +4316,20 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
         t_sub = time.perf_counter()
         f_first = _HEDGE_EXEC.submit(_req, urls[first_h], start, end, traces[first_h])
         futs = {f_first: first_h}
-        if adaptive and seg.first and not race_now and seg.retries == 0:
+        if dual and seg.first and seg.retries == 0 and seg.hpre >= 0:
+            # V9.8 dual: chờ host được gán; hedge sang host kia khi host kia ĐÃ có header mà mình chờ quá 1.5×TTFB của nó
+            # + 0.1 s (host mình chậm hơn hẳn), hoặc quá V98_FIRST_HEDGE_SEC. Chưa host nào trả lời → chưa hedge.
+            _dl = t_sub + max(0.0, float(V98_FIRST_HEDGE_SEC))
+            while True:
+                done, _ = wait([f_first], timeout=0.02)
+                if done or finished.is_set():
+                    break
+                _nw = time.perf_counter()
+                with lock:
+                    _ot = state["host_ttfb"][other_h]
+                if (_ot is not None and _nw - t_sub >= max(RANGE_HEDGE_DELAY_MIN, 1.5 * _ot + 0.10)) or _nw >= _dl:
+                    break
+        elif adaptive and seg.first and not race_now and seg.retries == 0:
             # V9.8: đoạn đợt đầu (không thăm dò) chờ host chính; chỉ hedge khi replica đã THẮNG thăm dò
             # hoặc host chính quá V98_FIRST_HEDGE_SEC chưa có header.
             _dl = t_sub + max(0.0, float(V98_FIRST_HEDGE_SEC))
@@ -4836,7 +4871,7 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
             except OSError:
                 pass
         ex.shutdown(wait=False, cancel_futures=True)
-        if V98_RACE_MODE == "learn" and state["alt"] and (state["races"] or state["hedges"]):
+        if _rmode == "learn" and state["alt"] and (state["races"] or state["hedges"]):
             _v98_race_note(state["alt_wins"] > 0)
         _range_progress_end(temp_file)
         if not ok:
@@ -4882,12 +4917,46 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
             "lock_hold_ms": round(state["lock_hold_ns"] / 1e6, 3), "write_ms": round(state["write_ns"] / 1e6, 3),
             "write_mode": wmode, "race_mode": race_mode_s, "scale_added": state["scale_added"],
             "scale_steps": list(state["scale_steps"]), "part_bytes": int(part), "segments_initial": len(segs),
-            "workers_learn": _wl_arm,
+            "workers_learn": _wl_arm, "dual": dual,
         })
         if _wl_arm:
             _v98_workers_note(media_kind, _wl_arm, info.get("mbps"))    # Mbps TỔNG (gồm TTFB): log thật 17/11 cho thấy TTFB tăng theo số kết nối
         TELEM.span(job, f"{media_kind}_download_complete", **{k: v for k, v in info.items()
                                                                 if k not in ("job", "cancel", "pool")})
+
+
+def _v98_aria2_forced(url, temp_dir, filename, logger, min_bytes, expected, media_kind, info):
+    """V98_FORCE_ARIA2=1: tải bằng aria2c RPC (≤16 kết nối, max-tries=1). True = xong + ĐÚNG dung lượng;
+    False = máy chủ từ chối (403/404/410/429 → caller SAFE-REFRESH, KHÔNG thử lại cùng link); None = lỗi khác → RANGE-TURBO."""
+    ai = {}
+    t0 = time.perf_counter()
+    temp_file = Path(temp_dir) / filename
+    try:
+        ok = _download_aria2c_rpc(url, temp_dir, filename, logger, min_bytes, expected, info=ai, max_tries=1)
+    except Exception as e:  # noqa: BLE001
+        ok, ai["fail_reason"] = False, f"EXC:{type(e).__name__}"
+    el = max(1e-3, time.perf_counter() - t0)
+    size = temp_file.stat().st_size if temp_file.exists() else 0
+    if ok and size == expected:
+        info.update({"ok": True, "engine": "aria2_rpc", "kind": media_kind, "bytes": size, "total": size, "fail_reason": "",
+                     "elapsed_ms": round(el * 1000.0, 2), "ttfb_ms": ai.get("ttfb_ms"), "connections": ai.get("connections"),
+                     "mbps": round(size * 8 / 1e6 / el, 1), "workers_initial": ai.get("split")})
+        logger(f"    [ARIA2-RPC] ✅ {media_kind.upper()} | {size/1048576:.2f}MB | {el:.3f}s | ≈{size*8/1e6/el:.0f}Mbps | "
+               f"ttfb={float(ai.get('ttfb_ms') or 0)/1000:.2f}s | kết nối thật={ai.get('connections')}/{ai.get('split')} (V98_FORCE_ARIA2)")
+        return True
+    for q in (temp_file, Path(str(temp_file) + ".aria2")):
+        try:
+            if q.exists():
+                q.unlink()
+        except OSError:
+            pass
+    fr = str(ai.get("fail_reason") or ("size_mismatch" if ok else "aria2_fail"))
+    if fr.startswith("HTTP_4"):
+        info.update({"ok": False, "engine": "aria2_rpc", "kind": media_kind, "fail_reason": fr})
+        logger(f"    [ARIA2-RPC] ⚠️ {fr} → không thử lại cùng link")
+        return False
+    logger(f"    [ARIA2-RPC] ⚠️ {fr} → quay về RANGE-TURBO")
+    return None
 
 
 def _download_http_range_turbo(url: str, temp_dir: Path, filename: str, logger,
@@ -4903,6 +4972,10 @@ def _download_http_range_turbo(url: str, temp_dir: Path, filename: str, logger,
                          "fail_reason": "" if ok else "v93_fail"})
         return ok
     info = info if isinstance(info, dict) else {}
+    if V98_FORCE_ARIA2 and ARIA2C_PATH and int(expected_bytes or 0) > 0:
+        r = _v98_aria2_forced(url, temp_dir, filename, logger, min_bytes, int(expected_bytes), media_kind, info)
+        if r is not None:
+            return r
     if _download_http_range_turbo_v94(url, temp_dir, filename, logger, min_bytes, expected_bytes,
                                       media_kind, info):
         return True
@@ -5875,7 +5948,7 @@ def _aria2_tuned_split(expected_bytes: int):
 
 
 def _download_aria2c_rpc(url: str, temp_dir: Path, filename: str, logger, min_bytes: int, expected_bytes: int = 0,
-                         info=None) -> bool:
+                         info=None, split=None, max_tries=None) -> bool:
     """info (V9.8, tuỳ chọn — chỉ bench dùng): ttfb_ms, elapsed_ms, connections (thực tế, lớn nhất theo tellStatus), split,
     aria2_error. V98_ARIA2_SPLIT>0 ép số kết nối; V98_ARIA2_MAX_TRIES (mặc định 2 = như cũ)."""
     if not _start_aria2_rpc_daemon():
@@ -5887,7 +5960,8 @@ def _download_aria2c_rpc(url: str, temp_dir: Path, filename: str, logger, min_by
         except Exception:
             pass
 
-    split = int(V98_ARIA2_SPLIT) if int(V98_ARIA2_SPLIT or 0) > 0 else _aria2_tuned_split(expected_bytes)
+    split = int(split or 0) or (int(V98_ARIA2_SPLIT) if int(V98_ARIA2_SPLIT or 0) > 0 else _aria2_tuned_split(expected_bytes))
+    split = max(1, min(16, split))      # V9.8: aria2c từ chối max-connection-per-server > 16 (trước đây 20/24 → RPC lỗi → legacy)
     logger(f"    [ARIA2-RPC] ⚡ Turbo daemon | split<={split} | {filename}")
     opts = {
         "dir": str(temp_dir),
@@ -5898,7 +5972,7 @@ def _download_aria2c_rpc(url: str, temp_dir: Path, filename: str, logger, min_by
         "file-allocation": "none",
         "allow-overwrite": "true",
         "auto-file-renaming": "false",
-        "max-tries": str(max(1, int(V98_ARIA2_MAX_TRIES or 2))),
+        "max-tries": str(max(1, int(max_tries or V98_ARIA2_MAX_TRIES or 2))),
         "retry-wait": "0",
         "connect-timeout": "2",
         "timeout": "4",
@@ -7812,6 +7886,7 @@ class PremiumDownloaderApp(QWidget):
             f"race={V98_RACE_MODE}" + (f"({V98_RACE_PROBES} thăm dò)" if V98_RACE_MODE in ("adaptive", "learn") else "")
             + f" | worker={'TỰ HỌC (×' + str(V98_WORKERS_LEARN_MUL) + ' ≤' + str(V98_SCALE_MAX) + ')' if V98_WORKERS_LEARN else 'cố định'}"
             + f" | scale-up={'BẬT ≤' + str(V98_SCALE_MAX) if V98_SCALE_UP else 'tắt'}"
+            + (" | ⚠️ ÉP ARIA2C (≤16 kết nối)" if V98_FORCE_ARIA2 else "")
             + (f" | đoạn đầu ≤{V98_PART_MIB}MiB" if float(V98_PART_MIB or 0) > 0 else "")
             + " | rollback: đặt biến môi trường V98_* (xem BAO_CAO_V98.md)"
         )
