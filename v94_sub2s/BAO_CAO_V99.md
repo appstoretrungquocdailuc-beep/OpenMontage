@@ -7,6 +7,40 @@
 > - Số có nhãn **CỤC BỘ** = ffmpeg thật + pipeline cắt thật của tool trên video tổng hợp. Là bằng chứng thật về cách cắt, không phải về mạng.
 > - **Không tuyên bố đạt SUB-2S.** Bản chính V9.8.1 (`V9_4_SUB2S.py`) **không bị sửa một byte** (SHA-256 trùng `backup/V9_8_1_SUB2S_truoc_v99.py`).
 
+## ★ CẬP NHẬT 18/11 — "10% cuối mất thêm ~1 giây": NGUYÊN NHÂN ĐÃ TÌM RA (log thật + tái hiện) VÀ ĐÃ SỬA
+
+**Bằng chứng từ log thật của bạn (bản ứng viên, dòng 🔬 ĐUÔI CHẬM):**
+
+| Lượt | Đạt 90% | Xong | Đuôi | Range xong cuối | TTFB đợt đầu (lạnh) p50/p90 | TTFB kết nối ấm |
+|---|---|---|---|---|---|---|
+| a8yPjfAx3nc video 65,55 MiB | 1,46 s | 2,13 s | **670 ms** | takeover phát lúc 1,68 s, chờ header 215 ms, tải 229 ms | 472 / 735 ms | 280–360 ms |
+| axd_drQ3buI video 211 MiB | 2,79 s | 3,35 s | **555 ms** | cứu phát lúc **3,29 s** (500 ms sau mốc 90%), chờ header 42 ms | 725 / 936 ms | 200–230 ms |
+| axd_drQ3buI audio 19,81 MiB | 1,52 s | 2,13 s | **618 ms** | 0,49 MiB tải **701 ms** (≈ 5,9 Mbps) trên 1 kết nối, không ai chia | 749 / 1194 ms | 40–190 ms |
+
+**Nguyên nhân (đọc từ code + chạy thử có in trạng thái engine):** khi một worker rảnh, engine chỉ chẻ một mẩu còn lại nếu
+`ETA của mẩu > 2 × TTFB + 0,1 s`. TTFB ở đây là trung bình bị kéo lên bởi đợt request ĐẦU (lạnh: bắt tay TLS + 64–128 request cùng lúc,
+0,47–0,94 s), trong khi request ở đuôi đi trên kết nối ẤM chỉ chờ header 0,04–0,23 s. Ngưỡng thực tế vì vậy là **1,1–1,9 s**: mẩu nào cần
+dưới mức đó thì để 1 kết nối (~6–16 Mbps) tải một mình, các worker còn lại ngồi chờ. Ở chế độ dual, đợt đầu phủ hết file nên lúc vào đuôi
+chưa có mẫu TTFB ấm nào → luôn dùng con số lạnh. Thêm nữa: mẩu < 512 KiB không bao giờ được chẻ.
+Bản in trạng thái (mock) cho thấy đúng điều đó: `ttfb=0.820 best_eta=1.45` → không chẻ, 3 đoạn chậm ETA 0,75 / 1,0 / 1,4 s tự tải.
+
+**Sửa (`V99_WARM_TTFB`, mặc định bật trong bản ứng viên):** mọi quyết định ở đuôi (chẻ / giành lại / cứu) dùng TTFB kết nối ấm: median các
+request không thuộc đợt đầu; chưa có mẫu → ½ median đợt đầu (log của bạn: ấm/lạnh = 0,28–0,43). Ở đuôi được chẻ mẩu tới 128 KiB
+(`V99_TAIL_MIN_SPLIT_KIB`).
+
+**A/B trên MOCK dựng theo đúng số log của bạn** (đợt đầu +0,45 s, ấm 0,2 s, 16,5 Mbps/kết nối, 1/9 request chỉ 6 Mbps, link 700 Mbps;
+video 65,55 MiB + audio 5,37 MiB; 8 lượt; SHA-256 đúng 100%):
+
+| | READY P50 / P90 | Đuôi video | Request |
+|---|---|---|---|
+| A — V9.8.1 đang chạy | 2698 / 2711 ms | ~1170 ms | 114 |
+| B — ứng viên, tắt sửa đuôi | 2688 / 2698 ms | 1168 ms | 114 |
+| **B — ứng viên, bật sửa đuôi** | **2236 / 2263 ms** | **712 ms** | 119 |
+
+Các kịch bản khác (2 host khoẻ, replica chậm, 1 range treo): khác biệt nằm trong sai số (±25 ms), request không tăng.
+Lần thử đầu (chỉ đổi ngưỡng khi đã có mẫu ấm) **không** có tác dụng trên mock và còn làm P90 xấu đi → đã bỏ, thay bằng cách ước lượng ở trên.
+**Đây là số MOCK.** Số thật: chạy bản ứng viên vài video rồi so cột `tail=` và dòng 🔬 với bảng trên (đuôi kỳ vọng giảm còn ~0,3–0,4 s).
+
 ## 0. Giao gì
 
 | File | Vai trò |
@@ -66,6 +100,7 @@ khi đuôi ≥ 300 ms: `🔬 ĐUÔI CHẬM AUDIO: 90% byte lúc …s, xong lúc 
 | Cờ | Mặc định | Tác dụng |
 |---|---|---|
 | `V99_TAIL_RESCUE` | **1** | Giai đoạn đuôi (số đoạn dở ≤ worker/8): đoạn chưa có header quá 1,15 × p90 TTFB đợt đầu → gửi lại ngay, **đua cả 2 host**; request cứu kiên nhẫn theo TTFB kết nối ấm. Tối đa `V99_TAIL_RESCUE_MAX=4` request / file |
+| `V99_WARM_TTFB` | **1** | Quyết định chẻ / giành lại / cứu ở đuôi theo TTFB kết nối ấm (mục ★). `V99_TAIL_MIN_SPLIT_KIB=128` |
 | `V99_NET_TRACE` | **1** | Đo DNS / TCP / TLS từng kết nối mới, gắn vào telemetry từng range (vá urllib3 1 lần; vá lỗi → tự bỏ qua) |
 | `V99_FORMAT_MODE` | `fixed` | `fixed` = 244 → 135 như V9.8.1. `smart` = chọn format dự đoán xong sớm nhất trong các codec cho phép |
 | `V99_ALLOW_VIDEO_CODECS` | `vp9,avc1` | **Không có `av01`** cho tới khi bạn kiểm file AV1 trong workflow TikTok (xem mục 5) |
