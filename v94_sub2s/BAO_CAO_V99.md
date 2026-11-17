@@ -236,8 +236,8 @@ Cập nhật bản mà tool dùng: `python -m pip install -U yt-dlp` (đúng pyt
 
 ## 10. Kiểm thử
 
-- Bản chính V9.8.1 (không đổi code): **225 passed + 17 skipped + 1 xfailed** (17 skipped = `test_v99.py`, chỉ dành cho bản ứng viên; xfail = test V9.3 cũ về Excel, chập chờn, không liên quan).
-- Bản ứng viên (`set V94_TEST_MODULE=V9_9_CANDIDATE`): **243 passed** — gồm toàn bộ test cũ (Excel, wake-up, JA strict, DIRECT-CUT,
+- Bản chính V9.8.1 (không đổi code): **225 passed + 18 skipped + 1 xfailed** (lượt 18/11) (skipped = `test_v99.py`, chỉ dành cho bản ứng viên; xfail = test V9.3 cũ về Excel, chập chờn, không liên quan).
+- Bản ứng viên (`set V94_TEST_MODULE=V9_9_CANDIDATE`): **243 passed + 1 xfailed** (lượt 18/11, gồm 18 test V9.9) — gồm toàn bộ test cũ (Excel, wake-up, JA strict, DIRECT-CUT,
   403-GUARD, dual, failover…) chạy trên bản ứng viên + 17 test mới: tail-rescue (đúng từng byte, có trần request, không thêm request khi
   khoẻ, 403 vẫn lỗi cứng), telemetry từng range, chọn format (fixed giữ 244; smart mặc định không bao giờ chọn AV1; học tốc độ và
   lỗi; ép itag đúng hoặc không có; `OUTPUT_H264`), yt-dlp bundle, **ép audio không bao giờ lấy track không phải tiếng Nhật**.
