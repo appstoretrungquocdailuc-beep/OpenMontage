@@ -8,3 +8,4 @@ benchmark_config.json
 perf_report/telemetry_2*.jsonl
 _temp_yt480p/
 backup/perf_report/
+v99_format_stats.json
