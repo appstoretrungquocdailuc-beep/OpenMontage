@@ -157,7 +157,7 @@ def _v94_env(name, default):
         return default
 
 
-V94_VERSION = "V9.8-SUB2S"     # V9.7.1 + RANGE: prealloc nền, race learn, worker tự học (xem BAO_CAO_V98.md)
+V94_VERSION = "V9.8.1-SUB2S"   # V9.7.1 + RANGE: prealloc nền, race learn, worker tự học (xem BAO_CAO_V98.md)
 # Range: kiểm tra Content-Range start/end khớp đúng request (V9.3 chỉ đọc tổng).
 V94_STRICT_CONTENT_RANGE = _v94_env("STRICT_CONTENT_RANGE", True)
 # Range: size thật ≠ ước tính → co/giãn tại chỗ, không vứt dữ liệu và tải lại (V9.3 = restart).
@@ -318,13 +318,17 @@ V98_PREALLOC_ASYNC = _v98_env("PREALLOC_ASYNC", True)
 # (nhanh hơn thật) hoặc host chính chưa trả header sau V98_FIRST_HEDGE_SEC. File nhỏ (<= V94_RACE_ALL_IF_WORKERS_LE
 # đoạn) vẫn race hết như cũ. "learn" (MẶC ĐỊNH V9.8) = như adaptive nhưng CHỈ khi các job gần đây replica không thắng
 # lần nào (xem V98_RACE_LEARN_*); còn lại race tất cả như "fixed". Quay về V9.7.1: V98_RACE_MODE=fixed
-V98_RACE_MODE = str(os.environ.get("V98_RACE_MODE", "learn") or "learn").strip().lower()
+V98_RACE_MODE = str(os.environ.get("V98_RACE_MODE", "dual") or "dual").strip().lower()
 V98_RACE_PROBES = _v98_env("RACE_PROBES", 2)
 # "dual" (V9.8.1): KHÔNG bắn kép. Chia file thành 2N đoạn, đoạn chẵn → host chính, đoạn lẻ → replica mn: vẫn 2N kết nối
 # như race-all nhưng CẢ 2N đều tải dữ liệu (race-all: N kết nối thua bị bỏ — log thật 17/11: 64 kết nối mở, 32 bị đóng).
 # Đoạn kẹt ở host chậm: hedge sang host kia khi host kia đã có header (chờ 1.5×TTFB của nó + 0.1 s) hoặc quá
 # V98_FIRST_HEDGE_SEC; sau đó work-stealing lo phần còn lại. Chỉ áp dụng cho VIDEO; audio giữ luật "learn".
 V98_DUAL_MAX_CONNS = _v98_env("DUAL_MAX_CONNS", 64)
+# Tốc độ/ETA của mỗi đoạn tính từ lúc CÓ HEADER (bắt đầu nhận dữ liệu), không phải từ lúc gửi request. V9.7.1 chia cho cả
+# thời gian chờ máy chủ (TTFB) → đoạn vừa bắt đầu bị coi là "chậm" → chẻ đôi thừa, mỗi lần chẻ tốn thêm 1 vòng TTFB
+# (log thật 17/11, video 83 MB: 49 lần chẻ, 8 MB cuối mất 0,8 s). 0 = cách tính V9.7.1.
+V98_ETA_FIRST_BYTE = _v98_env("ETA_FIRST_BYTE", True)
 # Ép tải video/audio native bằng aria2c RPC (để tự so sánh trên máy thật; mặc định TẮT). aria2c giới hạn CỨNG 16 kết nối
 # tới 1 máy chủ. 403/429: max-tries=1, không thử lại cùng link. Lỗi khác → quay về RANGE-TURBO.
 V98_FORCE_ARIA2 = _v98_env("FORCE_ARIA2", False)
@@ -3349,7 +3353,7 @@ def _gvs_alt_url(url: str) -> str:
 
 class _RangeSeg:
     __slots__ = ("pos", "end", "last_t", "retries", "taken", "t_start", "got", "h", "first", "gen",
-                 "kind", "hmode", "hpre")
+                 "kind", "hmode", "hpre", "t_fb")
 
     def __init__(self, pos: int, end: int, retries: int = 0):
         self.pos = int(pos)
@@ -3365,6 +3369,14 @@ class _RangeSeg:
         self.kind = "first" # V9.4.1 telemetry: first/split/takeover/retry/ext (engine V9.3 bỏ qua)
         self.hmode = ""     # V9.4.1 telemetry: ""/race/hedge
         self.hpre = -1      # V9.8 dual: host gán sẵn cho đoạn đợt đầu (0/1); -1 = để engine chọn
+        self.t_fb = 0.0     # V9.8: lúc có header 206 (bắt đầu nhận dữ liệu); 0 = chưa có (engine V9.3 không đặt)
+
+    def rate(self, now: float) -> float:
+        """byte/s của đoạn. V9.8: tính từ lúc có header; V9.7.1 (cờ tắt / engine V9.3): từ lúc gửi request."""
+        if self.got <= 0:
+            return 0.0
+        t0 = self.t_fb if (self.t_fb > 0.0 and V98_ETA_FIRST_BYTE) else self.t_start
+        return self.got / max(1e-3, now - t0)
 
     def eta(self, now: float) -> float:
         rem = self.end - self.pos + 1
@@ -3373,6 +3385,8 @@ class _RangeSeg:
             return 0.0
         if self.got <= 0 or age <= 0:
             return 1e9 if age >= RANGE_STALL_SEC else 0.0
+        if self.t_fb > 0.0 and V98_ETA_FIRST_BYTE:
+            return rem / self.rate(now)
         return rem / (self.got / age)
 
 
@@ -4011,12 +4025,19 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
     # V9.4.1: số worker riêng cho video <= 4MiB (A/B theo job qua info["small_video_workers"]).
     svw = 0 if is_audio else int(info.get("small_video_workers") or V94_VIDEO_SMALL_WORKERS or 0)
     _wl_arm = None
+    _le0 = int(V94_RACE_ALL_IF_WORKERS_LE or 0)
+
+    def _dual_ok(w):
+        return bool(V98_RACE_MODE == "dual" and not is_audio and size_known and RANGE_MN_RACE and w >= 4 and w > _le0
+                    and int(V94_FIRST_WAVE_RACE_MAX) != 0 and not int(info.get("workers_override") or 0)
+                    and time.time() >= _MN_RACE_BAD_UNTIL[0] and _gvs_alt_url(url))
     if size_known:
         workers = _range_worker_count(total0, media_kind, svw)
         if int(info.get("workers_override") or 0) > 0:      # V9.6: ép N đoạn (A/B 360p)
             workers = int(info["workers_override"])
         elif (V98_WORKERS_LEARN and total0 >= float(V98_WORKERS_LEARN_MIN_MIB) * 1048576
-                and not int(V94_RANGE_WORKERS_AUDIO if is_audio else V94_RANGE_WORKERS_VIDEO)):
+                and not int(V94_RANGE_WORKERS_AUDIO if is_audio else V94_RANGE_WORKERS_VIDEO)
+                and not _dual_ok(workers)):                  # dual đã nhân đôi kết nối tải → không cộng thêm mức "hi"
             workers, _wl_arm = _v98_workers_pick(media_kind, workers)
         workers = max(1, min(workers, max(1, total0 // min_part_bytes)))
     else:
@@ -4024,10 +4045,7 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
         # size thật nhận 416 "*/N" hoặc bị cắt theo Content-Range → vô hại), header đầu → fan-out phần còn lại.
         workers = max(1, min(int(V94_UNKNOWN_FIRST_WORKERS), max(1, total0 // min_part_bytes)))
     dual = False
-    _le0 = int(V94_RACE_ALL_IF_WORKERS_LE or 0)
-    if (V98_RACE_MODE == "dual" and not is_audio and size_known and RANGE_MN_RACE and workers >= 4 and workers > _le0
-            and int(V94_FIRST_WAVE_RACE_MAX) != 0 and not int(info.get("workers_override") or 0)
-            and time.time() >= _MN_RACE_BAD_UNTIL[0] and _gvs_alt_url(url)):
+    if _dual_ok(workers):
         dual = True                                          # video: 2N kết nối đều tải (= số kết nối của race-all)
         workers = max(workers, min(2 * workers, int(V98_DUAL_MAX_CONNS), max(1, total0 // min_part_bytes)))
     # audio / file nhỏ / không có replica khi đặt "dual" → dùng luật "learn" (audio không nằm trên đường găng)
@@ -4197,8 +4215,9 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
                 return None    # chưa biết size thì chưa chẻ (request đầu sẽ fan-out)
             now = time.perf_counter()
             ttfb = state["ttfb_ema"] if state["ttfb_ema"] is not None else 0.30
-            rates = [x.got / (now - x.t_start) for x in active
-                     if x.got > 0 and now - x.t_start > 0.05 and x.pos <= x.end]
+            rates = [x.rate(now) for x in active
+                     if x.got > 0 and now - (x.t_fb if (x.t_fb > 0.0 and V98_ETA_FIRST_BYTE) else x.t_start) > 0.05
+                     and x.pos <= x.end]
             r_avg = (sum(rates) / len(rates)) if rates else 0.0
             best, best_eta = None, 0.0
             for x in active:
@@ -4209,7 +4228,7 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
                     best, best_eta = x, e_
             if best is not None and best_eta > 2.0 * ttfb + 0.10:
                 rem = best.end - best.pos + 1
-                r_v = best.got / max(1e-3, now - best.t_start) if best.got > 0 else 0.0
+                r_v = best.rate(now)
                 if r_v > 0 and r_avg > 0:
                     keep = int(r_v * (ttfb + rem / r_avg) / (1.0 + r_v / r_avg))
                 else:
@@ -4530,6 +4549,7 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
                     TELEM.span(job, "gvs_206_headers", kind=media_kind, total=state["total"],
                                ttfb_ms=round((_now - t0) * 1000.0, 2), hops=hops, host=seg.h)
                 _req_ttfb = _now - seg.t_start
+                seg.t_fb = _now
                 state["ttfb_ema"] = (_req_ttfb if state["ttfb_ema"] is None
                                      else 0.7 * state["ttfb_ema"] + 0.3 * _req_ttfb)
             while True:
@@ -7884,6 +7904,7 @@ class PremiumDownloaderApp(QWidget):
         self.logger_qt.log(
             f"⚙️ V9.8 RANGE: prealloc={'NỀN' if V98_PREALLOC_ASYNC else 'trước GET'} | ghi={V98_WRITE_MODE} | "
             f"race={V98_RACE_MODE}" + (f"({V98_RACE_PROBES} thăm dò)" if V98_RACE_MODE in ("adaptive", "learn") else "")
+            + (f"(video 2N kết nối đều tải ≤{V98_DUAL_MAX_CONNS}; audio=learn)" if V98_RACE_MODE == "dual" else "")
             + f" | worker={'TỰ HỌC (×' + str(V98_WORKERS_LEARN_MUL) + ' ≤' + str(V98_SCALE_MAX) + ')' if V98_WORKERS_LEARN else 'cố định'}"
             + f" | scale-up={'BẬT ≤' + str(V98_SCALE_MAX) if V98_SCALE_UP else 'tắt'}"
             + (" | ⚠️ ÉP ARIA2C (≤16 kết nối)" if V98_FORCE_ARIA2 else "")

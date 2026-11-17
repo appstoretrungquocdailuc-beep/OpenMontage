@@ -33,7 +33,8 @@ def wmode(v94, monkeypatch, request):
 def test_v98_defaults(v94):
     """Mặc định V9.8 = chỉ các thay đổi đã qua A/B (BAO_CAO_V98.md); phần còn lại giữ đúng V9.7.1."""
     assert v94.V94_VERSION.startswith("V9.8")
-    assert v94.V98_PREALLOC_ASYNC is True and v94.V98_RACE_MODE == "learn" and v94.V98_WORKERS_LEARN is True
+    assert v94.V98_PREALLOC_ASYNC is True and v94.V98_RACE_MODE == "dual" and v94.V98_WORKERS_LEARN is True
+    assert v94.V98_FORCE_ARIA2 is False and int(v94.V98_DUAL_MAX_CONNS) == 64
     assert v94.V98_WRITE_MODE == "lock" and v94.V98_SCALE_UP is False and float(v94.V98_PART_MIB) == 0.0
     assert int(v94.V98_ARIA2_SPLIT) == 0 and int(v94.V98_ARIA2_MAX_TRIES) == 2
 
