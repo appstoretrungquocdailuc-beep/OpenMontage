@@ -3134,8 +3134,14 @@ def _range_progress_begin(path: Path, total: int):
 
 
 def _range_progress_add(path: Path, amount: int):
+    _range_progress_add_key(_range_progress_key(path), amount)
+
+
+def _range_progress_add_key(key: str, amount: int):
+    """V9.8: key tính SẴN 1 lần/job. Log Windows thật: path.resolve() (syscall realpath) chạy cho MỖI khối 128 KiB
+    ngay trong khoá chung → 1647 lần ≈ 1,26 s giữ khoá (lock_hold 1430 ms, ghi đĩa chỉ 168 ms), 36 luồng xếp hàng."""
     with _RANGE_PROGRESS_LOCK:
-        row = _RANGE_PROGRESS.get(_range_progress_key(path))
+        row = _RANGE_PROGRESS.get(key)
         if row is not None:
             row[0] += int(amount or 0)
 
@@ -4049,6 +4055,7 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
     else:
         prealloc_ev.set()
     wmode = V98_WRITE_MODE if V98_WRITE_MODE in ("lock", "split", "pwrite") else "lock"
+    _pkey = _range_progress_key(temp_file)                   # V9.8: không resolve() path dưới khoá mỗi khối
     wlock = threading.Lock()
     _wtl = threading.local()
     _whandles = []
@@ -4527,7 +4534,7 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
                         seg.last_t = time.perf_counter()
                         state["done"] += allowed
                         state["writes"] += 1
-                        _range_progress_add(temp_file, allowed)
+                        _range_progress_add_key(_pkey, allowed)
                         state["lock_hold_ns"] += time.perf_counter_ns() - _ta
                 else:
                     # V9.8: giữ chỗ [off, off+allowed) dưới khoá lập lịch (nhanh), ghi đĩa NGOÀI khoá đó.
@@ -4565,7 +4572,7 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
                                        ms=round(state["first_byte"] * 1000.0, 2))
                         state["done"] += allowed
                         state["writes"] += 1
-                        _range_progress_add(temp_file, allowed)
+                        _range_progress_add_key(_pkey, allowed)
             with lock:
                 clean = seg.pos == req_end + 1
                 open_resps.discard(resp)
@@ -4878,7 +4885,7 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
             "workers_learn": _wl_arm,
         })
         if _wl_arm:
-            _v98_workers_note(media_kind, _wl_arm, info.get("xfer_mbps"))
+            _v98_workers_note(media_kind, _wl_arm, info.get("mbps"))    # Mbps TỔNG (gồm TTFB): log thật 17/11 cho thấy TTFB tăng theo số kết nối
         TELEM.span(job, f"{media_kind}_download_complete", **{k: v for k, v in info.items()
                                                                 if k not in ("job", "cancel", "pool")})
 
