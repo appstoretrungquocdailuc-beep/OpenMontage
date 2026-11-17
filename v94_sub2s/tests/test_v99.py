@@ -36,15 +36,16 @@ def test_v99_defaults_keep_v981_behaviour(v99):
 
 # ----------------------------------------------------------------------------- tail-rescue
 def _stall_case(v99, tmp_path, monkeypatch, rescue, name):
-    """12 worker, đợt đầu TTFB ~1.0 s (lạnh), request sau 0.2 s; range thứ 5 treo 2.5 s."""
+    """Giống trường hợp thật: AUDIO 9 MiB / 24 worker (đoạn 0,375 MiB, không chẻ được), đợt đầu TTFB ~1.0 s (lạnh),
+    request sau 0.2 s; range thứ 5 treo 2.5 s."""
     monkeypatch.setattr(v99, "V99_TAIL_RESCUE", rescue)
     monkeypatch.setattr(v99, "V98_WORKERS_LEARN", False)
-    monkeypatch.setattr(v99, "V94_RANGE_WORKERS_VIDEO", 12)
-    data = make_payload(24 * MB, seed=91)
-    part = (len(data) + 11) // 12
+    monkeypatch.setattr(v99, "V94_RANGE_WORKERS_AUDIO", 24)
+    data = make_payload(9 * MB, seed=91)
+    part = (len(data) + 23) // 24
     with MockGVS() as g:
-        url = g.add("/st", data, hdr_delay=0.2, cold_n=12, cold_delay=0.8, stall_start=part * 5, stall_delay=2.5, stall_count=1)
-        ok, info = _dl(v99, url, tmp_path, name, len(data))
+        url = g.add("/st", data, hdr_delay=0.2, cold_n=24, cold_delay=0.8, stall_start=part * 5, stall_delay=2.5, stall_count=1)
+        ok, info = _dl(v99, url, tmp_path, name, len(data), "audio")
         time.sleep(0.2)
         n = len(g.requests_for("/st"))
     assert ok, info
@@ -55,11 +56,18 @@ def _stall_case(v99, tmp_path, monkeypatch, rescue, name):
 def test_tail_rescue_bounds_a_stalled_range(v99, tmp_path, monkeypatch):
     off, n_off = _stall_case(v99, tmp_path, monkeypatch, False, "off.bin")
     on, n_on = _stall_case(v99, tmp_path, monkeypatch, True, "on.bin")
-    assert off["rescues"] == 0 and on["rescues"] >= 1
+    # V9.8.1: chỉ thoát nhờ read-timeout 1.5 s của audio rồi retry; ứng viên: cứu ngay khi 23 range kia xong
+    assert off["rescues"] == 0 and off["req_errors"].get("error:ReadTimeoutError", 0) >= 1
+    assert on["rescues"] == 1 and on["last_range"]["req"] == "rescue" and not on["req_errors"]
     assert on["elapsed_ms"] < off["elapsed_ms"] - 150, (on["elapsed_ms"], off["elapsed_ms"])
-    assert on["elapsed_ms"] < 2300                                       # không chờ hết 2.5 s treo + TTFB
-    assert n_on <= n_off + int(v99.V99_TAIL_RESCUE_MAX) + 2              # request thêm bị chặn trần
-    assert on["last_range"]["req"] in ("rescue", "split", "takeover", "first") and on["tail_ms"] is not None
+    assert on["tail_ms"] < off["tail_ms"]
+    assert n_on <= n_off + 1                                            # đúng 1 request cứu, không spam
+
+
+def test_tail_rescue_request_cap(v99, tmp_path, monkeypatch):
+    monkeypatch.setattr(v99, "V99_TAIL_RESCUE_MAX", 0)
+    info, _ = _stall_case(v99, tmp_path, monkeypatch, True, "cap.bin")
+    assert info["rescues"] == 0
 
 
 def test_tail_rescue_no_extra_requests_when_healthy(v99, tmp_path, monkeypatch):

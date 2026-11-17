@@ -147,12 +147,14 @@ keyframe, lệch A/V, **giải mã toàn bộ**, đếm khung hình. ffmpeg 6.1.
 | VP9 + Opus | 330 s | DIRECT-CUT | DONE | 4/4 | vp9 + opus (mp4) | không | 6672 / 6672 | 0 | 0 | 1 ms | 0 | 0 |
 | **AV1 + Opus** | 330 s | DIRECT-CUT | DONE | 4/4 | av1 + opus (mp4) | không | **6864 / 6672** | **96** | **3/4** | 1 ms | 0 | 0 |
 | cả 5 tổ hợp | 120 s | MUX | DONE | 1/1 | giữ codec gốc | không | 2880 / 2880 | 0 | 0 | 0 ms | 0 | 0 |
+| VP9 / AV1 / H.264 + AAC | 40 s | MUX + nối đuôi cho đủ ≥ 60 s | DONE | 1/1 | giữ codec gốc | không (stream-copy) | 1560 / 1560 | 0 | 0 | 23 ms | 0 | 0 |
 
 Trả lời từng câu hỏi:
 
 - **File ra có video + audio không?** Có, 100% part ở mọi tổ hợp; audio đúng track đưa vào. (Trên link thật, track đó là track JA do
   luật strict chọn — `live480` in `a_lang` của từng part.)
-- **Có phải mã hoá lại AV1/VP9 sang H.264 không?** **Không.** Tool chỉ stream-copy (`-c copy`): codec ra = codec vào. Nếu workflow
+- **Có phải mã hoá lại AV1/VP9 sang H.264 không?** **Không.** Tool chỉ stream-copy (`-c copy`): codec ra = codec vào. Ngoại lệ duy nhất
+  trong code: video < 60 s, nếu bước nối đuôi bằng stream-copy thất bại thì mới fallback `libx264 ultrafast` (trong thử nghiệm: không xảy ra). Nếu workflow
   cần H.264 thì chỉ itag 135 đáp ứng, và 135 là file LỚN nhất (148,61 MiB).
 - **AV1 (397) cắt trực tiếp được không?** Cắt được, file phát được, không lỗi giải mã — **nhưng không sạch**: 3/4 part (mọi part không
   bắt đầu đúng keyframe) lộ ra tới 96 khung (4 s) "pre-roll" trước điểm cắt và ffmpeg báo timestamp lùi. Nguyên nhân: lệnh cắt dùng
