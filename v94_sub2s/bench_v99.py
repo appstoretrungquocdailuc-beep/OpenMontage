@@ -681,7 +681,9 @@ def run_cutlab(args):
                        parts_ok=psum.get("ok_parts"), out_vcodec=",".join(psum.get("vcodecs") or []),
                        out_acodec=",".join(psum.get("acodecs") or []), out_container=",".join(psum.get("containers") or []),
                        branch=("DIRECT-CUT" if "DIRECT-CUT" in log and "BỎ MUX" in log else "MUX+CẮT" if "MUX COPY" in log else "?"),
-                       reencode=bool(re.search(r"libx264|transcod|chuyển mã|encode", log, re.I)),
+                       reencode=bool(re.search(r"fallback ultrafast|FAST COPY chưa đạt", log, re.I)
+                                     or (psum.get("vcodecs") and psum["vcodecs"] != [{"vp9": "vp9", "av1": "av1", "h264": "h264"}[vc]])),
+                       branch_short=("PREPEND<60s" if "FAST COPY" in log or "ultrafast" in log else ""),
                        hot_ready_ms=hot, cut_mux_ms=(round(tot - hot, 1) if (hot and tot) else None), total_ms=tot, wall_ms=wall,
                        total_out_dur_s=psum.get("total_dur_s"), src_video_packets=src_pk, out_video_packets=pk,
                        max_av_start_diff_ms=psum.get("max_av_start_diff_ms"), max_av_dur_diff_ms=psum.get("max_av_dur_diff_ms"),
@@ -706,7 +708,7 @@ def run_cutlab(args):
             "frames_decoded", "frames_expected", "note"]
     md = [f"# v99 cutlab — {time.strftime('%Y-%m-%d %H:%M:%S')}", "",
           f"- CỤC BỘ (không mạng): nguồn 854x480 24fps tổng hợp, chạy NGUYÊN pipeline `{mod.V94_VERSION}` qua máy chủ giả; ffmpeg: {_run([ffmpeg, '-version'])}",
-          f"- cutsec={args.cutsec}. Mỗi part được ffprobe + GIẢI MÃ TOÀN BỘ. `reencode`=True nếu log có dấu hiệu mã hoá lại.",
+          f"- cutsec={args.cutsec}. Mỗi part được ffprobe + GIẢI MÃ TOÀN BỘ. `reencode`=True nếu codec ra KHÁC codec nguồn hoặc log báo fallback libx264.",
           "- `frames_decoded` so với `frames_expected` (= thời lượng part × 24): LỚN hơn = lộ khung 'pre-roll' trước điểm cắt (max_extra_frames / part).",
           "- `parts_with_ts_warn`: số part mà ffmpeg báo timestamp lùi khi giải mã (không phải lỗi giải mã).",
           "- Tool cắt theo thiết kế cũ: bỏ 6 s đầu, part sau lùi +2 s, phần dư cuối (< cutsec) KHÔNG xuất → tổng thời lượng ra < nguồn.",
