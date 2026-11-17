@@ -55,6 +55,8 @@ Ngoài ra: worker tự học trước đây so `xfer_mbps` (không thấy TTFB) 
   `[ARIA2-RPC] ✅ VIDEO | …MB | …s | ≈…Mbps | ttfb=… | kết nối thật=N/16`. 403/429: `max-tries=1`, không thử lại cùng link;
   lỗi khác → tự quay về RANGE-TURBO. Tải 3–4 video mỗi chế độ rồi so dòng `HOÀN TẤT VIDEO` / `HOT 480P READY`.
 
+**Kiểm thử V9.8.1:** toàn bộ **219 passed + 1 xfailed** (xfail = test V9.3 cũ về Excel, không liên quan). Thêm 7 test: dual (2N kết nối đều tải, host chính chậm → hedge, replica 403 → về host chính, cả hai 403 → lỗi cứng không spam, chỉ áp dụng video có replica), ép aria2 (SHA đúng, ≤ 16 kết nối, 403 đúng 1 request, sai dung lượng → về RANGE-TURBO), trần split 16. 3 test luật race V9.4.1 được ghim vào `V98_RACE_MODE=fixed` (chế độ mà chúng kiểm tra).
+
 **Cần bạn gửi lại:** vài dòng log `[RANGE-TURBO] ✅ HOÀN TẤT VIDEO` của bản V9.8.1 (có `race=dual`), tốt nhất gồm 2–3 video
 **40–60 MB**. Nhìn `workers=`, `xfer≈`, `ttfb=`, `splits=`: nếu `xfer` tăng rõ so với bảng trên mà `ttfb` không tăng → dual
 có tác dụng thật; nếu `ttfb` tăng → đặt `V98_DUAL_MAX_CONNS=48`.
