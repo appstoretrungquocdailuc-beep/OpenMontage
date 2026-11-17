@@ -307,6 +307,7 @@ def _dl(v94, url, tmp_path, name, expected, kind, info=None, logs=None):
     (int(2.88 * MB), 4, 8, "all"), (24 * MB, 4, 8, 4),             # trần tuỳ chọn: file nhỏ vẫn race hết
     (int(2.88 * MB), 4, 0, 4)])                                     # = V9.4.0
 def test_race_all_small_files(v94, monkeypatch, tmp_path, size, cap, flag, expect_races):
+    monkeypatch.setattr(v94, "V98_RACE_MODE", "fixed")      # test luật race V9.4.1; mặc định V9.8.1 là "dual" (không race)
     monkeypatch.setattr(v94, "V94_FIRST_WAVE_RACE_MAX", cap)
     monkeypatch.setattr(v94, "V94_RACE_ALL_IF_WORKERS_LE", flag)
     data = make_payload(size, seed=size & 0xFFFF)
