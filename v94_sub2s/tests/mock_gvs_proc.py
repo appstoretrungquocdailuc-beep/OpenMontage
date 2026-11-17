@@ -42,6 +42,12 @@ def main():
             with g.log_lock:
                 n = sum(1 for x in g.log if x[1].startswith(pre))
             print(f"COUNT {n}", flush=True)
+        elif parts[0] == "reset":           # trước mỗi lượt đo: đếm lại request (cold_n) và range treo (stall_*)
+            for sp in g.files.values():
+                with sp.lock:
+                    sp.requests = 0
+                    sp.kw.pop("_stalled", None)
+            print("RESET 1", flush=True)
         elif parts[0] == "conns":
             print(f"CONNS {g.conns}", flush=True)
         elif parts[0] == "quit":

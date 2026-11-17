@@ -37,6 +37,7 @@ REPORT = ROOT / "perf_report"
 sys.path.insert(0, str(ROOT / "tests"))
 sys.path.insert(0, str(ROOT))
 MB = 1024 * 1024
+REPORT_PREFIX = "v98"
 TABLE_COLS = ["ENGINE", "WORKERS_VIDEO", "WORKERS_AUDIO", "HEDGE", "FILE_MB", "RESOLVE_MS", "TTFB_MS", "VIDEO_MS", "AUDIO_MS",
               "HOT_READY_MS", "PIPELINE_TOTAL_MS", "P50", "P90", "REQUESTS", "ERRORS", "SHA256_OK"]
 
@@ -105,6 +106,9 @@ class MockProc:
     def conns(self):
         return self._ask("conns")
 
+    def reset(self):
+        return self._ask("reset")
+
     def close(self):
         try:
             self.p.stdin.write("quit\n")
@@ -135,9 +139,19 @@ def mock_spec(sc, vsize, asize):
     vr, ar = s["v_conn"] * 1e6 / 8, s["a_conn"] * 1e6 / 8
     files = []
     for k, size, rate, seed in (("v", vsize, vr, 244), ("a", asize, ar, 139)):
-        files.append({"path": f"/{k}/real", "size": size, "seed": seed, "mode": "ok", "kw": {"rate": rate, "hdr_delay": s["final_ms"] / 1000}})
+        ex = {}
+        st = s.get(f"{k}_stall")            # {"seg": i, "workers": N, "delay": giây}: range thứ i của đợt đầu bị treo trên CẢ 2 host
+        if st:
+            part = (size + int(st["workers"]) - 1) // int(st["workers"])
+            ex = {"stall_start": part * int(st["seg"]), "stall_delay": float(st["delay"]), "stall_count": 1}
+        cold = s.get(f"{k}_cold")           # {"n": N, "extra_ms": X}: N request đầu của mỗi host chậm thêm X ms
+        if cold:
+            ex.update({"cold_n": int(cold["n"]), "cold_delay": float(cold["extra_ms"]) / 1000})
+        fin = (s.get(f"{k}_final_ms") or s["final_ms"]) / 1000
+        alt = (s.get(f"{k}_alt_ms") or s["alt_ms"]) / 1000
+        files.append({"path": f"/{k}/real", "size": size, "seed": seed, "mode": "ok", "kw": dict({"rate": rate, "hdr_delay": fin}, **ex)})
         files.append({"path": f"/{k}/main", "size": 0, "mode": "redirect", "kw": {"to_path": f"/{k}/real", "hdr_delay": s["redirect_ms"] / 1000}})
-        files.append({"path": f"/{k}/alt", "size": size, "seed": seed, "mode": "ok", "kw": {"rate": rate, "hdr_delay": s["alt_ms"] / 1000}})
+        files.append({"path": f"/{k}/alt", "size": size, "seed": seed, "mode": "ok", "kw": dict({"rate": rate, "hdr_delay": alt}, **ex)})
     return {"link_mbps": s["link"], "ttfb_ms": 0, "files": files}
 
 
@@ -185,7 +199,7 @@ def run_pair(mod, mp, cfg, vsize, asize, vsha, asha, win_prealloc):
         setattr(mod, k, v)
     # bộ nhớ "học" (race learn, worker tự học) RIÊNG cho từng cấu hình — không thì các biến thể B dùng chung lịch sử
     if hasattr(mod, "_V98_WL"):
-        st = _LEARN_STORE.setdefault((id(mp), cfg.get("label")), {"wl": {}, "rh": []})
+        st = _LEARN_STORE.setdefault((mp.port, mp.p.pid, cfg.get("label")), {"wl": {}, "rh": []})   # id(mp) có thể bị tái dùng
         mod._V98_WL, mod._V98_RACE_HIST = st["wl"], st["rh"]
     alt = {mp.url("/v/main"): mp.url("/v/alt"), mp.url("/a/main"): mp.url("/a/alt")}
     old_alt = mod._gvs_alt_url
@@ -194,6 +208,7 @@ def run_pair(mod, mp, cfg, vsize, asize, vsha, asha, win_prealloc):
     _patch_open(mod, win_prealloc)
     tmp = Path(tempfile.mkdtemp(prefix="v98_"))
     res = {}
+    mp.reset()
     r0 = {"v": mp.count("/v/"), "a": mp.count("/a/")}
     c0 = mp.conns()
     cpu0 = time.process_time()
@@ -234,6 +249,8 @@ def run_pair(mod, mp, cfg, vsize, asize, vsha, asha, win_prealloc):
             "prealloc_ms_video": vinf.get("prealloc_ms"), "first_get_ms_video": vinf.get("first_get_ms"),
             "steals_video": vinf.get("steals"), "splits_video": vinf.get("splits"), "workers_video": vinf.get("workers_initial"),
             "workers_audio": ainf.get("workers_initial"), "xfer_mbps_video": vinf.get("xfer_mbps"), "cpu_s": round(cpu, 3),
+            "takeovers_audio": ainf.get("takeovers"), "gets_audio": ainf.get("requests"), "rescues_audio": ainf.get("rescues"),
+            "tail_ms_audio": ainf.get("tail_ms"), "tail_ms_video": vinf.get("tail_ms"), "rescues_video": vinf.get("rescues"),
             "TCP_CONNS": tcp, "write_ms_video": vinf.get("write_ms"), "write_mode": vinf.get("write_mode"),
             "prealloc_bg_ms_video": vinf.get("prealloc_bg_ms"), "scale_added_video": vinf.get("scale_added"),
             "workers_peak_video": vinf.get("workers_peak"), "aria2_conns_video": vinf.get("connections"),
@@ -304,14 +321,14 @@ def configs_from(args, eng_mods):
                                 flags.update(V98_RACE_MODE="adaptive", V94_FIRST_WAVE_RACE_MAX=-1)
                             else:
                                 flags["V94_FIRST_WAVE_RACE_MAX"] = int(rc)
-                                if eng == "B":
+                                if eng == "B" and REPORT_PREFIX == "v98":   # bench V9.8 cũ: B không tên = race cố định
                                     flags["V98_RACE_MODE"] = "fixed"
                             variants = ({"": {}} if eng != "B" else (args.b_variants or {"": {}}))
                             for vn, vflags in variants.items():
                                 fl = dict(flags)
                                 if vn and rc != "adaptive":
                                     fl.pop("V98_RACE_MODE", None)      # biến thể có tên: giữ MẶC ĐỊNH của bản B (không ép fixed)
-                                if eng == "B":
+                                if eng == "B" or REPORT_PREFIX != "v98":
                                     fl["V98_PART_MIB"] = pm
                                     fl.update(args.b_flags or {})
                                     fl.update(vflags or {})
@@ -354,7 +371,7 @@ def summarize(rows):
 def write_report(mode, rows, summary, notes):
     REPORT.mkdir(exist_ok=True)
     ts = time.strftime("%Y%m%d_%H%M%S")
-    base = REPORT / f"v98_{mode}_{ts}"
+    base = REPORT / f"{REPORT_PREFIX}_{mode}_{ts}"
     with open(f"{base}.jsonl", "w", encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False, default=str) + "\n")

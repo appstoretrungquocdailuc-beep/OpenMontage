@@ -101,6 +101,8 @@ class MockGVS:
                     time.sleep(mock.ttfb)
                 if kw.get("hdr_delay"):
                     time.sleep(float(kw["hdr_delay"]))
+                if kw.get("cold_n") and nreq <= int(kw["cold_n"]):      # cold_n request ĐẦU chậm thêm (kết nối lạnh / tranh chấp đợt đầu)
+                    time.sleep(float(kw.get("cold_delay") or 0))
                 if spec.mode == "redirect":
                     self.send_response(302)
                     self.send_header("Location", kw["to"])
@@ -128,6 +130,14 @@ class MockGVS:
                 if start >= n:
                     return self._send(416, b"", {"Content-Range": f"bytes */{n}"})
                 end = min(end, n - 1)
+                # stall_start/stall_delay/stall_count: `stall_count` request đầu tiên xin đúng byte `stall_start` bị treo
+                # header thêm `stall_delay` giây (mô phỏng 1 range kẹt: mất gói SYN/TLS, edge chậm...). Request cứu sau đó nhanh.
+                if kw.get("stall_start") is not None and start == int(kw["stall_start"]):
+                    with spec.lock:
+                        spec.kw["_stalled"] = int(spec.kw.get("_stalled", 0)) + 1
+                        _c = spec.kw["_stalled"]
+                    if _c <= int(kw.get("stall_count", 1)):
+                        time.sleep(float(kw.get("stall_delay", 3.0)))
                 cr_start = start
                 if spec.mode == "badcr":
                     # Server/edge trả SAI đoạn byte (lệch shift) nhưng Content-Range trung thực.

@@ -97,9 +97,13 @@ def load_module(name: str):
     return mod
 
 
+# V9.9: chạy NGUYÊN bộ test trên bản ứng viên:  set V94_TEST_MODULE=V9_9_CANDIDATE  (mặc định: bản chính V9_4_SUB2S)
+V94_MODULE = os.environ.get("V94_TEST_MODULE") or "V9_4_SUB2S"
+
+
 @pytest.fixture(scope="session")
 def v94():
-    return load_module("V9_4_SUB2S")
+    return load_module(V94_MODULE)
 
 
 @pytest.fixture(scope="session")
@@ -149,7 +153,7 @@ def qapp():
 @pytest.fixture(autouse=True)
 def _v98_reset_learning():
     """V9.8: race 'learn' + worker tự học nhớ lịch sử giữa các job trong 1 tiến trình — mỗi test bắt đầu sạch."""
-    m = sys.modules.get("V9_4_SUB2S")
+    m = sys.modules.get(V94_MODULE)
     if m is not None and hasattr(m, "_V98_RACE_HIST"):
         m._V98_RACE_HIST.clear()
         m._V98_WL.clear()

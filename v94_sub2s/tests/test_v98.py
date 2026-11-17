@@ -32,7 +32,7 @@ def wmode(v94, monkeypatch, request):
 
 def test_v98_defaults(v94):
     """Mặc định V9.8 = chỉ các thay đổi đã qua A/B (BAO_CAO_V98.md); phần còn lại giữ đúng V9.7.1."""
-    assert v94.V94_VERSION.startswith("V9.8")
+    assert v94.V94_VERSION.startswith(("V9.8", "V9.9"))
     assert v94.V98_PREALLOC_ASYNC is True and v94.V98_RACE_MODE == "dual" and v94.V98_WORKERS_LEARN is True
     assert v94.V98_FORCE_ARIA2 is False and int(v94.V98_DUAL_MAX_CONNS) == 64
     assert v94.V98_WRITE_MODE == "lock" and v94.V98_SCALE_UP is False and float(v94.V98_PART_MIB) == 0.0
@@ -47,8 +47,9 @@ def test_v98_rollback_env(monkeypatch):
     root = Path(__file__).resolve().parents[1]
     code = ("import sys; sys.path.insert(0, r'%s'); sys.path.insert(0, r'%s');"
             "import conftest; conftest._install_pyside6_stub();"
-            "import V9_4_SUB2S as m;"
-            "print(m.V98_PREALLOC_ASYNC, m.V98_RACE_MODE, m.V98_WORKERS_LEARN)") % (root, root / "tests")
+            "import %s as m;"
+            "print(m.V98_PREALLOC_ASYNC, m.V98_RACE_MODE, m.V98_WORKERS_LEARN)") % (
+                root, root / "tests", os.environ.get("V94_TEST_MODULE") or "V9_4_SUB2S")
     env = dict(os.environ, V98_PREALLOC_ASYNC="0", V98_RACE_MODE="fixed", V98_WORKERS_LEARN="0", QT_QPA_PLATFORM="offscreen")
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, timeout=120, cwd=str(root))
     assert out.stdout.strip().splitlines()[-1] == "False fixed False", out.stderr[-2000:]
