@@ -55,7 +55,19 @@ Ngoài ra: worker tự học trước đây so `xfer_mbps` (không thấy TTFB) 
   `[ARIA2-RPC] ✅ VIDEO | …MB | …s | ≈…Mbps | ttfb=… | kết nối thật=N/16`. 403/429: `max-tries=1`, không thử lại cùng link;
   lỗi khác → tự quay về RANGE-TURBO. Tải 3–4 video mỗi chế độ rồi so dòng `HOÀN TẤT VIDEO` / `HOT 480P READY`.
 
-**Kiểm thử V9.8.1:** toàn bộ **219 passed + 1 xfailed** (xfail = test V9.3 cũ về Excel, không liên quan). Thêm 7 test: dual (2N kết nối đều tải, host chính chậm → hedge, replica 403 → về host chính, cả hai 403 → lỗi cứng không spam, chỉ áp dụng video có replica), ép aria2 (SHA đúng, ≤ 16 kết nối, 403 đúng 1 request, sai dung lượng → về RANGE-TURBO), trần split 16. 3 test luật race V9.4.1 được ghim vào `V98_RACE_MODE=fixed` (chế độ mà chúng kiểm tra).
+**Log thật 21:05 (bản V9.8.1, video 82,96 MB) — 1 mẫu, chưa kết luận được**
+
+- Lần thử đầu (link native, dual 64 kết nối): `HTTP_401` sau ~1,5 s, chưa nhận byte nào → SAFE-REFRESH (~0,9 s) → HOT READY 4,545 s.
+- Lần thử hai (link yt-dlp, dual 64 kết nối): **82,96 MB trong 1,926 s** (361 Mbps; xfer 403 Mbps; trước đó 83,47 MB mất 2,846 s).
+  Kết nối đã ấm từ lần thử đầu (`ttfb=0.19s`) nên chưa phải so sánh sạch. Không có sự cố 401 thì HOT READY ≈ 2,07 s.
+- **Chưa biết 401 do đâu**: (a) trùng hợp — link native đôi khi bị từ chối, job chạy ngay giây đầu sau khi mở tool; hoặc
+  (b) dual làm mất lớp dự phòng của race (host chính từ chối nhưng replica phục vụ được → race vẫn xong, dual thì hỏng).
+- Đã vá cả hai hướng: **failover** (đoạn bị host này từ chối → chuyển host kia, chỉ khi host kia đã trả 206 trong job; cả hai
+  từ chối → dừng, không gửi thêm; 429 không bao giờ failover); **tự bảo vệ** (job dual bị từ chối → tắt dual 30 phút, lần sau
+  2 giờ, dùng `learn`); **log chẩn đoán** (`lỗi từ host=chính|replica | header 206: chính=a/b replica=c/d`).
+- Muốn tắt hẳn dual ngay: `set V98_RACE_MODE=learn` trong `RUN_V9_8_GUI.bat`.
+
+**Kiểm thử V9.8.1:** toàn bộ **222 passed + 1 xfailed** (bản 21:30, thêm 3 test failover / tự bảo vệ / 429). Bản trước: **219 passed + 1 xfailed** (xfail = test V9.3 cũ về Excel, không liên quan). Thêm 7 test: dual (2N kết nối đều tải, host chính chậm → hedge, replica 403 → về host chính, cả hai 403 → lỗi cứng không spam, chỉ áp dụng video có replica), ép aria2 (SHA đúng, ≤ 16 kết nối, 403 đúng 1 request, sai dung lượng → về RANGE-TURBO), trần split 16. 3 test luật race V9.4.1 được ghim vào `V98_RACE_MODE=fixed` (chế độ mà chúng kiểm tra).
 
 **Cần bạn gửi lại:** vài dòng log `[RANGE-TURBO] ✅ HOÀN TẤT VIDEO` của bản V9.8.1 (có `race=dual`), tốt nhất gồm 2–3 video
 **40–60 MB**. Nhìn `workers=`, `xfer≈`, `ttfb=`, `splits=`: nếu `xfer` tăng rõ so với bảng trên mà `ttfb` không tăng → dual
