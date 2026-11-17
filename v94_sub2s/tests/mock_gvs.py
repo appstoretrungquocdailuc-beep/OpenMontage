@@ -101,8 +101,13 @@ class MockGVS:
                     time.sleep(mock.ttfb)
                 if kw.get("hdr_delay"):
                     time.sleep(float(kw["hdr_delay"]))
-                if kw.get("cold_n") and nreq <= int(kw["cold_n"]):      # cold_n request ĐẦU chậm thêm (kết nối lạnh / tranh chấp đợt đầu)
-                    time.sleep(float(kw.get("cold_delay") or 0))
+                if kw.get("cold_n") and nreq <= int(kw["cold_n"]):      # đợt request ĐẦU chậm thêm (kết nối lạnh / tranh chấp đợt đầu)
+                    # chỉ request tới trong cold_window giây kể từ request đầu tiên của path này (đợt đầu thật); request
+                    # chẻ / cứu về sau đi trên kết nối ẤM (log thật: chờ header 0.04–0.23 s) → không chậm thêm
+                    with spec.lock:
+                        t_first = spec.kw.setdefault("_t_first", time.perf_counter())
+                    if time.perf_counter() - t_first <= float(kw.get("cold_window", 0.3)):
+                        time.sleep(float(kw.get("cold_delay") or 0))
                 if spec.mode == "redirect":
                     self.send_response(302)
                     self.send_header("Location", kw["to"])
@@ -153,6 +158,8 @@ class MockGVS:
                 rate = float(kw.get("rate") or 0)
                 if kw.get("slow_first_n") and nreq <= int(kw["slow_first_n"]):
                     rate = float(kw.get("slow_rate") or 64 * 1024)
+                elif kw.get("slow_every") and nreq % int(kw["slow_every"]) == 0:
+                    rate = float(kw.get("slow_rate") or 64 * 1024)      # mỗi request thứ N: kết nối chậm (tắc nghẽn / edge kém)
                 drop_at = kw.get("drop_at")
                 pos = 0
                 chunk = 16 * 1024

@@ -47,6 +47,7 @@ def main():
                 with sp.lock:
                     sp.requests = 0
                     sp.kw.pop("_stalled", None)
+                    sp.kw.pop("_t_first", None)
             print("RESET 1", flush=True)
         elif parts[0] == "conns":
             print(f"CONNS {g.conns}", flush=True)

@@ -39,6 +39,7 @@ def _stall_case(v99, tmp_path, monkeypatch, rescue, name):
     """Giống trường hợp thật: AUDIO 9 MiB / 24 worker (đoạn 0,375 MiB, không chẻ được), đợt đầu TTFB ~1.0 s (lạnh),
     request sau 0.2 s; range thứ 5 treo 2.5 s."""
     monkeypatch.setattr(v99, "V99_TAIL_RESCUE", rescue)
+    monkeypatch.setattr(v99, "V99_WARM_TTFB", rescue)                   # off = đúng luật V9.8.1 (cả 2 cơ chế mới tắt)
     monkeypatch.setattr(v99, "V98_WORKERS_LEARN", False)
     monkeypatch.setattr(v99, "V94_RANGE_WORKERS_AUDIO", 24)
     data = make_payload(9 * MB, seed=91)
@@ -58,10 +59,10 @@ def test_tail_rescue_bounds_a_stalled_range(v99, tmp_path, monkeypatch):
     on, n_on = _stall_case(v99, tmp_path, monkeypatch, True, "on.bin")
     # V9.8.1: chỉ thoát nhờ read-timeout 1.5 s của audio rồi retry; ứng viên: cứu ngay khi 23 range kia xong
     assert off["rescues"] == 0 and off["req_errors"].get("error:ReadTimeoutError", 0) >= 1
-    assert on["rescues"] == 1 and on["last_range"]["req"] == "rescue" and not on["req_errors"]
+    assert on["rescues"] + on["takeovers"] >= 1 and not on["req_errors"]   # cứu sớm (rescue hoặc giành lại theo TTFB ấm), không chờ timeout
     assert on["elapsed_ms"] < off["elapsed_ms"] - 150, (on["elapsed_ms"], off["elapsed_ms"])
     assert on["tail_ms"] < off["tail_ms"]
-    assert n_on <= n_off + 1                                            # đúng 1 request cứu, không spam
+    assert n_on <= n_off + int(v99.V99_TAIL_RESCUE_MAX)                 # request thêm có trần, không spam
 
 
 def test_tail_rescue_request_cap(v99, tmp_path, monkeypatch):
@@ -254,3 +255,34 @@ def test_force_audio_never_picks_non_japanese(v99, monkeypatch):
     only_en = dict(YT, formats=[f for f in YT["formats"] if f.get("language") != "ja"])
     bd = v99._pick_ytdlp_480_bundle(only_en, "YTDLP")
     assert bd["audio_url"] is None and bd.get("ja_audio_missing") is True
+
+
+# ----------------------------------------------------------------------------- đuôi chậm: TTFB ấm (log thật 18/11)
+def _tail_case(v99, tmp_path, monkeypatch, warm, name):
+    """12 đoạn × 2 MiB; đợt đầu LẠNH (TTFB ~0.85 s), request sau ẤM (0.05 s); mỗi kết nối 2 MiB/s, cứ 4 request có 1 cái chỉ
+    0.8 MiB/s. Lúc các đoạn nhanh xong (~1.85 s) đoạn chậm còn ~1.2 MiB = ETA ~1.5 s: V9.8.1 (ngưỡng 2 × 0.85 + 0.1 = 1.8 s)
+    KHÔNG chẻ → 1 kết nối tải một mình; TTFB ấm (ngưỡng ~0.95 s) chẻ ngay — đúng hiện tượng log thật 18/11."""
+    monkeypatch.setattr(v99, "V99_WARM_TTFB", warm)
+    monkeypatch.setattr(v99, "V99_TAIL_RESCUE", False)
+    monkeypatch.setattr(v99, "V98_WORKERS_LEARN", False)
+    monkeypatch.setattr(v99, "V98_RACE_MODE", "fixed")
+    monkeypatch.setattr(v99, "V94_RANGE_WORKERS_VIDEO", 12)
+    data = make_payload(24 * MB, seed=96)
+    with MockGVS() as g:
+        url = g.add("/tl", data, hdr_delay=0.05, rate=2 * MB, cold_n=12, cold_delay=0.8, slow_every=4, slow_rate=int(0.8 * MB))
+        ok, info = _dl(v99, url, tmp_path, name, len(data))
+        time.sleep(0.2)
+        n = len(g.requests_for("/tl"))
+    assert ok, info
+    assert sha256((tmp_path / name).read_bytes()) == sha256(data)
+    return info, n
+
+
+def test_warm_ttfb_shortens_tail(v99, tmp_path, monkeypatch):
+    old, n_old = _tail_case(v99, tmp_path, monkeypatch, False, "old.bin")
+    new, n_new = _tail_case(v99, tmp_path, monkeypatch, True, "new.bin")
+    assert new["splits"] > old["splits"]
+    assert new["elapsed_ms"] < old["elapsed_ms"] - 250, (new["elapsed_ms"], old["elapsed_ms"])
+    assert new["tail_ms"] < old["tail_ms"]
+    assert n_new <= n_old + 12                                          # chẻ thêm có giới hạn, không bùng request
+    assert new["warm_ttfb_p50_ms"] is not None and new["warm_ttfb_p50_ms"] < new["ttfb_first_p50_ms"]

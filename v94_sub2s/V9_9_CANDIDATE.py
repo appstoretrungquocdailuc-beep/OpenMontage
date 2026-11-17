@@ -377,6 +377,12 @@ V99_TAIL_RESCUE = _v99_env("TAIL_RESCUE", True)
 V99_TAIL_RESCUE_FACTOR = _v99_env("TAIL_RESCUE_FACTOR", 1.15)
 V99_TAIL_RESCUE_MAX = _v99_env("TAIL_RESCUE_MAX", 4)             # tối đa request cứu / file (chống request trùng)
 V99_TAIL_BODY_STALL_SEC = _v99_env("TAIL_BODY_STALL_SEC", 0.35)  # đuôi: đoạn đã có header nhưng đứng im quá N giây → cứu
+# ĐUÔI CHẬM (log thật 18/11: 10% cuối mất ~0,6–1 s): quyết định chẻ / giành lại dùng TTFB của kết nối ẤM (median các request
+# không thuộc đợt đầu, đo lúc có header) thay cho trung bình bị kéo lên bởi đợt đầu LẠNH (0,47–0,75 s, trong khi request ở đuôi chỉ
+# chờ header 0,04–0,23 s). Ngưỡng chẻ = ETA > 2×TTFB + 0,1 s → từ ~1,3 s xuống ~0,5 s. 0 = cách tính V9.8.1.
+V99_WARM_TTFB = _v99_env("WARM_TTFB", True)
+# Mẩu nhỏ nhất được chẻ ở giai đoạn đuôi (KiB). V9.8.1: 512 KiB (mẩu < 512 KiB không bao giờ chẻ → audio 0,49 MiB mất 701 ms).
+V99_TAIL_MIN_SPLIT_KIB = _v99_env("TAIL_MIN_SPLIT_KIB", 128)
 # Đo DNS / TCP / TLS của từng kết nối mới và gắn vào span gvs_req (vá urllib3 1 lần; vá lỗi → bỏ qua, không ảnh hưởng tải)
 V99_NET_TRACE = _v99_env("NET_TRACE", True)
 # Số worker audio (0 = heuristic V9.8.1). Bench: 8/16/24/32.
@@ -4433,7 +4439,7 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
              "lock_hold_ns": 0, "write_ns": 0, "w_inflight": 0, "scale_added": 0, "scale_steps": [],
              "host_ok": [0, 0], "host_err": [0, 0], "err_host": -1, "failovers": 0,
              # V9.9
-             "first_ttfb": [], "rescues": 0, "t90": None, "last_req": None, "errs": {}}
+             "first_ttfb": [], "rescues": 0, "t90": None, "last_req": None, "errs": {}, "warm_ttfb": [], "tail_splits": 0}
     # V9.4.1: file nhỏ (<= V94_RACE_ALL_IF_WORKERS_LE segment đợt đầu) race TẤT CẢ như V9.3; file lớn giữ trần.
     # Log live: video 6 worker chỉ race 4 → 2 segment còn lại phải chờ host chính + 302 (+~150ms trong mock).
     _rm = int(V94_FIRST_WAVE_RACE_MAX)
@@ -4536,13 +4542,23 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
                 return None    # chưa biết size thì chưa chẻ (request đầu sẽ fan-out)
             now = time.perf_counter()
             ttfb = state["ttfb_ema"] if state["ttfb_ema"] is not None else 0.30
+            _wt = state["warm_ttfb"]
+            _ft0 = state["first_ttfb"]
+            _warm_ok = bool(V99_WARM_TTFB and (_wt or len(_ft0) >= 3))
+            if _warm_ok:
+                # V9.9: TTFB kết nối ẤM cho quyết định ở đuôi. Có mẫu ấm → median; chưa có (dual: đợt đầu phủ hết file nên
+                # request ấm chỉ xuất hiện khi đã vào đuôi) → ½ median đợt đầu lạnh (log thật 18/11: ấm/lạnh = 0,28–0,43).
+                ttfb = (sorted(_wt)[len(_wt) // 2] if _wt else 0.5 * sorted(_ft0)[len(_ft0) // 2])
+            _min_split = RANGE_STEAL_MIN_BYTES
+            if _warm_ok and not pending:
+                _min_split = max(64 * 1024, min(RANGE_STEAL_MIN_BYTES, int(float(V99_TAIL_MIN_SPLIT_KIB) * 1024)))
             rates = [x.rate(now) for x in active
                      if x.got > 0 and now - (x.t_fb if (x.t_fb > 0.0 and V98_ETA_FIRST_BYTE) else x.t_start) > 0.05
                      and x.pos <= x.end]
             r_avg = (sum(rates) / len(rates)) if rates else 0.0
             best, best_eta = None, 0.0
             for x in active:
-                if x.taken or x.end - x.pos + 1 < 2 * RANGE_STEAL_MIN_BYTES:
+                if x.taken or x.end - x.pos + 1 < 2 * _min_split:
                     continue
                 e_ = x.eta(now)
                 if e_ > best_eta:
@@ -4554,7 +4570,9 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
                     keep = int(r_v * (ttfb + rem / r_avg) / (1.0 + r_v / r_avg))
                 else:
                     keep = rem // 2
-                keep = max(RANGE_STEAL_MIN_BYTES, min(rem - RANGE_STEAL_MIN_BYTES, keep))
+                keep = max(_min_split, min(rem - _min_split, keep))
+                if _min_split < RANGE_STEAL_MIN_BYTES and rem < 2 * RANGE_STEAL_MIN_BYTES:
+                    state["tail_splits"] += 1
                 mid = best.pos + keep
                 new = _RangeSeg(mid, best.end)
                 new.h = _pick_host_locked(initial=False)
@@ -4572,12 +4590,14 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
                     _p90 = _fs[min(len(_fs) - 1, int(0.9 * (len(_fs) - 1) + 0.5))]
                     _thr = max(0.15, float(V99_TAIL_RESCUE_FACTOR) * _p90)
                     # request cứu / giành lại (gen ≥ 1) chạy trên kết nối ĐÃ ẤM → kiên nhẫn theo TTFB ấm, không theo đợt đầu
-                    _lt = sorted(state["late_ttfb"])
+                    _lt = sorted(state["warm_ttfb"] or state["late_ttfb"])
                     _warm = _lt[len(_lt) // 2] if _lt else 0.5 * _fs[len(_fs) // 2]
                     _thr_warm = max(0.15, 2.0 * _warm + 0.05)
                     for x in sorted(_open, key=lambda y: y.t_start):
                         if x.t_fb <= 0.0:
-                            _late = (now - x.t_start) >= (_thr if x.gen == 0 else _thr_warm * x.gen)
+                            # đợt đầu: so với TTFB lạnh; đoạn chẻ / giành lại / cứu chạy trên kết nối ấm → so với TTFB ấm
+                            _cold = (x.kind == "first" and x.gen == 0)
+                            _late = (now - x.t_start) >= (_thr if _cold else _thr_warm * max(1, x.gen))
                         else:
                             _late = (now - x.last_t) >= float(V99_TAIL_BODY_STALL_SEC) * (1 + x.gen)
                         if not _late:
@@ -4937,6 +4957,10 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
                 seg.t_fb = _now
                 if seg.kind == "first":
                     state["first_ttfb"].append(_req_ttfb)
+                else:
+                    state["warm_ttfb"].append(_req_ttfb)
+                    if len(state["warm_ttfb"]) > 32:
+                        del state["warm_ttfb"][:-32]
                 state["ttfb_ema"] = (_req_ttfb if state["ttfb_ema"] is None
                                      else 0.7 * state["ttfb_ema"] + 0.3 * _req_ttfb)
             while True:
@@ -5277,6 +5301,8 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
         _lr_ttfb = (round((_lr["t_hdr"] - _lr["t_issue"]) * 1000.0, 1) if _lr.get("t_hdr") is not None else None)
         _lr_body = (round((_lr["t_end"] - _lr["t_hdr"]) * 1000.0, 1) if _lr.get("t_hdr") is not None else None)
         extra += (f" tail={_tail_ms:.0f}ms" if _tail_ms is not None else "") + (f" rescue={state['rescues']}" if state["rescues"] else "")
+        extra += (f" ttfb_warm={sorted(state['warm_ttfb'])[len(state['warm_ttfb']) // 2] * 1000:.0f}ms" if state["warm_ttfb"] else "")
+        extra += (f" tail_split={state['tail_splits']}" if state["tail_splits"] else "")
         if state["errs"]:
             extra += " errs=" + ",".join(f"{k.replace('error:', '')}x{v}" for k, v in sorted(state["errs"].items()))
         _slow_tail = _tail_ms is not None and _tail_ms >= 300.0 and _lr
@@ -5367,6 +5393,7 @@ def _download_http_range_turbo_v94(url: str, temp_dir: Path, filename: str, logg
             "scale_steps": list(state["scale_steps"]), "part_bytes": int(part), "segments_initial": len(segs),
             "workers_learn": _wl_arm, "dual": dual, "failovers": state["failovers"], "host_ok": list(state["host_ok"]),
             # V9.9
+            "tail_splits": state["tail_splits"], "warm_ttfb_p50_ms": (lambda a: round(a[len(a) // 2] * 1000.0, 1) if a else None)(sorted(state["warm_ttfb"])),
             "rescues": state["rescues"], "tail_ms": (round((elapsed_ms / 1000.0 - state["t90"]) * 1000.0, 1)
                                                       if (ok and state["t90"] is not None) else None),
             "t90_ms": (round(state["t90"] * 1000.0, 1) if state["t90"] is not None else None),

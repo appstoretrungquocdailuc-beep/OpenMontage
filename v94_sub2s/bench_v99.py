@@ -44,6 +44,12 @@ b.SCENARIOS.update({
                                link=900, v_conn=18.6, a_conn=20.0, redirect_ms=60, final_ms=200, alt_ms=260,
                                a_final_ms=200, a_alt_ms=260, a_cold={"n": 24, "extra_ms": 1100},
                                a_stall={"seg": 17, "workers": 24, "delay": 3.0}),
+    # theo log thật 18/11 01:28-01:29 (V9.9-CANDIDATE): TTFB đợt đầu p50 0.47-0.75 s, request sau 0.04-0.23 s, ~16 Mbps/kết nối,
+    # tốc độ truyền tổng ~650 Mbps; vài kết nối chậm (audio: 0.49 MiB mất 701 ms ≈ 5.9 Mbps)
+    "S9_tail_real": dict(note="theo log 18/11: đợt đầu lạnh (+0.45 s), sau đó ấm (0.2 s); 16.5 Mbps/kết nối; 1/9 request chỉ 6 Mbps; link 700 Mbps",
+                         link=700, v_conn=16.5, a_conn=20.0, redirect_ms=60, final_ms=200, alt_ms=220,
+                         v_cold={"n": 64, "extra_ms": 450}, a_cold={"n": 32, "extra_ms": 450},
+                         v_slow={"every": 9, "mbps": 6.0}, a_slow={"every": 9, "mbps": 6.0}),
     "S8_vstall": dict(note="video: 1 range đợt đầu treo 3 s trên cả 2 host (kiểm tail-rescue cho video dual)",
                       link=900, v_conn=18.6, a_conn=20.0, redirect_ms=60, final_ms=200, alt_ms=260,
                       v_stall={"seg": 41, "workers": 64, "delay": 3.0}),
@@ -59,6 +65,8 @@ b.PRESETS.update({
     "v99_hedge": {"h0": {"V99_HEDGE_MAX": 0}, "h8": {"V99_HEDGE_MAX": 8}, "h16": {"V99_HEDGE_MAX": 16}, "h40": {"V99_HEDGE_MAX": 40}},
     "v99_range": {"auto": {}, "r1": {"V98_PART_MIB": 1.0}, "r2": {"V98_PART_MIB": 2.0}, "r4": {"V98_PART_MIB": 4.0}},
     "v99_rescue": {"rescue_on": {}, "rescue_off": {"V99_TAIL_RESCUE": False}},
+    "v99_tail": {"tail_new": {}, "tail_old": {"V99_WARM_TTFB": False, "V99_TAIL_RESCUE": False},
+                 "warm_only": {"V99_TAIL_RESCUE": False}, "rescue_only": {"V99_WARM_TTFB": False}},
 })
 
 

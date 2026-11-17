@@ -147,6 +147,9 @@ def mock_spec(sc, vsize, asize):
         cold = s.get(f"{k}_cold")           # {"n": N, "extra_ms": X}: N request đầu của mỗi host chậm thêm X ms
         if cold:
             ex.update({"cold_n": int(cold["n"]), "cold_delay": float(cold["extra_ms"]) / 1000})
+        slow = s.get(f"{k}_slow")           # {"every": N, "mbps": X}: mỗi request thứ N chỉ được X Mbps
+        if slow:
+            ex.update({"slow_every": int(slow["every"]), "slow_rate": float(slow["mbps"]) * 1e6 / 8})
         fin = (s.get(f"{k}_final_ms") or s["final_ms"]) / 1000
         alt = (s.get(f"{k}_alt_ms") or s["alt_ms"]) / 1000
         files.append({"path": f"/{k}/real", "size": size, "seed": seed, "mode": "ok", "kw": dict({"rate": rate, "hdr_delay": fin}, **ex)})
